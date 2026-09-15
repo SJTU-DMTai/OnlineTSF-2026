@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.utils.data import DataLoader, Subset
 
 from .config import load_config
 from .data import load_benchmark_dataset
@@ -58,6 +59,38 @@ def _build_method(config: dict[str, Any], model: nn.Module):
     )
 
 
+def _run_offline_training(dataset, method: OGDMethod | FSNetMethod, offline: dict[str, Any]) -> int:
+    """Train the model on an initial window prefix before online evaluation."""
+
+    train_size = int(len(dataset) * offline["train_ratio"])
+    if train_size == 0:
+        if offline["train_ratio"] == 0.0:
+            return 0
+        raise ValueError("config.offline.train_ratio selects no training windows")
+
+    optimizer = method.optimizer
+    loss_fn = method.loss_fn
+    if optimizer is None or loss_fn is None:
+        raise ValueError("offline training requires config.method.learning_rate")
+
+    loader = DataLoader(
+        Subset(dataset, range(train_size)),
+        batch_size=offline["batch_size"],
+        shuffle=True,
+    )
+    method.model.train()
+    for _ in range(offline["epochs"]):
+        for context, target in loader:
+            optimizer.zero_grad(set_to_none=True)
+            prediction = method.model(context.to(method.device))
+            loss = loss_fn(prediction, target.to(method.device))
+            loss.backward()
+            if isinstance(method, FSNetMethod):
+                method.model.record_gradients()
+            optimizer.step()
+    return train_size
+
+
 def _build_detector(config: dict[str, Any]):
     drift = config["drift"]
     options = drift["parameters"]
@@ -87,13 +120,18 @@ def run_experiment(config: dict[str, Any]) -> tuple[OnlineRun, list[int]]:
     )
     model = _build_backbone(config, dataset.num_features, dataset.num_targets, dataset.target_indices)
     method = _build_method(config, model)
+    offline_stop = _run_offline_training(dataset, method, config["offline"])
     online = config["online"]
     executor = OnlineExecutor(
         method,
         feedback_delay=online["feedback_delay"],
         keep_predictions=online.get("keep_predictions", False),
     )
-    run = executor.run_dataset(dataset, start=online.get("start", 0), stop=online.get("stop"))
+    run = executor.run_dataset(
+        dataset,
+        start=max(offline_stop, online.get("start", 0)),
+        stop=online.get("stop"),
+    )
 
     detector = _build_detector(config)
     drift_indices: list[int] = []

@@ -30,7 +30,11 @@ python -m onlinetsf --config config.yaml
 
 `config.yaml` supports `linear`, `tcn`, `patchtst`, and `fsnet_tcn`; `ogd` and
 `fsnet`; and `none`, `page_hinkley`, `adwin`, and `kswin`. FSNet must be paired
-with `fsnet_tcn`.
+with `fsnet_tcn`. The `offline` section trains on an initial prefix of sliding
+windows before online evaluation. For example, `train_ratio: 0.25` trains on the
+first 25% of windows and starts prequential forecasting from the remaining 75%;
+`epochs` and `batch_size` control that phase. Set `train_ratio: 0` for an
+online-only experiment.
 
 Each run creates a new timestamped directory under `output.directory` with:
 

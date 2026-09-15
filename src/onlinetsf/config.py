@@ -42,6 +42,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
     forecasting = _section(config, "forecasting")
     method = _section(config, "method")
     online = _section(config, "online")
+    offline_value = config.get("offline", {})
+    if not isinstance(offline_value, dict):
+        raise ValueError("config.offline must be a mapping")
+    offline = dict(offline_value)
     drift = _section(config, "drift")
 
     for key in ("name", "path", "context_length", "horizon"):
@@ -68,6 +72,25 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("method fsnet must be paired with backbone fsnet_tcn")
     if method_name == "fsnet" and method.get("learning_rate") is None:
         raise ValueError("config.method.learning_rate is required for fsnet")
+
+    offline_train_ratio = offline.get("train_ratio", 0.0)
+    if (
+        not isinstance(offline_train_ratio, (int, float))
+        or isinstance(offline_train_ratio, bool)
+        or not 0.0 <= offline_train_ratio < 1.0
+    ):
+        raise ValueError("config.offline.train_ratio must be in [0, 1)")
+    offline["train_ratio"] = float(offline_train_ratio)
+    offline_epochs = offline.get("epochs", 1)
+    if not isinstance(offline_epochs, int) or isinstance(offline_epochs, bool) or offline_epochs <= 0:
+        raise ValueError("config.offline.epochs must be a positive integer")
+    offline["epochs"] = offline_epochs
+    offline_batch_size = offline.get("batch_size", 32)
+    if not isinstance(offline_batch_size, int) or isinstance(offline_batch_size, bool) or offline_batch_size <= 0:
+        raise ValueError("config.offline.batch_size must be a positive integer")
+    offline["batch_size"] = offline_batch_size
+    if offline["train_ratio"] > 0.0 and method.get("learning_rate") is None:
+        raise ValueError("config.method.learning_rate is required when offline training is enabled")
 
     if "feedback_delay" not in online:
         raise ValueError("config.online.feedback_delay is required")
@@ -108,6 +131,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     config["forecasting"] = forecasting
     config["method"] = method
     config["online"] = online
+    config["offline"] = offline
     config["drift"] = drift
     config["output"] = output
     return config

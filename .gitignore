@@ -2,7 +2,8 @@
 .agents/
 .pytest_cache/
 tests/
-
+runs/
+data/
 # Python bytecode
 __pycache__/
 *.py[cod]

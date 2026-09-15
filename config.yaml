@@ -27,6 +27,12 @@ method:
   update_steps: 1
   # To use FSNet, set name: fsnet and forecasting.backbone: fsnet_tcn.
 
+offline:
+  # Train on this initial share of sliding windows, then evaluate online on the remainder.
+  train_ratio: 0.25
+  epochs: 5
+  batch_size: 32
+
 online:
   feedback_delay: 0
   start: 0
