@@ -1,0 +1,49 @@
+# All supported selections:
+#   forecasting.backbone: linear | tcn | patchtst | fsnet_tcn
+#   method.name: ogd | fsnet  (fsnet must use fsnet_tcn)
+#   drift.name: none | page_hinkley | adwin | kswin
+
+seed: 0
+
+data:
+  name: etth1
+  path: data/ETTh1.csv
+  context_length: 96
+  horizon: 1
+  stride: 1
+
+forecasting:
+  backbone: tcn
+  parameters:
+    channels: [32, 32, 32, 32, 32]
+    kernel_size: 3
+    dropout: 0.0
+  # PatchTST example: {patch_length: 16, patch_stride: 8, d_model: 64, num_heads: 4, num_layers: 2}
+  # FSNet example: {hidden_channels: 64, depth: 10, memory_size: 32}
+
+method:
+  name: ogd
+  learning_rate: 0.001
+  update_steps: 1
+  # To use FSNet, set name: fsnet and forecasting.backbone: fsnet_tcn.
+
+online:
+  feedback_delay: 0
+  start: 0
+  stop: null
+  device: cpu
+  keep_predictions: false
+
+output:
+  directory: runs
+  run_name: null
+
+drift:
+  name: page_hinkley
+  signal: mae
+  parameters:
+    delta: 0.005
+    threshold: 50.0
+    min_instances: 30
+  # ADWIN example: set name: adwin, scale: 1.0, parameters: {delta: 0.002, min_window_length: 20}
+  # KSWIN example: set name: kswin, parameters: {alpha: 0.005, window_size: 100, stat_size: 30}

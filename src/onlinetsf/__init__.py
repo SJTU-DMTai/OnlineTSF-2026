@@ -14,7 +14,7 @@ from .online import (
     OnlineRun,
     OnlineStep,
 )
-from .methods import AdaptiveConv1d, FSNetMethod, FSNetTCN
+from .methods import AdaptiveConv1d, FSNetMethod, FSNetTCN, OGDMethod
 
 __all__ = [
     "ADWINDetector",
@@ -31,6 +31,7 @@ __all__ = [
     "MethodFeedback",
     "OnlineExecutor",
     "OnlineMethod",
+    "OGDMethod",
     "OnlineMetrics",
     "OnlineRun",
     "OnlineStep",

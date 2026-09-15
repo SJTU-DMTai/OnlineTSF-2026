@@ -63,6 +63,7 @@ class AdaptiveConv1d(nn.Module):
         self.bias = nn.Parameter(torch.zeros(channels))
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
 
+        # Compress each channel gradient chunk into a few scales instead of mapping a full kernel.
         gradient_chunk_size = channels * kernel_size
         self.controller = nn.Sequential(
             nn.Linear(gradient_chunk_size, controller_hidden),
@@ -75,18 +76,22 @@ class AdaptiveConv1d(nn.Module):
             nn.init.zeros_(head.weight)
             nn.init.ones_(head.bias)
 
+        # u contains weight, bias, and feature scales; memory stores past u vectors.
         adaptation_size = channels * (kernel_size + 2)
         memory = torch.empty(memory_size, adaptation_size)
         nn.init.xavier_uniform_(memory)
         memory.div_(max(1.0, torch.linalg.vector_norm(memory).item()))
+        # Buffers move with model.to() and enter state_dict(), but are not optimizer parameters.
         self.register_buffer("memory", memory)
         self.register_buffer("gradient_ema", torch.zeros_like(self.weight).flatten())
         self.register_buffer("fast_gradient_ema", torch.zeros_like(self.weight).flatten())
         self.register_buffer("adaptation_ema", torch.zeros(adaptation_size))
+        # This flag is set after feedback and consumed by the following prediction.
         self.register_buffer("memory_trigger", torch.tensor(False))
         self.register_buffer("memory_interactions", torch.tensor(0, dtype=torch.long))
 
     def _adaptation(self, *, advance_state: bool) -> tuple[Tensor, Tensor, Tensor]:
+        # The slow EMA is a stable recent gradient summary, chunked before entering the adapter.
         chunks = self.gradient_ema.view(self.channels, self.channels, self.kernel_size)
         chunks = chunks.permute(1, 0, 2).reshape(self.channels, -1)
         representation = self.controller(chunks)
@@ -95,16 +100,20 @@ class AdaptiveConv1d(nn.Module):
         feature_scale = self.feature_scale(representation).flatten()
         adaptation = torch.cat((weight_scale.flatten(), bias_scale, feature_scale))
 
+        # Advance u EMA only for emitted forecasts; feedback recomputation must not create another time step.
         if advance_state:
             self.adaptation_ema.mul_(self.fast_decay).add_(
                 adaptation.detach(), alpha=1.0 - self.fast_decay
             )
+            # Read and write memory sparsely only when fast and slow gradient directions conflict.
             if self.memory_trigger.item():
                 scores = self.memory @ self.adaptation_ema
                 attention = F.softmax(scores / self.memory_temperature, dim=0)
+                # The recalled vector is the attention-weighted sum of only the most relevant memories.
                 top_values, top_indices = torch.topk(attention, self.memory_top_k)
                 recalled = (self.memory.index_select(0, top_indices) * top_values.unsqueeze(1)).sum(dim=0)
 
+                # Write only top-k memory slots, then bound the memory norm.
                 sparse_attention = torch.zeros_like(attention)
                 sparse_attention[top_indices] = top_values
                 self.memory.mul_(self.memory_threshold).add_(
@@ -129,6 +138,7 @@ class AdaptiveConv1d(nn.Module):
 
     def forward(self, values: Tensor, *, advance_state: bool = False) -> Tensor:
         weight_scale, bias_scale, feature_scale = self._adaptation(advance_state=advance_state)
+        # alpha scales convolution weights and beta scales features; right cropping preserves causality.
         output = F.conv1d(
             values,
             self.weight * weight_scale,
@@ -144,6 +154,7 @@ class AdaptiveConv1d(nn.Module):
     def record_gradient(self) -> None:
         """Update both gradient EMAs and arm the next memory interaction."""
 
+        # The post-backprop gradient measures this layer contribution; normalization emphasizes direction.
         gradient = F.normalize(self.weight.grad.detach().flatten(), dim=0)
         self.fast_gradient_ema.mul_(self.fast_decay).add_(gradient, alpha=1.0 - self.fast_decay)
         similarity = F.cosine_similarity(
@@ -152,6 +163,7 @@ class AdaptiveConv1d(nn.Module):
             dim=0,
             eps=1e-6,
         )
+        # Opposing fast and slow EMAs arm a memory interaction for the next prediction.
         if similarity.item() < -self.memory_threshold:
             self.memory_trigger.fill_(True)
         self.gradient_ema.mul_(self.gradient_decay).add_(gradient, alpha=1.0 - self.gradient_decay)
@@ -205,6 +217,7 @@ class FSNetTCN(ForecastBackbone):
         if self.num_targets <= 0:
             raise ValueError("num_targets must be positive")
 
+        # Project raw features to a fixed hidden width before adaptive convolutions.
         self.input_projection = nn.Linear(num_features, hidden_channels)
         adapter_options: dict[str, float | int] = {
             "controller_hidden": controller_hidden,
@@ -215,6 +228,7 @@ class FSNetTCN(ForecastBackbone):
             "memory_threshold": memory_threshold,
             "memory_temperature": memory_temperature,
         }
+        # Each residual block has two adapted convolutions at one exponentially growing dilation.
         self.blocks = nn.ModuleList(
             FSNetBlock(hidden_channels, kernel_size, 2**index, **adapter_options)
             for index in range(depth)
@@ -227,9 +241,11 @@ class FSNetTCN(ForecastBackbone):
                 "context shape does not match the model configuration: "
                 f"expected [batch, {self.context_length}, {self.num_features}]"
             )
+        # Convert [batch, time, features] to the [batch, channels, time] layout required by Conv1d.
         encoded = self.input_projection(context).transpose(1, 2)
         for block in self.blocks:
             encoded = block(encoded, advance_state=advance_state)
+        # A direct linear head maps the final causal representation to every horizon and target.
         forecast = self.head(encoded[..., -1])
         return forecast.reshape(context.shape[0], self.horizon, self.num_targets)
 
@@ -258,28 +274,35 @@ class FSNetMethod:
         self.model = model
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.model.to(self.device)
+        # Optimizer state belongs to the method and should be checkpointed alongside the model.
         self.optimizer = optimizer or AdamW(model.parameters(), lr=learning_rate)
         self.loss_fn = loss_fn or nn.MSELoss()
 
     def predict(self, context: Tensor) -> Tensor:
         """Forecast one context and advance FSNet's prediction-time state."""
 
+        # Prediction may advance memory state but does not construct an autograd graph.
         self.model.eval()
         with torch.no_grad():
             prediction = self.model(context.unsqueeze(0).to(self.device), advance_state=True)
         return prediction.squeeze(0)
 
     def on_feedback(self, feedback: MethodFeedback) -> float:
-        """Learn from one newly available target and update FSNet gradient state."""
+        """Learn from one complete forecast target and update FSNet state."""
 
+        if not feedback.observed_mask.all():
+            raise ValueError("FSNetMethod requires complete-horizon feedback")
+        # Train only when a label arrives; the recomputed forward pass does not advance EMA time.
         self.model.train()
         context = feedback.context.unsqueeze(0).to(self.device)
         target = feedback.target.unsqueeze(0).to(self.device)
+        # Clear gradients from the previous feedback event before differentiating the current loss.
         self.optimizer.zero_grad(set_to_none=True)
         prediction = self.model(context, advance_state=False)
         loss = self.loss_fn(prediction, target)
         if loss.ndim != 0:
             raise ValueError("loss_fn must return a scalar tensor")
+        # Update EMA/trigger from the current gradient before changing trainable parameters.
         loss.backward()
         self.model.record_gradients()
         self.optimizer.step()

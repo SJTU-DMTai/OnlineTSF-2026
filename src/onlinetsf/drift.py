@@ -51,8 +51,10 @@ class PageHinkleyDetector:
         if not math.isfinite(value):
             raise ValueError("drift signal must be finite")
 
+        # Inputs are commonly feedback MAE/MSE values; the mean is updated without full history.
         self.num_observations += 1
         self.mean += (value - self.mean) / self.num_observations
+        # delta ignores small fluctuations so only persistent upward error changes accumulate.
         self.cumulative_sum += value - self.mean - self.delta
         self.minimum_cumulative_sum = min(self.minimum_cumulative_sum, self.cumulative_sum)
         score = self.cumulative_sum - self.minimum_cumulative_sum
@@ -103,6 +105,7 @@ class ADWINDetector:
 
         detected = False
         score = 0.0
+        # Test every valid cut by comparing the earlier and recent window means.
         if len(self.window) >= 2 * self.min_window_length:
             total = sum(self.window)
             left_sum = 0.0
@@ -115,6 +118,7 @@ class ADWINDetector:
 
                 left_mean = left_sum / cut
                 right_mean = (total - left_sum) / right_length
+                # Hoeffding bound is valid only because ADWIN input is constrained to [0, 1].
                 epsilon = math.sqrt(
                     0.5 * (1.0 / cut + 1.0 / right_length) * math.log(4.0 / self.delta)
                 )
@@ -122,6 +126,7 @@ class ADWINDetector:
                 if excess > score:
                     score = excess
                 if excess > 0.0:
+                    # After a confirmed drift, discard the old distribution and retain recent data.
                     self.window = self.window[cut:]
                     detected = True
                     break
@@ -200,10 +205,12 @@ class KSWINDetector:
         if len(self.window) < self.window_size:
             return DriftUpdate(detected=False, value=value, mean=mean, score=0.0)
 
+        # KSWIN compares a sampled historical reference with the recent empirical distribution.
         reference_pool = self.window[:-self.stat_size]
         reference = self._random.sample(reference_pool, self.stat_size)
         recent = self.window[-self.stat_size:]
         statistic = self._ks_statistic(reference, recent)
+        # The KS threshold converts alpha into the maximum acceptable CDF distance.
         threshold = math.sqrt(
             -0.5
             * math.log(self.alpha / 2.0)

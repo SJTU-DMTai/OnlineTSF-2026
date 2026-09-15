@@ -50,9 +50,11 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         if values.shape[0] < context_length + horizon:
             raise ValueError("series is shorter than one context-plus-horizon window")
 
+        # A sliding sample contains visible history (context) followed by its future target.
         self.values = values.to(dtype=torch.float32)
         self.context_length = context_length
         self.horizon = horizon
+        # stride controls how far the next forecasting origin moves along the time axis.
         self.stride = stride
         self.target_indices = tuple(target_indices or range(values.shape[1]))
 
@@ -70,12 +72,14 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         return len(self.target_indices)
 
     def __len__(self) -> int:
+        # The final sample must still contain a complete future horizon.
         return (self.values.shape[0] - self.context_length - self.horizon) // self.stride + 1
 
     def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
         if index < 0 or index >= len(self):
             raise IndexError(index)
 
+        # context is visible history; target is the ground truth revealed later.
         start = index * self.stride
         split = start + self.context_length
         stop = split + self.horizon
@@ -107,6 +111,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
             if not reader.fieldnames:
                 raise ValueError(f"CSV file has no header: {source}")
 
+            # The time column is metadata; selected numeric columns are model features.
             columns = list(feature_columns or [name for name in reader.fieldnames if name != time_column])
             if not columns:
                 raise ValueError("no numeric feature columns were selected")
@@ -124,6 +129,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         if not rows:
             raise ValueError(f"CSV file has no data rows: {source}")
 
+        # With no explicit target columns, every input feature is forecast.
         selected_targets = tuple(target_columns or columns)
         missing_targets = set(selected_targets).difference(columns)
         if missing_targets:

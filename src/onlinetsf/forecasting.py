@@ -11,6 +11,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 
+# Every backbone shares this contract: batch dimension first, then time, then features.
 def _validate_context(context: Tensor, context_length: int, num_features: int) -> None:
     if context.ndim != 3:
         raise ValueError("context must have shape [batch, context_length, num_features]")
@@ -50,6 +51,7 @@ class LinearForecastBackbone(ForecastBackbone):
         if self.num_targets <= 0:
             raise ValueError("num_targets must be positive")
 
+        # The linear baseline flattens all history and predicts every future step at once.
         self.projection = nn.Linear(
             context_length * num_features,
             horizon * self.num_targets,
@@ -73,6 +75,7 @@ class TemporalBlock(nn.Module):
         dropout: float,
     ) -> None:
         super().__init__()
+        # Right padding creates artificial future positions and is removed for causality.
         self.padding = (kernel_size - 1) * dilation
         self.conv1 = nn.Conv1d(
             input_channels,
@@ -96,6 +99,7 @@ class TemporalBlock(nn.Module):
             else nn.Identity()
         )
 
+    # Conv1d pads both sides; removing the right tail prevents information from future positions.
     def _remove_right_padding(self, values: Tensor) -> Tensor:
         if self.padding == 0:
             return values
@@ -137,6 +141,7 @@ class TCNForecastBackbone(ForecastBackbone):
         if self.num_targets <= 0:
             raise ValueError("num_targets must be positive")
 
+        # Dilation grows as 1, 2, 4, ... to expand the receptive field efficiently.
         blocks: list[nn.Module] = []
         input_channels = num_features
         for block_index, output_channels in enumerate(channels):
@@ -155,6 +160,7 @@ class TCNForecastBackbone(ForecastBackbone):
 
     def forward(self, context: Tensor) -> Tensor:
         _validate_context(context, self.context_length, self.num_features)
+        # Conv1d consumes [batch, channels, time]; its last position summarizes visible history.
         encoded = self.network(context.transpose(1, 2))
         forecast = self.head(encoded[..., -1])
         return forecast.reshape(context.shape[0], self.horizon, self.num_targets)
@@ -199,10 +205,12 @@ class PatchTSTForecastBackbone(ForecastBackbone):
             raise ValueError("target_indices must contain exactly num_targets entries")
         if not selected_targets or min(selected_targets) < 0 or max(selected_targets) >= num_features:
             raise ValueError("target_indices contain an out-of-range feature index")
+        # This is fixed configuration rather than learned state, so checkpoints need not store it.
         self.register_buffer("target_indices", torch.tensor(selected_targets, dtype=torch.long), persistent=False)
 
         self.patch_length = patch_length
         self.patch_stride = patch_stride
+        # PatchTST splits every feature channel into its own sequence of time patches.
         self.num_patches = (context_length - patch_length + patch_stride - 1) // patch_stride + 1
         padded_length = (self.num_patches - 1) * patch_stride + patch_length
         self.right_padding = padded_length - context_length
@@ -225,9 +233,12 @@ class PatchTSTForecastBackbone(ForecastBackbone):
     def forward(self, context: Tensor) -> Tensor:
         _validate_context(context, self.context_length, self.num_features)
         values = context.transpose(1, 2)
+        # Replicating the last value completes the final patch without observing the future.
         if self.right_padding:
             values = F.pad(values, (0, self.right_padding), mode="replicate")
+        # unfold produces overlapping local temporal segments.
         patches = values.unfold(dimension=2, size=self.patch_length, step=self.patch_stride)
+        # Merge batch and feature dimensions to run one shared Transformer per feature channel.
         tokens = patches.reshape(
             context.shape[0] * self.num_features,
             self.num_patches,
@@ -241,4 +252,5 @@ class PatchTSTForecastBackbone(ForecastBackbone):
             self.num_features,
             self.horizon,
         ).transpose(1, 2)
+        # Retain only the target channels requested by the caller.
         return forecast.index_select(dim=2, index=self.target_indices)
