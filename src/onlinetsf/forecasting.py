@@ -63,6 +63,51 @@ class LinearForecastBackbone(ForecastBackbone):
         return forecast.reshape(context.shape[0], self.horizon, self.num_targets)
 
 
+class LSTMForecastBackbone(ForecastBackbone):
+    """Stacked LSTM encoder with a direct multi-horizon forecasting head."""
+
+    def __init__(
+        self,
+        context_length: int,
+        num_features: int,
+        horizon: int,
+        num_targets: int | None = None,
+        hidden_size: int = 64,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if context_length <= 0 or num_features <= 0 or horizon <= 0:
+            raise ValueError("context_length, num_features, and horizon must be positive")
+        if hidden_size <= 0 or num_layers <= 0:
+            raise ValueError("hidden_size and num_layers must be positive")
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+
+        self.context_length = context_length
+        self.num_features = num_features
+        self.horizon = horizon
+        self.num_targets = num_targets if num_targets is not None else num_features
+        if self.num_targets <= 0:
+            raise ValueError("num_targets must be positive")
+
+        self.encoder = nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0.0,
+            batch_first=True,
+        )
+        self.head = nn.Linear(hidden_size, horizon * self.num_targets)
+
+    def forward(self, context: Tensor) -> Tensor:
+        _validate_context(context, self.context_length, self.num_features)
+        # The final output summarizes only the visible context window.
+        encoded, _ = self.encoder(context)
+        forecast = self.head(encoded[:, -1])
+        return forecast.reshape(context.shape[0], self.horizon, self.num_targets)
+
+
 class TemporalBlock(nn.Module):
     """A residual pair of dilated causal convolutions."""
 
@@ -253,4 +298,75 @@ class PatchTSTForecastBackbone(ForecastBackbone):
             self.horizon,
         ).transpose(1, 2)
         # Retain only the target channels requested by the caller.
+        return forecast.index_select(dim=2, index=self.target_indices)
+
+
+class TimeTCNForecastBackbone(ForecastBackbone):
+    """Variable-independent TCN with weights shared across feature channels."""
+
+    def __init__(
+        self,
+        context_length: int,
+        num_features: int,
+        horizon: int,
+        num_targets: int | None = None,
+        target_indices: Sequence[int] | None = None,
+        channels: Sequence[int] = (32, 32, 32, 32, 32),
+        kernel_size: int = 3,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if context_length <= 0 or num_features <= 0 or horizon <= 0:
+            raise ValueError("context_length, num_features, and horizon must be positive")
+        if not channels or any(channel <= 0 for channel in channels):
+            raise ValueError("channels must contain positive channel counts")
+        if kernel_size <= 0 or not 0.0 <= dropout < 1.0:
+            raise ValueError("kernel_size must be positive and dropout must be in [0, 1)")
+
+        self.context_length = context_length
+        self.num_features = num_features
+        self.horizon = horizon
+        self.num_targets = num_targets if num_targets is not None else num_features
+        selected_targets = (
+            tuple(target_indices) if target_indices is not None else tuple(range(self.num_targets))
+        )
+        if len(selected_targets) != self.num_targets:
+            raise ValueError("target_indices must contain exactly num_targets entries")
+        if (
+            not selected_targets
+            or min(selected_targets) < 0
+            or max(selected_targets) >= num_features
+        ):
+            raise ValueError("target_indices contain an out-of-range feature index")
+        self.register_buffer(
+            "target_indices", torch.tensor(selected_targets, dtype=torch.long), persistent=False
+        )
+
+        blocks: list[nn.Module] = []
+        input_channels = 1
+        for block_index, output_channels in enumerate(channels):
+            blocks.append(
+                TemporalBlock(
+                    input_channels=input_channels,
+                    output_channels=output_channels,
+                    kernel_size=kernel_size,
+                    dilation=2**block_index,
+                    dropout=dropout,
+                )
+            )
+            input_channels = output_channels
+        self.network = nn.Sequential(*blocks)
+        self.head = nn.Linear(channels[-1], horizon)
+
+    def forward(self, context: Tensor) -> Tensor:
+        _validate_context(context, self.context_length, self.num_features)
+        # Treat every feature as a separate univariate series while sharing one temporal encoder.
+        values = context.transpose(1, 2).reshape(
+            context.shape[0] * self.num_features, 1, self.context_length
+        )
+        encoded = self.network(values)
+        per_channel = self.head(encoded[..., -1])
+        forecast = per_channel.reshape(
+            context.shape[0], self.num_features, self.horizon
+        ).transpose(1, 2)
         return forecast.index_select(dim=2, index=self.target_indices)

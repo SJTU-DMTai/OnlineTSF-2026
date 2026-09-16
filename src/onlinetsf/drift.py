@@ -17,6 +17,20 @@ class DriftUpdate:
     score: float
 
 
+@dataclass(frozen=True)
+class DriftRecord:
+    """One detector update paired with its forecasting feedback event."""
+
+    detector: str
+    signal: str
+    index: int
+    available_at: int
+    value: float
+    mean: float
+    score: float
+    detected: bool
+
+
 class PageHinkleyDetector:
     """Detect persistent upward shifts in a scalar error stream.
 

@@ -9,9 +9,17 @@ from typing import Any
 import yaml
 
 
-BACKBONES = frozenset(("linear", "tcn", "patchtst", "fsnet_tcn"))
-METHODS = frozenset(("ogd", "fsnet"))
+BACKBONES = frozenset(("linear", "lstm", "tcn", "patchtst", "fsnet_tcn", "onenet_tcn"))
+METHODS = frozenset(("ogd", "fsnet", "onenet"))
 DRIFT_DETECTORS = frozenset(("none", "page_hinkley", "adwin", "kswin"))
+
+
+def _load_mapping(source: Path, label: str) -> dict[str, Any]:
+    with source.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{label} root must be a mapping")
+    return dict(loaded)
 
 
 def _section(config: dict[str, Any], name: str) -> dict[str, Any]:
@@ -28,25 +36,55 @@ def _parameters(section: dict[str, Any], name: str) -> dict[str, Any]:
     return dict(value)
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
+def _profile(profiles: dict[str, Any], group: str, name: Any) -> dict[str, Any]:
+    selector = {"strategies": "strategy", "detectors": "detector"}[group]
+    if not isinstance(name, str):
+        raise ValueError(f"config.selection.{selector} must be a string")
+    entries = profiles.get(group)
+    if not isinstance(entries, dict):
+        raise ValueError(f"profiles.{group} must be a mapping")
+    value = entries.get(name)
+    if not isinstance(value, dict):
+        available = ", ".join(sorted(entries))
+        raise ValueError(f"unknown {selector} profile {name!r}; choose one of: {available}")
+    return dict(value)
+
+
+def load_config(
+    path: str | Path,
+    *,
+    strategy_name: str | None = None,
+    detector_name: str | None = None,
+) -> dict[str, Any]:
     """Read an experiment YAML file and validate its component selections."""
 
     source = Path(path)
-    with source.open("r", encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle)
-    if not isinstance(loaded, dict):
-        raise ValueError("config root must be a mapping")
-
-    config = dict(loaded)
+    config = _load_mapping(source, "config")
     data = _section(config, "data")
-    forecasting = _section(config, "forecasting")
-    method = _section(config, "method")
     online = _section(config, "online")
     offline_value = config.get("offline", {})
     if not isinstance(offline_value, dict):
         raise ValueError("config.offline must be a mapping")
     offline = dict(offline_value)
-    drift = _section(config, "drift")
+
+    selection = _section(config, "selection")
+    if strategy_name is not None:
+        selection["strategy"] = strategy_name
+    if detector_name is not None:
+        selection["detector"] = detector_name
+    profile_path_value = config.get("profiles")
+    if not isinstance(profile_path_value, str):
+        raise ValueError("config.profiles must be a path string")
+    profile_path = Path(profile_path_value)
+    if not profile_path.is_absolute():
+        profile_path = source.parent / profile_path
+    profiles = _load_mapping(profile_path, "profiles")
+    strategy = _profile(profiles, "strategies", selection.get("strategy"))
+    forecasting = _section(strategy, "forecasting")
+    method = _section(strategy, "method")
+    drift = _profile(profiles, "detectors", selection.get("detector"))
+    config["profiles"] = str(profile_path.resolve())
+    config["selection"] = selection
 
     for key in ("name", "path", "context_length", "horizon"):
         if key not in data:
@@ -68,10 +106,41 @@ def load_config(path: str | Path) -> dict[str, Any]:
     method_name = method.get("name")
     if method_name not in METHODS:
         raise ValueError(f"config.method.name must be one of: {', '.join(sorted(METHODS))}")
-    if (method_name == "fsnet") != (backbone == "fsnet_tcn"):
-        raise ValueError("method fsnet must be paired with backbone fsnet_tcn")
-    if method_name == "fsnet" and method.get("learning_rate") is None:
-        raise ValueError("config.method.learning_rate is required for fsnet")
+    paired_backbones = {"fsnet": "fsnet_tcn", "onenet": "onenet_tcn"}
+    expected_backbone = paired_backbones.get(method_name)
+    if expected_backbone is not None and backbone != expected_backbone:
+        raise ValueError(f"method {method_name} must be paired with backbone {expected_backbone}")
+    if backbone in paired_backbones.values() and expected_backbone != backbone:
+        raise ValueError(f"backbone {backbone} requires its matching online method")
+    if method_name in paired_backbones and method.get("learning_rate") is None:
+        raise ValueError(f"config.method.learning_rate is required for {method_name}")
+    if method_name == "fsnet":
+        n_inner = method.get("n_inner", 1)
+        if not isinstance(n_inner, int) or isinstance(n_inner, bool) or n_inner <= 0:
+            raise ValueError("config.method.n_inner must be a positive integer for fsnet")
+        method["n_inner"] = n_inner
+    if method_name == "onenet":
+        for option in ("learning_rate", "weight_learning_rate", "decision_learning_rate"):
+            value = method.get(option, 1e-3)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0.0:
+                raise ValueError(f"config.method.{option} must be positive for onenet")
+            method[option] = float(value)
+        decision_hidden = method.get("decision_hidden", 32)
+        if not isinstance(decision_hidden, int) or isinstance(decision_hidden, bool) or decision_hidden <= 0:
+            raise ValueError("config.method.decision_hidden must be a positive integer for onenet")
+        method["decision_hidden"] = decision_hidden
+        decision_dropout = method.get("decision_dropout", 0.1)
+        if (
+            not isinstance(decision_dropout, (int, float))
+            or isinstance(decision_dropout, bool)
+            or not 0.0 <= decision_dropout < 1.0
+        ):
+            raise ValueError("config.method.decision_dropout must be in [0, 1) for onenet")
+        method["decision_dropout"] = float(decision_dropout)
+        n_inner = method.get("n_inner", 1)
+        if not isinstance(n_inner, int) or isinstance(n_inner, bool) or n_inner <= 0:
+            raise ValueError("config.method.n_inner must be a positive integer for onenet")
+        method["n_inner"] = n_inner
 
     offline_train_ratio = offline.get("train_ratio", 0.0)
     if (
@@ -101,8 +170,8 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("config.online.feedback_delay must be an integer or integer list")
     if isinstance(feedback_delay, int) and feedback_delay < 0:
         raise ValueError("config.online.feedback_delay must be non-negative")
-    if method_name == "fsnet" and isinstance(feedback_delay, list):
-        raise ValueError("fsnet requires a scalar complete-feedback delay")
+    if method_name in {"fsnet", "onenet"} and isinstance(feedback_delay, list):
+        raise ValueError(f"{method_name} requires a scalar complete-feedback delay")
 
     detector_name = drift.get("name")
     if detector_name not in DRIFT_DETECTORS:
@@ -126,6 +195,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
     run_name = output.get("run_name")
     if run_name is not None and not isinstance(run_name, str):
         raise ValueError("config.output.run_name must be a string or null")
+    write_per_value_errors = output.get("write_per_value_errors", True)
+    if not isinstance(write_per_value_errors, bool):
+        raise ValueError("config.output.write_per_value_errors must be a boolean")
+    output["write_per_value_errors"] = write_per_value_errors
 
     config["data"] = data
     config["forecasting"] = forecasting

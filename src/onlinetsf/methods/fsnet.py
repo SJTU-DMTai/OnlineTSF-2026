@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Fast and Slow Network (FSNet) for online time-series forecasting.
-
-The implementation follows the paper's two essential mechanisms: each TCN
-convolution is modulated from a gradient EMA, and a second, faster EMA triggers
-sparse reads and writes to a per-layer associative memory.
-"""
+"""FSNet model and online update logic based on the official implementation."""
 
 from __future__ import annotations
 
@@ -23,13 +18,14 @@ LossFunction = Callable[[Tensor, Tensor], Tensor]
 
 
 class AdaptiveConv1d(nn.Module):
-    """A causal convolution with FSNet's gradient adapter and memory."""
+    """FSNet's same-padded convolution, gradient adapter, and memory."""
 
     def __init__(
         self,
-        channels: int,
+        in_channels: int,
+        out_channels: int,
         kernel_size: int,
-        dilation: int,
+        dilation: int = 1,
         *,
         controller_hidden: int = 64,
         gradient_decay: float = 0.9,
@@ -40,8 +36,10 @@ class AdaptiveConv1d(nn.Module):
         memory_temperature: float = 0.5,
     ) -> None:
         super().__init__()
-        if channels <= 0 or kernel_size <= 0 or dilation <= 0 or controller_hidden <= 0:
-            raise ValueError("channels, kernel_size, dilation, and controller_hidden must be positive")
+        if min(in_channels, out_channels, kernel_size, dilation, controller_hidden) <= 0:
+            raise ValueError("channel counts, kernel_size, dilation, and controller_hidden must be positive")
+        if out_channels % in_channels != 0:
+            raise ValueError("out_channels must be divisible by in_channels")
         if not 0.0 <= fast_decay < gradient_decay < 1.0:
             raise ValueError("EMA decays must satisfy 0 <= fast_decay < gradient_decay < 1")
         if memory_size <= 0 or not 0 < memory_top_k <= memory_size:
@@ -49,76 +47,86 @@ class AdaptiveConv1d(nn.Module):
         if not 0.0 < memory_threshold < 1.0 or memory_temperature <= 0.0:
             raise ValueError("memory_threshold must be in (0, 1) and temperature must be positive")
 
-        self.channels = channels
+        receptive_field = (kernel_size - 1) * dilation + 1
+        self.padding = receptive_field // 2
+        self.remove = 1 if receptive_field % 2 == 0 else 0
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.kernel_size = kernel_size
-        self.dilation = dilation
-        self.padding = (kernel_size - 1) * dilation
         self.gradient_decay = gradient_decay
         self.fast_decay = fast_decay
         self.memory_top_k = memory_top_k
         self.memory_threshold = memory_threshold
         self.memory_temperature = memory_temperature
 
-        self.weight = nn.Parameter(torch.empty(channels, channels, kernel_size))
-        self.bias = nn.Parameter(torch.zeros(channels))
-        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+        self.conv = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            padding=self.padding,
+            dilation=dilation,
+            bias=False,
+        )
+        self.bias = nn.Parameter(torch.zeros(out_channels))
 
-        # Compress each channel gradient chunk into a few scales instead of mapping a full kernel.
-        gradient_chunk_size = channels * kernel_size
+        self.n_chunks = in_channels
+        chunk_input_size = self.conv.weight.numel() // self.n_chunks
+        output_ratio = out_channels // in_channels
         self.controller = nn.Sequential(
-            nn.Linear(gradient_chunk_size, controller_hidden),
+            nn.Linear(chunk_input_size, controller_hidden),
             nn.SiLU(),
         )
         self.weight_scale = nn.Linear(controller_hidden, kernel_size)
-        self.bias_scale = nn.Linear(controller_hidden, 1)
-        self.feature_scale = nn.Linear(controller_hidden, 1)
-        for head in (self.weight_scale, self.bias_scale, self.feature_scale):
-            nn.init.zeros_(head.weight)
-            nn.init.ones_(head.bias)
+        self.bias_scale = nn.Linear(controller_hidden, output_ratio)
+        self.feature_scale = nn.Linear(controller_hidden, output_ratio)
 
-        # u contains weight, bias, and feature scales; memory stores past u vectors.
-        adaptation_size = channels * (kernel_size + 2)
-        memory = torch.empty(memory_size, adaptation_size)
+        adaptation_size = in_channels * kernel_size + 2 * out_channels
+        memory = torch.empty(adaptation_size, memory_size)
         nn.init.xavier_uniform_(memory)
         memory.div_(max(1.0, torch.linalg.vector_norm(memory).item()))
-        # Buffers move with model.to() and enter state_dict(), but are not optimizer parameters.
         self.register_buffer("memory", memory)
-        self.register_buffer("gradient_ema", torch.zeros_like(self.weight).flatten())
-        self.register_buffer("fast_gradient_ema", torch.zeros_like(self.weight).flatten())
+        self.register_buffer("gradient_ema", torch.zeros(self.conv.weight.numel()))
+        self.register_buffer("fast_gradient_ema", torch.zeros(self.conv.weight.numel()))
         self.register_buffer("adaptation_ema", torch.zeros(adaptation_size))
-        # This flag is set after feedback and consumed by the following prediction.
+        self.register_buffer("adaptation_ema_initialized", torch.tensor(False))
         self.register_buffer("memory_trigger", torch.tensor(False))
         self.register_buffer("memory_interactions", torch.tensor(0, dtype=torch.long))
 
-    def _adaptation(self, *, advance_state: bool) -> tuple[Tensor, Tensor, Tensor]:
-        # The slow EMA is a stable recent gradient summary, chunked before entering the adapter.
-        chunks = self.gradient_ema.view(self.channels, self.channels, self.kernel_size)
-        chunks = chunks.permute(1, 0, 2).reshape(self.channels, -1)
+    def _adaptation(self, advance_state: bool) -> tuple[Tensor, Tensor, Tensor]:
+        chunks = self.gradient_ema.view(self.n_chunks, -1)
         representation = self.controller(chunks)
         weight_scale = self.weight_scale(representation)
-        bias_scale = self.bias_scale(representation).flatten()
-        feature_scale = self.feature_scale(representation).flatten()
-        adaptation = torch.cat((weight_scale.flatten(), bias_scale, feature_scale))
+        bias_scale = self.bias_scale(representation)
+        feature_scale = self.feature_scale(representation)
+        adaptation = torch.cat(
+            (weight_scale.flatten(), bias_scale.flatten(), feature_scale.flatten())
+        )
 
-        # Advance u EMA only for emitted forecasts; feedback recomputation must not create another time step.
         if advance_state:
-            self.adaptation_ema.mul_(self.fast_decay).add_(
-                adaptation.detach(), alpha=1.0 - self.fast_decay
-            )
-            # Read and write memory sparsely only when fast and slow gradient directions conflict.
-            if self.memory_trigger.item():
-                scores = self.memory @ self.adaptation_ema
-                attention = F.softmax(scores / self.memory_temperature, dim=0)
-                # The recalled vector is the attention-weighted sum of only the most relevant memories.
-                top_values, top_indices = torch.topk(attention, self.memory_top_k)
-                recalled = (self.memory.index_select(0, top_indices) * top_values.unsqueeze(1)).sum(dim=0)
+            if self.adaptation_ema_initialized.item():
+                self.adaptation_ema.mul_(self.fast_decay).add_(
+                    adaptation.detach(), alpha=1.0 - self.fast_decay
+                )
+            else:
+                self.adaptation_ema_initialized.fill_(True)
+            query = self.adaptation_ema
 
-                # Write only top-k memory slots, then bound the memory norm.
+            if self.memory_trigger.item():
+                attention = F.softmax(
+                    query @ self.memory / self.memory_temperature,
+                    dim=0,
+                )
+                top_values, top_indices = torch.topk(attention, self.memory_top_k)
+                selected_memory = self.memory.index_select(1, top_indices)
+                recalled = selected_memory @ top_indices.to(selected_memory.dtype)
+
                 sparse_attention = torch.zeros_like(attention)
                 sparse_attention[top_indices] = top_values
-                self.memory.mul_(self.memory_threshold).add_(
-                    sparse_attention.unsqueeze(1) * self.adaptation_ema.unsqueeze(0),
-                    alpha=1.0 - self.memory_threshold,
+                memory_update = recalled.unsqueeze(1) * sparse_attention.unsqueeze(0)
+                self.memory[:, top_indices] = (
+                    self.memory_threshold * selected_memory
+                    + (1.0 - self.memory_threshold)
+                    * memory_update.index_select(1, top_indices)
                 )
                 self.memory.div_(max(1.0, torch.linalg.vector_norm(self.memory).item()))
                 adaptation = (
@@ -128,63 +136,84 @@ class AdaptiveConv1d(nn.Module):
                 self.memory_trigger.fill_(False)
                 self.memory_interactions.add_(1)
 
-        weight_end = self.channels * self.kernel_size
-        bias_end = weight_end + self.channels
+        weight_end = self.in_channels * self.kernel_size
+        bias_end = weight_end + self.out_channels
         return (
-            adaptation[:weight_end].view(1, self.channels, self.kernel_size),
+            adaptation[:weight_end].view(1, self.in_channels, self.kernel_size),
             adaptation[weight_end:bias_end],
             adaptation[bias_end:],
         )
 
-    def forward(self, values: Tensor, *, advance_state: bool = False) -> Tensor:
-        weight_scale, bias_scale, feature_scale = self._adaptation(advance_state=advance_state)
-        # alpha scales convolution weights and beta scales features; right cropping preserves causality.
+    def forward(self, values: Tensor, *, advance_state: bool = True) -> Tensor:
+        weight_scale, bias_scale, feature_scale = self._adaptation(advance_state)
         output = F.conv1d(
             values,
-            self.weight * weight_scale,
+            self.conv.weight * weight_scale,
             self.bias * bias_scale,
             padding=self.padding,
-            dilation=self.dilation,
+            dilation=self.conv.dilation,
         )
-        if self.padding:
-            output = output[..., :-self.padding]
+        if self.remove:
+            output = output[..., :-self.remove]
         return output * feature_scale.view(1, -1, 1)
 
     @torch.no_grad()
     def record_gradient(self) -> None:
-        """Update both gradient EMAs and arm the next memory interaction."""
+        """Update official fast/slow gradient EMAs after backpropagation."""
 
-        # The post-backprop gradient measures this layer contribution; normalization emphasizes direction.
-        gradient = F.normalize(self.weight.grad.detach().flatten(), dim=0)
-        self.fast_gradient_ema.mul_(self.fast_decay).add_(gradient, alpha=1.0 - self.fast_decay)
-        similarity = F.cosine_similarity(
-            self.fast_gradient_ema,
-            self.gradient_ema,
-            dim=0,
-            eps=1e-6,
+        gradient = F.normalize(self.conv.weight.grad.detach()).flatten()
+        self.fast_gradient_ema.mul_(self.fast_decay).add_(
+            gradient, alpha=1.0 - self.fast_decay
         )
-        # Opposing fast and slow EMAs arm a memory interaction for the next prediction.
-        if similarity.item() < -self.memory_threshold:
-            self.memory_trigger.fill_(True)
-        self.gradient_ema.mul_(self.gradient_decay).add_(gradient, alpha=1.0 - self.gradient_decay)
+        if not self.training:
+            similarity = F.cosine_similarity(
+                self.fast_gradient_ema,
+                self.gradient_ema,
+                dim=0,
+                eps=1e-6,
+            )
+            if similarity.item() < -self.memory_threshold:
+                self.memory_trigger.fill_(True)
+        self.gradient_ema.mul_(self.gradient_decay).add_(
+            gradient, alpha=1.0 - self.gradient_decay
+        )
 
 
 class FSNetBlock(nn.Module):
-    """Residual pair of FSNet adaptive convolutions."""
+    """Official two-convolution residual block."""
 
-    def __init__(self, channels: int, kernel_size: int, dilation: int, **adapter_options: float | int) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dilation: int,
+        *,
+        final: bool = False,
+        **adapter_options: float | int,
+    ) -> None:
         super().__init__()
-        self.conv1 = AdaptiveConv1d(channels, kernel_size, dilation, **adapter_options)
-        self.conv2 = AdaptiveConv1d(channels, kernel_size, dilation, **adapter_options)
+        self.conv1 = AdaptiveConv1d(
+            in_channels, out_channels, kernel_size, dilation, **adapter_options
+        )
+        self.conv2 = AdaptiveConv1d(
+            out_channels, out_channels, kernel_size, dilation, **adapter_options
+        )
+        self.projector = (
+            nn.Conv1d(in_channels, out_channels, 1)
+            if in_channels != out_channels or final
+            else None
+        )
 
-    def forward(self, values: Tensor, *, advance_state: bool = False) -> Tensor:
+    def forward(self, values: Tensor, *, advance_state: bool = True) -> Tensor:
+        residual = values if self.projector is None else self.projector(values)
         output = self.conv1(F.gelu(values), advance_state=advance_state)
         output = self.conv2(F.gelu(output), advance_state=advance_state)
-        return output + values
+        return output + residual
 
 
 class FSNetTCN(ForecastBackbone):
-    """TCN forecaster equipped with FSNet adapters on every convolution."""
+    """Official FSNet TCN encoder with a direct multi-horizon regressor."""
 
     def __init__(
         self,
@@ -195,7 +224,9 @@ class FSNetTCN(ForecastBackbone):
         *,
         hidden_channels: int = 64,
         depth: int = 10,
+        representation_channels: int = 320,
         kernel_size: int = 3,
+        representation_dropout: float = 0.1,
         controller_hidden: int = 64,
         gradient_decay: float = 0.9,
         fast_decay: float = 0.3,
@@ -207,8 +238,12 @@ class FSNetTCN(ForecastBackbone):
         super().__init__()
         if context_length <= 0 or num_features <= 0 or horizon <= 0:
             raise ValueError("context_length, num_features, and horizon must be positive")
-        if hidden_channels <= 0 or depth <= 0 or kernel_size <= 0:
-            raise ValueError("hidden_channels, depth, and kernel_size must be positive")
+        if hidden_channels <= 0 or depth <= 0 or representation_channels <= 0 or kernel_size <= 0:
+            raise ValueError("channel counts, depth, and kernel_size must be positive")
+        if representation_channels % hidden_channels != 0:
+            raise ValueError("representation_channels must be divisible by hidden_channels")
+        if not 0.0 <= representation_dropout < 1.0:
+            raise ValueError("representation_dropout must be in [0, 1)")
 
         self.context_length = context_length
         self.num_features = num_features
@@ -217,7 +252,6 @@ class FSNetTCN(ForecastBackbone):
         if self.num_targets <= 0:
             raise ValueError("num_targets must be positive")
 
-        # Project raw features to a fixed hidden width before adaptive convolutions.
         self.input_projection = nn.Linear(num_features, hidden_channels)
         adapter_options: dict[str, float | int] = {
             "controller_hidden": controller_hidden,
@@ -228,29 +262,38 @@ class FSNetTCN(ForecastBackbone):
             "memory_threshold": memory_threshold,
             "memory_temperature": memory_temperature,
         }
-        # Each residual block has two adapted convolutions at one exponentially growing dilation.
+        channels = [hidden_channels] * depth + [representation_channels]
         self.blocks = nn.ModuleList(
-            FSNetBlock(hidden_channels, kernel_size, 2**index, **adapter_options)
-            for index in range(depth)
+            FSNetBlock(
+                channels[index - 1] if index else hidden_channels,
+                output_channels,
+                kernel_size,
+                2**index,
+                final=index == len(channels) - 1,
+                **adapter_options,
+            )
+            for index, output_channels in enumerate(channels)
         )
-        self.head = nn.Linear(hidden_channels, horizon * self.num_targets)
+        self.representation_dropout = nn.Dropout(representation_dropout)
+        self.head = nn.Linear(representation_channels, horizon * self.num_targets)
 
-    def forward(self, context: Tensor, *, advance_state: bool = False) -> Tensor:
+    def forward(self, context: Tensor, *, advance_state: bool = True) -> Tensor:
         if context.ndim != 3 or context.shape[1:] != (self.context_length, self.num_features):
             raise ValueError(
                 "context shape does not match the model configuration: "
                 f"expected [batch, {self.context_length}, {self.num_features}]"
             )
-        # Convert [batch, time, features] to the [batch, channels, time] layout required by Conv1d.
-        encoded = self.input_projection(context).transpose(1, 2)
+        valid_steps = ~context.isnan().any(dim=-1)
+        values = context.masked_fill(~valid_steps.unsqueeze(-1), 0.0)
+        encoded = self.input_projection(values).transpose(1, 2)
         for block in self.blocks:
             encoded = block(encoded, advance_state=advance_state)
-        # A direct linear head maps the final causal representation to every horizon and target.
+        encoded = self.representation_dropout(encoded)
         forecast = self.head(encoded[..., -1])
         return forecast.reshape(context.shape[0], self.horizon, self.num_targets)
 
     def record_gradients(self) -> None:
-        """Update adapter state after loss backpropagation."""
+        """Store gradients for every adapted convolution."""
 
         for module in self.modules():
             if isinstance(module, AdaptiveConv1d):
@@ -258,7 +301,7 @@ class FSNetTCN(ForecastBackbone):
 
 
 class FSNetMethod:
-    """Own FSNet prediction and feedback updates behind the online lifecycle."""
+    """Own FSNet prediction and official-style online feedback updates."""
 
     def __init__(
         self,
@@ -267,43 +310,45 @@ class FSNetMethod:
         learning_rate: float = 1e-3,
         optimizer: Optimizer | None = None,
         loss_fn: LossFunction | None = None,
+        n_inner: int = 1,
         device: torch.device | str | None = None,
     ) -> None:
         if learning_rate <= 0.0:
             raise ValueError("learning_rate must be positive")
+        if n_inner <= 0:
+            raise ValueError("n_inner must be positive")
         self.model = model
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.model.to(self.device)
-        # Optimizer state belongs to the method and should be checkpointed alongside the model.
         self.optimizer = optimizer or AdamW(model.parameters(), lr=learning_rate)
         self.loss_fn = loss_fn or nn.MSELoss()
+        self.n_inner = n_inner
 
     def predict(self, context: Tensor) -> Tensor:
-        """Forecast one context and advance FSNet's prediction-time state."""
+        """Forecast one context using the current adapter and memory state."""
 
-        # Prediction may advance memory state but does not construct an autograd graph.
         self.model.eval()
         with torch.no_grad():
             prediction = self.model(context.unsqueeze(0).to(self.device), advance_state=True)
         return prediction.squeeze(0)
 
     def on_feedback(self, feedback: MethodFeedback) -> float:
-        """Learn from one complete forecast target and update FSNet state."""
+        """Apply official-style inner updates after complete feedback arrives."""
 
         if not feedback.observed_mask.all():
             raise ValueError("FSNetMethod requires complete-horizon feedback")
-        # Train only when a label arrives; the recomputed forward pass does not advance EMA time.
-        self.model.train()
+        self.model.eval()
         context = feedback.context.unsqueeze(0).to(self.device)
         target = feedback.target.unsqueeze(0).to(self.device)
-        # Clear gradients from the previous feedback event before differentiating the current loss.
-        self.optimizer.zero_grad(set_to_none=True)
-        prediction = self.model(context, advance_state=False)
-        loss = self.loss_fn(prediction, target)
-        if loss.ndim != 0:
-            raise ValueError("loss_fn must return a scalar tensor")
-        # Update EMA/trigger from the current gradient before changing trainable parameters.
-        loss.backward()
-        self.model.record_gradients()
-        self.optimizer.step()
-        return loss.detach().item()
+        losses: list[float] = []
+        for inner_step in range(self.n_inner):
+            self.optimizer.zero_grad(set_to_none=True)
+            prediction = self.model(context, advance_state=inner_step > 0)
+            loss = self.loss_fn(prediction, target)
+            if loss.ndim != 0:
+                raise ValueError("loss_fn must return a scalar tensor")
+            loss.backward()
+            self.optimizer.step()
+            self.model.record_gradients()
+            losses.append(loss.detach().item())
+        return sum(losses) / len(losses)

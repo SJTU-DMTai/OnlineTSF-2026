@@ -14,9 +14,15 @@ from torch.utils.data import DataLoader, Subset
 from .config import load_config
 from .data import load_benchmark_dataset
 from .documentation import write_experiment_documents
-from .drift import ADWINDetector, KSWINDetector, PageHinkleyDetector
-from .forecasting import LinearForecastBackbone, PatchTSTForecastBackbone, TCNForecastBackbone
-from .methods import FSNetMethod, FSNetTCN, OGDMethod
+from .drift import ADWINDetector, DriftRecord, KSWINDetector, PageHinkleyDetector
+from .forecasting import (
+    LinearForecastBackbone,
+    LSTMForecastBackbone,
+    PatchTSTForecastBackbone,
+    TCNForecastBackbone,
+    TimeTCNForecastBackbone,
+)
+from .methods import FSNetMethod, FSNetTCN, OGDMethod, OneNetEnsemble, OneNetMethod
 from .online import OnlineExecutor, OnlineRun
 
 
@@ -32,10 +38,25 @@ def _build_backbone(config: dict[str, Any], num_features: int, num_targets: int,
     }
     if forecasting["backbone"] == "linear":
         return LinearForecastBackbone(**dimensions, **options)
+    if forecasting["backbone"] == "lstm":
+        return LSTMForecastBackbone(**dimensions, **options)
     if forecasting["backbone"] == "tcn":
         return TCNForecastBackbone(**dimensions, **options)
     if forecasting["backbone"] == "patchtst":
         return PatchTSTForecastBackbone(**dimensions, target_indices=target_indices, **options)
+    if forecasting["backbone"] == "onenet_tcn":
+        cross_time = TimeTCNForecastBackbone(
+            **dimensions, target_indices=target_indices, **options
+        )
+        cross_variable = TCNForecastBackbone(**dimensions, **options)
+        return OneNetEnsemble(
+            cross_time,
+            cross_variable,
+            horizon=data["horizon"],
+            num_targets=num_targets,
+            decision_hidden=config["method"].get("decision_hidden", 32),
+            decision_dropout=config["method"].get("decision_dropout", 0.1),
+        )
     return FSNetTCN(**dimensions, **options)
 
 
@@ -43,9 +64,24 @@ def _build_method(config: dict[str, Any], model: nn.Module):
     method = config["method"]
     device = config["online"].get("device")
     learning_rate = method.get("learning_rate")
+    if method["name"] == "onenet":
+        assert isinstance(model, OneNetEnsemble)
+        return OneNetMethod(
+            model,
+            learning_rate=learning_rate,
+            weight_learning_rate=method.get("weight_learning_rate", 1e-3),
+            decision_learning_rate=method.get("decision_learning_rate", 1e-3),
+            n_inner=method.get("n_inner", 1),
+            device=device,
+        )
     if method["name"] == "fsnet":
         assert isinstance(model, FSNetTCN)
-        return FSNetMethod(model, learning_rate=learning_rate, device=device)
+        return FSNetMethod(
+            model,
+            learning_rate=learning_rate,
+            n_inner=method.get("n_inner", 1),
+            device=device,
+        )
 
     if learning_rate is None:
         return OGDMethod(model, device=device)
@@ -59,7 +95,9 @@ def _build_method(config: dict[str, Any], model: nn.Module):
     )
 
 
-def _run_offline_training(dataset, method: OGDMethod | FSNetMethod, offline: dict[str, Any]) -> int:
+def _run_offline_training(
+    dataset, method: OGDMethod | FSNetMethod | OneNetMethod, offline: dict[str, Any]
+) -> int:
     """Train the model on an initial window prefix before online evaluation."""
 
     train_size = int(len(dataset) * offline["train_ratio"])
@@ -68,16 +106,23 @@ def _run_offline_training(dataset, method: OGDMethod | FSNetMethod, offline: dic
             return 0
         raise ValueError("config.offline.train_ratio selects no training windows")
 
-    optimizer = method.optimizer
-    loss_fn = method.loss_fn
-    if optimizer is None or loss_fn is None:
-        raise ValueError("offline training requires config.method.learning_rate")
-
     loader = DataLoader(
         Subset(dataset, range(train_size)),
         batch_size=offline["batch_size"],
         shuffle=True,
     )
+    if isinstance(method, OneNetMethod):
+        for _ in range(offline["epochs"]):
+            for context, target in loader:
+                method.train_batch(context, target)
+        method.reset_online_state()
+        return train_size
+
+    optimizer = method.optimizer
+    loss_fn = method.loss_fn
+    if optimizer is None or loss_fn is None:
+        raise ValueError("offline training requires config.method.learning_rate")
+
     method.model.train()
     for _ in range(offline["epochs"]):
         for context, target in loader:
@@ -85,9 +130,9 @@ def _run_offline_training(dataset, method: OGDMethod | FSNetMethod, offline: dic
             prediction = method.model(context.to(method.device))
             loss = loss_fn(prediction, target.to(method.device))
             loss.backward()
+            optimizer.step()
             if isinstance(method, FSNetMethod):
                 method.model.record_gradients()
-            optimizer.step()
     return train_size
 
 
@@ -103,8 +148,8 @@ def _build_detector(config: dict[str, Any]):
     return KSWINDetector(**options)
 
 
-def run_experiment(config: dict[str, Any]) -> tuple[OnlineRun, list[int]]:
-    """Run one configured prequential experiment and return detected drift indices."""
+def run_forecast(config: dict[str, Any]) -> OnlineRun:
+    """Run one configured prequential forecasting experiment."""
 
     seed = config.get("seed")
     if seed is not None:
@@ -125,24 +170,59 @@ def run_experiment(config: dict[str, Any]) -> tuple[OnlineRun, list[int]]:
     executor = OnlineExecutor(
         method,
         feedback_delay=online["feedback_delay"],
-        keep_predictions=online.get("keep_predictions", False),
+        keep_predictions=(
+            online.get("keep_predictions", False)
+            or config["output"]["write_per_value_errors"]
+        ),
     )
-    run = executor.run_dataset(
+    return executor.run_dataset(
         dataset,
         start=max(offline_stop, online.get("start", 0)),
         stop=online.get("stop"),
     )
 
+
+def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftRecord]:
+    """Apply the selected detector to every recorded forecasting feedback event."""
+
     detector = _build_detector(config)
-    drift_indices: list[int] = []
+    records: list[DriftRecord] = []
     if detector is not None:
         signal_name = config["drift"].get("signal", "mae")
         for event in run.events:
             signal = getattr(event, signal_name)
             if config["drift"]["name"] == "adwin":
                 signal = min(signal / config["drift"]["scale"], 1.0)
-            if detector.update(signal).detected:
-                drift_indices.append(event.index)
+            update = detector.update(signal)
+            records.append(
+                DriftRecord(
+                    detector=config["drift"]["name"],
+                    signal=signal_name,
+                    index=event.index,
+                    available_at=event.available_at,
+                    value=update.value,
+                    mean=update.mean,
+                    score=update.score,
+                    detected=update.detected,
+                )
+            )
+    return records
+
+
+def run_experiment_with_drift(
+    config: dict[str, Any],
+) -> tuple[OnlineRun, list[int], list[DriftRecord]]:
+    """Run one experiment and preserve every detector update for documentation."""
+
+    run = run_forecast(config)
+    records = collect_drift_records(config, run)
+    return run, [record.index for record in records if record.detected], records
+
+
+def run_experiment(config: dict[str, Any]) -> tuple[OnlineRun, list[int]]:
+    """Run one configured prequential experiment and return detected drift indices."""
+
+    run, drift_indices, _ = run_experiment_with_drift(config)
     return run, drift_indices
 
 
@@ -154,13 +234,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
-    run, drift_indices = run_experiment(config)
+    run, drift_indices, drift_records = run_experiment_with_drift(config)
     document_directory = write_experiment_documents(
         config["output"]["directory"],
         config["output"].get("run_name"),
         config,
         run,
         drift_indices,
+        drift_records,
     )
     print(
         f"forecasts={run.metrics.forecasts_emitted} "

@@ -1,0 +1,80 @@
+# Forecasting-method combinations and drift-detector defaults.
+
+strategies:
+  linear_ogd:
+    forecasting:
+      backbone: linear
+      parameters: {}
+    method:
+      name: ogd
+      learning_rate: 0.001
+      update_steps: 1
+
+  lstm_ogd:
+    forecasting:
+      backbone: lstm
+      parameters: {hidden_size: 64, num_layers: 2, dropout: 0.1}
+    method:
+      name: ogd
+      learning_rate: 0.001
+      update_steps: 1
+
+  tcn_ogd:
+    forecasting:
+      backbone: tcn
+      parameters: {channels: [32, 32, 32, 32, 32], kernel_size: 3, dropout: 0.0}
+    method:
+      name: ogd
+      learning_rate: 0.001
+      update_steps: 1
+
+  patchtst_ogd:
+    forecasting:
+      backbone: patchtst
+      parameters: {patch_length: 16, patch_stride: 8, d_model: 64, num_heads: 4, num_layers: 2, dropout: 0.0}
+    method:
+      name: ogd
+      learning_rate: 0.001
+      update_steps: 1
+
+  fsnet:
+    forecasting:
+      backbone: fsnet_tcn
+      parameters: {hidden_channels: 64, depth: 10, representation_channels: 320, representation_dropout: 0.1, memory_size: 32}
+    method:
+      name: fsnet
+      learning_rate: 0.001
+      n_inner: 1
+
+  onenet:
+    forecasting:
+      backbone: onenet_tcn
+      parameters: {channels: [32, 32, 32, 32, 32], kernel_size: 3, dropout: 0.0}
+    method:
+      name: onenet
+      learning_rate: 0.001
+      weight_learning_rate: 0.001
+      decision_learning_rate: 0.001
+      decision_hidden: 32
+      decision_dropout: 0.1
+      n_inner: 1
+
+detectors:
+  none:
+    name: none
+
+  page_hinkley:
+    name: page_hinkley
+    signal: mae
+    parameters: {delta: 0.005, threshold: 50.0, min_instances: 30}
+
+  adwin:
+    name: adwin
+    signal: mae
+    scale: 1.0
+    parameters: {delta: 0.002, min_window_length: 20}
+
+  kswin:
+    name: kswin
+    signal: mae
+    parameters: {alpha: 0.005, window_size: 100, stat_size: 30}

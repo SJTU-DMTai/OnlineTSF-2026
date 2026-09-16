@@ -3,5 +3,13 @@
 
 from .fsnet import AdaptiveConv1d, FSNetMethod, FSNetTCN
 from .ogd import OGDMethod
+from .onenet import OneNetEnsemble, OneNetMethod
 
-__all__ = ["AdaptiveConv1d", "FSNetMethod", "FSNetTCN", "OGDMethod"]
+__all__ = [
+    "AdaptiveConv1d",
+    "FSNetMethod",
+    "FSNetTCN",
+    "OGDMethod",
+    "OneNetEnsemble",
+    "OneNetMethod",
+]

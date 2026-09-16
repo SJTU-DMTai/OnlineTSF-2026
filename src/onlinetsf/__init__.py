@@ -3,7 +3,13 @@
 
 from .data import SlidingWindowDataset, load_benchmark_dataset
 from .drift import ADWINDetector, KSWINDetector, PageHinkleyDetector
-from .forecasting import LinearForecastBackbone, PatchTSTForecastBackbone, TCNForecastBackbone
+from .forecasting import (
+    LinearForecastBackbone,
+    LSTMForecastBackbone,
+    PatchTSTForecastBackbone,
+    TCNForecastBackbone,
+    TimeTCNForecastBackbone,
+)
 from .online import (
     FeedbackEvent,
     ForecastEmission,
@@ -14,7 +20,14 @@ from .online import (
     OnlineRun,
     OnlineStep,
 )
-from .methods import AdaptiveConv1d, FSNetMethod, FSNetTCN, OGDMethod
+from .methods import (
+    AdaptiveConv1d,
+    FSNetMethod,
+    FSNetTCN,
+    OGDMethod,
+    OneNetEnsemble,
+    OneNetMethod,
+)
 
 __all__ = [
     "ADWINDetector",
@@ -23,8 +36,10 @@ __all__ = [
     "FSNetTCN",
     "KSWINDetector",
     "LinearForecastBackbone",
+    "LSTMForecastBackbone",
     "PatchTSTForecastBackbone",
     "TCNForecastBackbone",
+    "TimeTCNForecastBackbone",
     "PageHinkleyDetector",
     "FeedbackEvent",
     "ForecastEmission",
@@ -32,6 +47,8 @@ __all__ = [
     "OnlineExecutor",
     "OnlineMethod",
     "OGDMethod",
+    "OneNetEnsemble",
+    "OneNetMethod",
     "OnlineMetrics",
     "OnlineRun",
     "OnlineStep",
