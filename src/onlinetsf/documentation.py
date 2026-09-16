@@ -60,12 +60,14 @@ def write_experiment_documents(
 
     with (directory / "forecast_values.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
+        target_names = config["data"].get("target_names", ())
         writer.writerow(
             (
                 "forecast_index",
                 "feedback_available_at",
                 "horizon_step",
                 "target_position",
+                "target_name",
                 "prediction",
                 "target",
                 "absolute_error",
@@ -88,6 +90,7 @@ def write_experiment_documents(
                             event.available_at,
                             horizon_index + 1,
                             target_index,
+                            target_names[target_index],
                             prediction,
                             target,
                             abs(error),
@@ -145,6 +148,12 @@ def write_experiment_documents(
         handle.write(f"Prequential MSE: {_format_metric(run.metrics.mse)}\n")
         handle.write(f"Adaptation steps: {run.metrics.adaptation_steps}\n")
         handle.write(f"Mean adaptation loss: {_format_metric(run.metrics.mean_adaptation_loss)}\n\n")
+        handle.write("Runtime\n")
+        handle.write(f"Setup: {_format_metric(run.metrics.setup_seconds)} seconds\n")
+        handle.write(f"Offline training: {_format_metric(run.metrics.offline_training_seconds)} seconds\n")
+        handle.write(f"Online evaluation: {_format_metric(run.metrics.online_evaluation_seconds)} seconds\n")
+        handle.write(f"Drift detection: {_format_metric(run.metrics.drift_detection_seconds)} seconds\n")
+        handle.write(f"Total execution: {_format_metric(run.metrics.total_seconds)} seconds\n\n")
         handle.write("Drift Events\n")
         detected_records = [record for record in drift_records if record.detected]
         if detected_records:

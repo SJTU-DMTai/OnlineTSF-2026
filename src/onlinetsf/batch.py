@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Sequence
 
 import yaml
@@ -76,6 +78,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "feedback_available_at",
                 "horizon_step",
                 "target_position",
+                "target_name",
                 "prediction",
                 "target",
                 "absolute_error",
@@ -120,6 +123,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "mse",
                 "adaptation_steps",
                 "mean_adaptation_loss",
+                "setup_seconds",
+                "offline_training_seconds",
+                "online_evaluation_seconds",
+                "drift_detection_seconds",
+                "total_seconds",
                 "documents",
             )
         )
@@ -137,6 +145,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 config["output"]["run_name"] = f"{strategy}-seed-{seed}"
                 run = run_forecast(config)
 
+                detection_started = perf_counter()
                 drift_records = []
                 for detector_name in args.detectors:
                     detector_config = load_config(
@@ -145,6 +154,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                         detector_name=detector_name,
                     )
                     drift_records.extend(collect_drift_records(detector_config, run))
+                drift_detection_seconds = perf_counter() - detection_started
+                run = replace(
+                    run,
+                    metrics=replace(
+                        run.metrics,
+                        drift_detection_seconds=drift_detection_seconds,
+                        total_seconds=(run.metrics.total_seconds or 0.0) + drift_detection_seconds,
+                    ),
+                )
                 drift_indices = [record.index for record in drift_records if record.detected]
                 document_directory = write_experiment_documents(
                     config["output"]["directory"],
@@ -218,6 +236,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                         metrics.mse,
                         metrics.adaptation_steps,
                         metrics.mean_adaptation_loss,
+                        metrics.setup_seconds,
+                        metrics.offline_training_seconds,
+                        metrics.online_evaluation_seconds,
+                        metrics.drift_detection_seconds,
+                        metrics.total_seconds,
                         document_directory,
                     )
                 )

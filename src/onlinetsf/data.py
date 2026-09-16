@@ -41,6 +41,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         context_length: int,
         horizon: int,
         target_indices: Sequence[int] | None = None,
+        target_names: Sequence[str] | None = None,
         stride: int = 1,
     ) -> None:
         if values.ndim != 2:
@@ -62,6 +63,12 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
             raise ValueError("target_indices must not be empty")
         if min(self.target_indices) < 0 or max(self.target_indices) >= values.shape[1]:
             raise ValueError("target_indices contain an out-of-range feature index")
+        if target_names is None:
+            self.target_names = tuple(f"target_{index}" for index in self.target_indices)
+        else:
+            self.target_names = tuple(target_names)
+            if len(self.target_names) != len(self.target_indices):
+                raise ValueError("target_names must have the same length as target_indices")
 
     @property
     def num_features(self) -> int:
@@ -140,6 +147,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
             context_length=context_length,
             horizon=horizon,
             target_indices=target_indices,
+            target_names=selected_targets,
             stride=stride,
         )
 

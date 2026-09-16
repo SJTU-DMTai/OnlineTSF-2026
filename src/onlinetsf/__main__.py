@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from dataclasses import replace
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -151,6 +153,7 @@ def _build_detector(config: dict[str, Any]):
 def run_forecast(config: dict[str, Any]) -> OnlineRun:
     """Run one configured prequential forecasting experiment."""
 
+    experiment_started = perf_counter()
     seed = config.get("seed")
     if seed is not None:
         torch.manual_seed(seed)
@@ -163,9 +166,13 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         horizon=data["horizon"],
         stride=data.get("stride", 1),
     )
+    data["target_names"] = list(dataset.target_names)
     model = _build_backbone(config, dataset.num_features, dataset.num_targets, dataset.target_indices)
     method = _build_method(config, model)
+    setup_seconds = perf_counter() - experiment_started
+    offline_started = perf_counter()
     offline_stop = _run_offline_training(dataset, method, config["offline"])
+    offline_training_seconds = perf_counter() - offline_started
     online = config["online"]
     executor = OnlineExecutor(
         method,
@@ -175,11 +182,21 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
             or config["output"]["write_per_value_errors"]
         ),
     )
-    return executor.run_dataset(
+    online_started = perf_counter()
+    run = executor.run_dataset(
         dataset,
         start=max(offline_stop, online.get("start", 0)),
         stop=online.get("stop"),
     )
+    online_evaluation_seconds = perf_counter() - online_started
+    metrics = replace(
+        run.metrics,
+        setup_seconds=setup_seconds,
+        offline_training_seconds=offline_training_seconds,
+        online_evaluation_seconds=online_evaluation_seconds,
+        total_seconds=perf_counter() - experiment_started,
+    )
+    return replace(run, metrics=metrics)
 
 
 def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftRecord]:
@@ -215,7 +232,15 @@ def run_experiment_with_drift(
     """Run one experiment and preserve every detector update for documentation."""
 
     run = run_forecast(config)
+    detection_started = perf_counter()
     records = collect_drift_records(config, run)
+    drift_detection_seconds = perf_counter() - detection_started
+    metrics = replace(
+        run.metrics,
+        drift_detection_seconds=drift_detection_seconds,
+        total_seconds=(run.metrics.total_seconds or 0.0) + drift_detection_seconds,
+    )
+    run = replace(run, metrics=metrics)
     return run, [record.index for record in records if record.detected], records
 
 

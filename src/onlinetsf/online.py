@@ -79,6 +79,11 @@ class OnlineMetrics:
     mse: float | None
     adaptation_steps: int
     mean_adaptation_loss: float | None
+    setup_seconds: float | None = None
+    offline_training_seconds: float | None = None
+    online_evaluation_seconds: float | None = None
+    drift_detection_seconds: float | None = None
+    total_seconds: float | None = None
 
 
 @dataclass(frozen=True)
