@@ -5,7 +5,7 @@ tests/
 runs/
 data/
 figures/
-scripts/
+
 
 # Python bytecode
 __pycache__/

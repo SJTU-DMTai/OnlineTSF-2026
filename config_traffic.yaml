@@ -14,7 +14,7 @@ data:
   stride: 1
 
 offline:
-  train_ratio: 0.25
+  train_ratio: 0.20
   epochs: 5
   batch_size: 32
 

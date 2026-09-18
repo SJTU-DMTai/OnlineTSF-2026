@@ -23,7 +23,7 @@ online:
   feedback_delay: 0
   start: 0
   stop: null
-  device: cpu
+  device: cuda
   keep_predictions: false
 
 output:
