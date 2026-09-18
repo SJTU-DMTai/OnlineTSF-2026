@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Subset
 from .config import load_config
 from .data import load_benchmark_dataset
 from .documentation import write_experiment_documents
-from .drift import ADWINDetector, DriftRecord, KSWINDetector, PageHinkleyDetector
+from .drift import ADWINDetector, DriftObservation, DriftRecord, KSWINDetector, PageHinkleyDetector
 from .forecasting import (
     LinearForecastBackbone,
     LSTMForecastBackbone,
@@ -25,7 +25,7 @@ from .forecasting import (
     TimeTCNForecastBackbone,
 )
 from .methods import FSNetMethod, FSNetTCN, OGDMethod, OneNetEnsemble, OneNetMethod
-from .online import OnlineExecutor, OnlineRun
+from .online import FeedbackEvent, OnlineExecutor, OnlineRun
 
 
 def _build_backbone(config: dict[str, Any], num_features: int, num_targets: int, target_indices: Sequence[int]):
@@ -167,6 +167,7 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         stride=data.get("stride", 1),
     )
     data["target_names"] = list(dataset.target_names)
+    data["feature_names"] = list(dataset.feature_names)
     model = _build_backbone(config, dataset.num_features, dataset.num_targets, dataset.target_indices)
     method = _build_method(config, model)
     setup_seconds = perf_counter() - experiment_started
@@ -180,6 +181,7 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         keep_predictions=(
             online.get("keep_predictions", False)
             or config["output"]["write_per_value_errors"]
+            or config["drift"]["name"] != "none"
         ),
     )
     online_started = perf_counter()
@@ -199,30 +201,92 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
     return replace(run, metrics=metrics)
 
 
-def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftRecord]:
-    """Apply the selected detector to every recorded forecasting feedback event."""
+def _drift_values(config: dict[str, Any], event: FeedbackEvent) -> list[DriftObservation]:
+    source = config["drift"]["source"]
+    if source == "features":
+        if event.features is None:
+            raise ValueError("feature drift detection requires retained feature values")
+        feature_names = config["data"].get(
+            "feature_names", [f"feature_{index}" for index in range(event.features.numel())]
+        )
+        return [
+            DriftObservation(name, index, None, value, event.index)
+            for index, (name, value) in enumerate(
+                zip(feature_names, event.features.tolist(), strict=True)
+            )
+        ]
 
-    detector = _build_detector(config)
-    records: list[DriftRecord] = []
-    if detector is not None:
-        signal_name = config["drift"].get("signal", "mae")
-        for event in run.events:
-            signal = getattr(event, signal_name)
-            if config["drift"]["name"] == "adwin":
-                signal = min(signal / config["drift"]["scale"], 1.0)
-            update = detector.update(signal)
-            records.append(
-                DriftRecord(
-                    detector=config["drift"]["name"],
-                    signal=signal_name,
-                    index=event.index,
-                    available_at=event.available_at,
-                    value=update.value,
-                    mean=update.mean,
-                    score=update.score,
-                    detected=update.detected,
+    if event.target is None or event.observed_mask is None:
+        raise ValueError("target and residual drift detection require retained forecast values")
+    values: list[DriftObservation] = []
+    target_names = config["data"].get(
+        "target_names", [f"target_{index}" for index in range(event.target.shape[1])]
+    )
+    for horizon_index in range(event.target.shape[0]):
+        for target_index in range(event.target.shape[1]):
+            if not event.observed_mask[horizon_index, target_index].item():
+                continue
+            value = event.target[horizon_index, target_index].item()
+            if source == "residual":
+                if event.prediction is None:
+                    raise ValueError("residual drift detection requires retained forecast values")
+                value = event.prediction[horizon_index, target_index].item() - value
+            values.append(
+                DriftObservation(
+                    target_names[target_index],
+                    target_index,
+                    horizon_index + 1,
+                    value,
+                    event.available_at,
                 )
             )
+    return values
+
+
+def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftRecord]:
+    """Apply independent detectors to the configured source variables."""
+
+    records: list[DriftRecord] = []
+    detectors: dict[str, Any] = {}
+    processed_feature_indices: set[int] = set()
+    processed_target_positions: set[tuple[int, int]] = set()
+    source = config["drift"]["source"]
+    if config["drift"]["name"] != "none":
+        for event in run.events:
+            if source == "features" and event.index in processed_feature_indices:
+                continue
+            if source == "features":
+                processed_feature_indices.add(event.index)
+            for observation in _drift_values(config, event):
+                if source == "target":
+                    target_position = (
+                        event.index * config["data"].get("stride", 1)
+                        + config["data"]["context_length"]
+                        + observation.horizon_step
+                        - 1
+                    )
+                    target_key = (target_position, observation.variable_index)
+                    if target_key in processed_target_positions:
+                        continue
+                    processed_target_positions.add(target_key)
+                detector = detectors.get(observation.variable_name)
+                if detector is None:
+                    detector = _build_detector(config)
+                    detectors[observation.variable_name] = detector
+                update = detector.update(observation.value)
+                records.append(
+                    DriftRecord(
+                        detector=config["drift"]["name"],
+                        source=source,
+                        index=event.index,
+                        available_at=observation.available_at,
+                        variable_name=observation.variable_name,
+                        variable_index=observation.variable_index,
+                        horizon_step=observation.horizon_step,
+                        value=update.value,
+                        detected=update.detected,
+                    )
+                )
     return records
 
 

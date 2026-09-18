@@ -42,6 +42,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         horizon: int,
         target_indices: Sequence[int] | None = None,
         target_names: Sequence[str] | None = None,
+        feature_names: Sequence[str] | None = None,
         stride: int = 1,
     ) -> None:
         if values.ndim != 2:
@@ -58,6 +59,11 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         # stride controls how far the next forecasting origin moves along the time axis.
         self.stride = stride
         self.target_indices = tuple(target_indices or range(values.shape[1]))
+        self.feature_names = tuple(
+            feature_names or (f"feature_{index}" for index in range(values.shape[1]))
+        )
+        if len(self.feature_names) != values.shape[1]:
+            raise ValueError("feature_names must have one name per input feature")
 
         if not self.target_indices:
             raise ValueError("target_indices must not be empty")
@@ -148,6 +154,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
             horizon=horizon,
             target_indices=target_indices,
             target_names=selected_targets,
+            feature_names=columns,
             stride=stride,
         )
 

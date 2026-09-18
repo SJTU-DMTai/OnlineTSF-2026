@@ -90,12 +90,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "strategy",
                 "seed",
                 "detector",
-                "signal",
+                "source",
                 "forecast_index",
-                "feedback_available_at",
+                "available_at",
+                "variable_name",
+                "variable_index",
+                "horizon_step",
                 "value",
-                "mean",
-                "score",
                 "detected",
             )
         )
@@ -104,12 +105,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "strategy",
                 "seed",
                 "detector",
-                "signal",
+                "source",
                 "forecast_index",
-                "feedback_available_at",
+                "available_at",
+                "variable_name",
+                "variable_index",
+                "horizon_step",
                 "value",
-                "mean",
-                "score",
             )
         )
         summary_writer.writerow(
@@ -153,6 +155,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                         strategy_name=strategy,
                         detector_name=detector_name,
                     )
+                    detector_config["data"]["feature_names"] = config["data"]["feature_names"]
+                    detector_config["data"]["target_names"] = config["data"]["target_names"]
                     drift_records.extend(collect_drift_records(detector_config, run))
                 drift_detection_seconds = perf_counter() - detection_started
                 run = replace(
@@ -201,12 +205,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                             strategy,
                             seed,
                             record.detector,
-                            record.signal,
+                            record.source,
                             record.index,
                             record.available_at,
+                            record.variable_name,
+                            record.variable_index,
+                            record.horizon_step,
                             record.value,
-                            record.mean,
-                            record.score,
                             record.detected,
                         )
                     )
@@ -216,12 +221,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 strategy,
                                 seed,
                                 record.detector,
-                                record.signal,
+                                record.source,
                                 record.index,
                                 record.available_at,
+                                record.variable_name,
+                                record.variable_index,
+                                record.horizon_step,
                                 record.value,
-                                record.mean,
-                                record.score,
                             )
                         )
                 metrics = run.metrics

@@ -103,12 +103,13 @@ def write_experiment_documents(
         writer.writerow(
             (
                 "detector",
-                "signal",
+                "source",
                 "forecast_index",
-                "feedback_available_at",
+                "available_at",
+                "variable_name",
+                "variable_index",
+                "horizon_step",
                 "value",
-                "mean",
-                "score",
                 "detected",
             )
         )
@@ -116,12 +117,13 @@ def write_experiment_documents(
             writer.writerow(
                 (
                     record.detector,
-                    record.signal,
+                    record.source,
                     record.index,
                     record.available_at,
+                    record.variable_name,
+                    record.variable_index,
+                    record.horizon_step,
                     record.value,
-                    record.mean,
-                    record.score,
                     record.detected,
                 )
             )

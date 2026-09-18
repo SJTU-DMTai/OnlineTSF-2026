@@ -1,9 +1,12 @@
-# Agent and test artifacts
+
 .agents/
 .pytest_cache/
 tests/
 runs/
 data/
+figures/
+scripts/
+
 # Python bytecode
 __pycache__/
 *.py[cod]

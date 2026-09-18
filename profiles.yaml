@@ -65,16 +65,15 @@ detectors:
 
   page_hinkley:
     name: page_hinkley
-    signal: mae
-    parameters: {delta: 0.005, threshold: 50.0, min_instances: 30}
+    source: features
+    parameters: {delta: 0.005, threshold: 50.0, min_instances: 30, alpha: 0.9999, mode: both}
 
   adwin:
     name: adwin
-    signal: mae
-    scale: 1.0
-    parameters: {delta: 0.002, min_window_length: 20}
+    source: features
+    parameters: {delta: 0.002, clock: 32, max_buckets: 5, min_window_length: 5, grace_period: 10}
 
   kswin:
     name: kswin
-    signal: mae
+    source: features
     parameters: {alpha: 0.005, window_size: 100, stat_size: 30}

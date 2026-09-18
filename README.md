@@ -53,7 +53,12 @@ results.txt
 ```
 
 Each run also writes `forecast_values.csv`, with one row per observed
-horizon/target value, and `drift_trace.csv`, with every detector update.
+horizon/target value, and `drift_trace.csv`, with every detector update. Drift
+detectors use `drift.source` (`features`, `target`, or `residual`) and maintain
+one independent detector for each input feature or target. The default source is
+`features`; MAE/MSE are evaluation metrics only and are not detector inputs.
+`target` consumes each target time point once, while `residual` keeps every
+forecast error because forecasts from different origins are distinct observations.
 
 ## Batch run
 

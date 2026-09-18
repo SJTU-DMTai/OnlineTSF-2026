@@ -12,6 +12,7 @@ import yaml
 BACKBONES = frozenset(("linear", "lstm", "tcn", "patchtst", "fsnet_tcn", "onenet_tcn"))
 METHODS = frozenset(("ogd", "fsnet", "onenet"))
 DRIFT_DETECTORS = frozenset(("none", "page_hinkley", "adwin", "kswin"))
+DRIFT_SOURCES = frozenset(("features", "target", "residual"))
 
 
 def _load_mapping(source: Path, label: str) -> dict[str, Any]:
@@ -177,13 +178,14 @@ def load_config(
     if detector_name not in DRIFT_DETECTORS:
         valid_names = ", ".join(sorted(DRIFT_DETECTORS))
         raise ValueError(f"config.drift.name must be one of: {valid_names}")
-    if drift.get("signal", "mae") not in {"mae", "mse"}:
-        raise ValueError("config.drift.signal must be mae or mse")
+    if "signal" in drift or "scale" in drift:
+        raise ValueError("drift.signal and drift.scale are not supported; use drift.source")
+    drift_source = drift.get("source", "features")
+    if drift_source not in DRIFT_SOURCES:
+        valid_sources = ", ".join(sorted(DRIFT_SOURCES))
+        raise ValueError(f"config.drift.source must be one of: {valid_sources}")
+    drift["source"] = drift_source
     drift["parameters"] = _parameters(drift, "drift")
-    if detector_name == "adwin":
-        scale = drift.get("scale")
-        if not isinstance(scale, (int, float)) or scale <= 0:
-            raise ValueError("config.drift.scale must be positive for adwin")
 
     output_value = config.get("output", {})
     if not isinstance(output_value, dict):

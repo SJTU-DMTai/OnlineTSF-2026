@@ -58,6 +58,7 @@ class FeedbackEvent:
     prediction: Tensor | None = None
     target: Tensor | None = None
     observed_mask: Tensor | None = None
+    features: Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -387,6 +388,7 @@ class OnlineExecutor:
             prediction=pending.prediction if self.keep_predictions else None,
             target=observed_target if self.keep_predictions else None,
             observed_mask=pending.observed_mask if self.keep_predictions else None,
+            features=pending.context[-1] if self.keep_predictions else None,
         )
         self._events.append(event)
         return event
@@ -414,4 +416,5 @@ class OnlineExecutor:
             prediction=state["prediction"],
             target=state["target"],
             observed_mask=state["observed_mask"],
+            features=state.get("features"),
         )
