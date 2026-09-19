@@ -301,13 +301,17 @@ def detector_alarm_votes(start: int, end: int, votes_by_index: Sequence[int]) ->
 def build_alarm_vote_prefixes(
     alarm_events: Sequence[dict[str, Any]], detector_names: Sequence[str], dataset_length: int,
 ) -> tuple[dict[str, list[int]], list[int], dict[str, int]]:
-    """Veto only simultaneous majority alarms from comparable detector streams."""
+    """Veto only simultaneous detector consensus from comparable streams."""
 
     sources = ("features", "residual")
-    votes_to_veto = {
+    voter_counts = {
         source: sum(
             source in DETECTOR_SOURCES.get(name, DRIFT_SOURCES) for name in detector_names
-        ) // 2 + 1
+        )
+        for source in sources
+    }
+    votes_to_veto = {
+        source: math.ceil(voter_counts[source] / 2)
         for source in sources
     }
     votes_by_scope: dict[tuple[str, str, int], set[str]] = defaultdict(set)
