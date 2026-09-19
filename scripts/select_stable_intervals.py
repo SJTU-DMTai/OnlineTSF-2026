@@ -59,7 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--detectors",
         nargs="+",
-        default=["page_hinkley", "adwin", "kswin"],
+        default=["page_hinkley", "adwin", "kswin", "seed", "stepd", "hddmw", "abcd"],
         help="detector profiles; each runs only on its supported feature or residual input",
     )
     parser.add_argument("--window-size", type=int, default=256, help="forecast samples per candidate window")
@@ -88,7 +88,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--auto-calibrate-detectors", action="store_true",
-        help="select detector sensitivity separately for each feature and model residual stream",
+        help="calibrate Page-Hinkley, ADWIN, and KSWIN per feature and model residual stream",
     )
     parser.add_argument(
         "--calibration-samples", type=int, default=512,
@@ -293,10 +293,46 @@ def raw_bounds(sample_start: int, sample_end: int, stride: int, context: int, ho
     return raw_start, raw_end
 
 
-def detector_alarm_votes(start: int, end: int, alarm_prefixes: dict[str, list[int]]) -> int:
-    """Count methods with at least one alarm in the candidate window."""
+def detector_alarm_votes(start: int, end: int, votes_by_index: Sequence[int]) -> int:
+    """Return the strongest same-sample detector agreement in a window."""
 
-    return sum(prefix[end] > prefix[start] for prefix in alarm_prefixes.values())
+    return max(votes_by_index[start:end], default=0)
+
+
+def build_alarm_vote_prefixes(
+    alarm_events: Sequence[dict[str, Any]], detector_names: Sequence[str], dataset_length: int,
+) -> tuple[dict[str, list[int]], list[int], dict[str, int]]:
+    """Veto only simultaneous majority alarms from comparable detector streams."""
+
+    sources = ("features", "residual")
+    votes_to_veto = {
+        source: sum(
+            source in DETECTOR_SOURCES.get(name, DRIFT_SOURCES) for name in detector_names
+        ) // 2 + 1
+        for source in sources
+    }
+    votes_by_scope: dict[tuple[str, str, int], set[str]] = defaultdict(set)
+    for event in alarm_events:
+        source = event["source"]
+        strategy = event["strategy"] if source == "residual" else ""
+        votes_by_scope[(source, strategy, event["sample_index"])].add(event["detector"])
+
+    votes_by_index = [0] * dataset_length
+    consensus_indices: dict[str, set[int]] = {source: set() for source in sources}
+    for (source, _, index), voters in votes_by_scope.items():
+        votes_by_index[index] = max(votes_by_index[index], len(voters))
+        if len(voters) >= votes_to_veto[source]:
+            consensus_indices[source].add(index)
+
+    alarm_prefixes: dict[str, list[int]] = {}
+    for source, indices in consensus_indices.items():
+        prefix = [0] * (dataset_length + 1)
+        for index in indices:
+            prefix[index + 1] = 1
+        for index in range(1, len(prefix)):
+            prefix[index] += prefix[index - 1]
+        alarm_prefixes[source] = prefix
+    return alarm_prefixes, votes_by_index, votes_to_veto
 
 
 def evaluate_window(
@@ -341,9 +377,9 @@ def evaluate_window(
         sample_end=sample_end,
         raw_start=raw_start,
         raw_end=raw_end,
-        detector_ok=(
-            detector_alarm_votes(sample_start, sample_end, alarm_prefixes)
-            <= len(alarm_prefixes) // 2
+        detector_ok=all(
+            prefix[sample_end] == prefix[sample_start]
+            for prefix in alarm_prefixes.values()
         ),
         distribution_ok=(
             distribution.mean_change <= args.mean_threshold
@@ -600,17 +636,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         alarm_indices_by_stream[f"features:{detector_name}"] = {
             event["sample_index"] for event in events if event["detector"] == detector_name
         }
-    alarm_indices_by_detector = {name: set() for name in args.detectors}
-    for stream, indices in alarm_indices_by_stream.items():
-        alarm_indices_by_detector[stream.rsplit(":", 1)[-1]].update(indices)
-    alarm_prefixes: dict[str, list[int]] = {}
-    for name, indices in alarm_indices_by_detector.items():
-        prefix = [0] * (len(dataset) + 1)
-        for index in indices:
-            prefix[index + 1] = 1
-        for index in range(1, len(prefix)):
-            prefix[index] += prefix[index - 1]
-        alarm_prefixes[name] = prefix
+    alarm_prefixes, votes_by_index, votes_to_veto = build_alarm_vote_prefixes(
+        alarm_events, args.detectors, len(dataset)
+    )
 
     distribution_by_range: dict[tuple[int, int], DistributionMetrics] = {}
     loss_by_range: dict[tuple[int, int], dict[str, LossMetrics]] = {}
@@ -688,7 +716,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         core_end = end - (args.window_size - 1) // 2
         raw_start = core_start * stride + context
         raw_end = core_end * stride + context
-        core_alarm_votes = detector_alarm_votes(core_start, core_end, alarm_prefixes)
+        core_alarm_votes = detector_alarm_votes(core_start, core_end, votes_by_index)
         maximum_run_length = max(maximum_run_length, raw_end - raw_start)
         candidate: dict[str, Any] = {
             "sample_start": core_start,
@@ -702,7 +730,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 and core_end - core_start >= 2 * args.loss_block_size
             ),
             "detector_alarm_votes": core_alarm_votes,
-            "detector_ok": core_alarm_votes <= len(alarm_prefixes) // 2,
+            "detector_ok": all(
+                prefix[core_end] == prefix[core_start]
+                for prefix in alarm_prefixes.values()
+            ),
         }
         if not candidate["length_ok"]:
             runs_rejected_by_length += 1
@@ -834,13 +865,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             distribution = distribution_by_range[candidate]
             row: dict[str, Any] = {
                 **asdict(window),
-                "feature_detector_ok": not any(
-                    window.sample_start <= index < window.sample_end
-                    for index in feature_alarms
+                "feature_detector_ok": (
+                    alarm_prefixes["features"][window.sample_end]
+                    == alarm_prefixes["features"][window.sample_start]
                 ),
-                "residual_detector_ok": not any(
-                    window.sample_start <= index < window.sample_end
-                    for index in residual_alarms
+                "residual_detector_ok": (
+                    alarm_prefixes["residual"][window.sample_end]
+                    == alarm_prefixes["residual"][window.sample_start]
                 ),
                 "feature_alarm_indices": sum(
                     window.sample_start <= index < window.sample_end
@@ -851,7 +882,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     for index in residual_alarms
                 ),
                 "detector_alarm_votes": detector_alarm_votes(
-                    window.sample_start, window.sample_end, alarm_prefixes
+                    window.sample_start, window.sample_end, votes_by_index
                 ),
                 "stable": window.stable,
                 "mean_change": distribution.mean_change,
@@ -934,10 +965,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "strategies": list(strategies),
         "detectors": list(args.detectors),
         "detector_voting": {
-            "rule": "strict_majority_alarm_veto",
+            "rule": "simultaneous_majority_alarm_veto",
             "voters": list(args.detectors),
-            "votes_to_veto": len(args.detectors) // 2 + 1,
-            "scope": "at least one alarm per detector method in the window",
+            "votes_to_veto": votes_to_veto,
+            "scope": "same sample index and source; residual alarms also share a strategy",
         },
         "offline_train_ratio": first_config["offline"]["train_ratio"],
         "offline_training_windows": train_size,
@@ -956,11 +987,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         "condition_pass_counts": condition_counts(windows),
         "subcondition_pass_counts": {
             "feature_detector": sum(
-                not any(window.sample_start <= index < window.sample_end for index in feature_alarms)
+                alarm_prefixes["features"][window.sample_end]
+                == alarm_prefixes["features"][window.sample_start]
                 for window in windows
             ),
             "residual_detector": sum(
-                not any(window.sample_start <= index < window.sample_end for index in residual_alarms)
+                alarm_prefixes["residual"][window.sample_end]
+                == alarm_prefixes["residual"][window.sample_start]
                 for window in windows
             ),
             "mean": sum(
