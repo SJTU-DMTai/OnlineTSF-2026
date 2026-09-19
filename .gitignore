@@ -5,7 +5,7 @@ tests/
 runs/
 data/
 figures/
-
+README.md
 
 # Python bytecode
 __pycache__/

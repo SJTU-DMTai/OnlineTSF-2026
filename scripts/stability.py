@@ -29,7 +29,7 @@ class LossMetrics:
 
 @dataclass(frozen=True)
 class CandidateWindow:
-    """One non-overlapping window evaluated by all stability conditions."""
+    """One candidate window evaluated by all conditions."""
 
     sample_start: int
     sample_end: int
@@ -94,16 +94,25 @@ def distribution_metrics(
     )
 
 
-def loss_metrics(losses: Sequence[float], *, eps: float = 1e-12) -> LossMetrics:
-    """Return the mean loss and population coefficient of variation."""
+def loss_metrics(
+    losses: Sequence[float], *, block_size: int = 1, eps: float = 1e-12
+) -> LossMetrics:
+    """Return mean loss and CV of consecutive block-mean losses."""
 
     if not losses:
         raise ValueError("losses must not be empty")
+    if block_size <= 0 or len(losses) < 2 * block_size:
+        raise ValueError("losses must contain at least two blocks")
     tensor = torch.tensor(losses, dtype=torch.float64)
     if not torch.isfinite(tensor).all():
         raise ValueError("losses must be finite")
     mean = tensor.mean()
-    coefficient = tensor.std(unbiased=False) / mean.abs().clamp_min(eps)
+    blocks = list(tensor.split(block_size))
+    if blocks[-1].numel() < block_size:
+        blocks[-2] = torch.cat((blocks[-2], blocks[-1]))
+        blocks.pop()
+    block_means = torch.tensor([block.mean().item() for block in blocks], dtype=torch.float64)
+    coefficient = block_means.std(unbiased=False) / mean.abs().clamp_min(eps)
     return LossMetrics(mean=mean.item(), coefficient_of_variation=coefficient.item())
 
 
@@ -122,7 +131,7 @@ def merge_stable_windows(
     *,
     minimum_raw_length: int,
 ) -> list[StableInterval]:
-    """Merge adjacent AND-passing windows and apply the strict length filter."""
+    """Merge consecutive overlapping AND-passing windows, then filter length."""
 
     if minimum_raw_length < 0:
         raise ValueError("minimum_raw_length must be non-negative")
@@ -136,10 +145,10 @@ def merge_stable_windows(
             current = None
             continue
 
-        if current is not None and window.sample_start == current.sample_end:
+        if current is not None and window.sample_start <= current.sample_end:
             current = StableInterval(
                 sample_start=current.sample_start,
-                sample_end=window.sample_end,
+                sample_end=max(current.sample_end, window.sample_end),
                 raw_start=current.raw_start,
                 raw_end=max(current.raw_end, window.raw_end),
                 window_count=current.window_count + 1,

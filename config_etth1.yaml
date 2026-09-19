@@ -9,13 +9,13 @@ selection:
 data:
   name: etth1
   path: data/ETTh1.csv
-  context_length: 96
+  context_length: 60
   horizon: 1
   stride: 1
 
 offline:
   train_ratio: 0.20
-  epochs: 5
+  epochs: 6
   batch_size: 32
 
 online:

@@ -1,0 +1,17 @@
+# Starting point for stability selection, not a validated ETTh1 calibration.
+# Check alarm_events.csv and per-window alarm columns before accepting intervals.
+features:
+  page_hinkley:
+    threshold: 200.0
+  adwin:
+    delta: 0.00001
+  kswin:
+    alpha: 0.00001
+
+residual:
+  page_hinkley:
+    threshold: 100.0
+  adwin:
+    delta: 0.00001
+  kswin:
+    alpha: 0.00001
