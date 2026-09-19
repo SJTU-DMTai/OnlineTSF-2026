@@ -24,7 +24,10 @@ class DatasetSpec:
 BENCHMARK_SPECS = {
     "etth1": DatasetSpec(time_column="date", target_columns=("OT",)),
     "etth2": DatasetSpec(time_column="date", target_columns=("OT",)),
+    "ettm1": DatasetSpec(time_column="date", target_columns=("OT",)),
+    "ettm2": DatasetSpec(time_column="date", target_columns=("OT",)),
     "traffic": DatasetSpec(time_column="date", target_columns=None),
+    "weather": DatasetSpec(time_column="date", target_columns=("OT",)),
 }
 
 
