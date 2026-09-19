@@ -138,9 +138,9 @@ def _run_offline_training(
     return train_size
 
 
-def _build_detector(config: dict[str, Any]):
+def _build_detector(config: dict[str, Any], parameters: dict[str, Any] | None = None):
     drift = config["drift"]
-    options = drift["parameters"]
+    options = drift["parameters"] if parameters is None else parameters
     if drift["name"] == "none":
         return None
     if drift["name"] == "page_hinkley":
@@ -271,7 +271,11 @@ def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftR
                     processed_target_positions.add(target_key)
                 detector = detectors.get(observation.variable_name)
                 if detector is None:
-                    detector = _build_detector(config)
+                    parameters = {
+                        **config["drift"]["parameters"],
+                        **config["drift"].get("variable_parameters", {}).get(observation.variable_name, {}),
+                    }
+                    detector = _build_detector(config, parameters)
                     detectors[observation.variable_name] = detector
                 update = detector.update(observation.value)
                 records.append(

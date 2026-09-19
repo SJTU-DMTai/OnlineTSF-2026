@@ -31,6 +31,7 @@ from onlinetsf.__main__ import collect_drift_records, run_forecast
 from onlinetsf.config import load_config
 from onlinetsf.data import SlidingWindowDataset, load_benchmark_dataset
 from onlinetsf.online import FeedbackEvent, OnlineMetrics, OnlineRun
+from scripts.stability_calibration import calibrate_stream, calibration_streams
 from scripts.stability import (
     CandidateWindow,
     DistributionMetrics,
@@ -63,27 +64,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--window-size", type=int, default=256, help="forecast samples per candidate window")
     parser.add_argument(
-        "--window-step", type=int, default=32,
+        "--window-step", type=int, default=8,
         help="forecast samples between neighboring sliding windows",
     )
-    parser.add_argument("--mean-threshold", type=float, default=0.5)
-    parser.add_argument("--std-threshold", type=float, default=0.5)
-    parser.add_argument("--quantile-threshold", type=float, default=0.75)
+    parser.add_argument("--mean-threshold", type=float, default=0.8)
+    parser.add_argument("--std-threshold", type=float, default=0.6)
+    parser.add_argument("--quantile-threshold", type=float, default=1.15)
     parser.add_argument("--distribution-feature-quantile", type=float, default=0.95)
     parser.add_argument(
         "--loss-low-quantile",
         type=float,
-        default=0.5,
+        default=0.55,
         help="quantile of candidate mean losses defining a low loss for each model",
     )
-    parser.add_argument("--loss-cv-threshold", type=float, default=1.0)
+    parser.add_argument("--loss-cv-threshold", type=float, default=1.1)
     parser.add_argument(
         "--loss-block-size", type=int, default=16,
         help="forecast steps averaged before computing loss CV",
     )
     parser.add_argument(
         "--detector-overrides", type=Path,
-        help="YAML file with separate features/residual detector parameter overrides",
+        help="YAML detector parameters by source, dataset, feature variable, or residual model",
+    )
+    parser.add_argument(
+        "--auto-calibrate-detectors", action="store_true",
+        help="select detector sensitivity separately for each feature and model residual stream",
+    )
+    parser.add_argument(
+        "--calibration-samples", type=int, default=512,
+        help="maximum post-training forecast samples reserved for detector calibration",
     )
     parser.add_argument(
         "--extra-min-length",
@@ -132,6 +141,8 @@ def validate_args(args: argparse.Namespace, strategies: Sequence[str]) -> None:
         raise ValueError("--loss-cv-threshold must be non-negative")
     if args.loss_block_size <= 0:
         raise ValueError("--loss-block-size must be positive")
+    if args.calibration_samples < 64:
+        raise ValueError("--calibration-samples must be at least 64")
     if args.window_size // args.loss_block_size < 2:
         raise ValueError("each candidate window needs at least two loss blocks")
     if not strategies:
@@ -179,6 +190,38 @@ def file_digest(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def detector_parameters(
+    overrides: dict[str, Any], dataset_name: str, source: str, strategy: str,
+    detector_name: str,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    dataset_overrides = overrides.get("datasets", {}).get(dataset_name, {})
+    parameters = dict(overrides.get(source, {}).get(detector_name, {}))
+    parameters.update(dataset_overrides.get(source, {}).get(detector_name, {}))
+    if source == "residual":
+        parameters.update(
+            dataset_overrides.get("residual_models", {}).get(strategy, {}).get(detector_name, {})
+        )
+        variable_parameters = {
+            variable: detectors[detector_name]
+            for variable, detectors in dataset_overrides.get("residual_variables", {}).get(strategy, {}).items()
+            if detector_name in detectors
+        }
+        return parameters, variable_parameters
+    variable_parameters = {
+        variable: detectors[detector_name]
+        for variable, detectors in dataset_overrides.get("feature_variables", {}).items()
+        if detector_name in detectors
+    }
+    return parameters, variable_parameters
+
+
+def validate_detector_settings(settings: Any, detectors: Sequence[str], label: str) -> None:
+    if not isinstance(settings, dict) or set(settings) - set(detectors):
+        raise ValueError(f"{label} must map selected detector names to parameters")
+    if any(not isinstance(parameters, dict) for parameters in settings.values()):
+        raise ValueError(f"{label} detector parameters must be mappings")
+
+
 def collect_alarm_indices(
     config_path: str | Path,
     detector_names: Sequence[str],
@@ -187,9 +230,9 @@ def collect_alarm_indices(
     source: str,
     device: str | None,
     overrides: dict[str, Any],
+    dataset: SlidingWindowDataset,
     cache_dir: Path,
     input_key: str,
-    code_digest: str,
 ) -> tuple[set[int], dict[str, int], list[dict[str, Any]], dict[str, bool]]:
     alarm_indices: set[int] = set()
     alarm_counts: dict[str, int] = {}
@@ -197,10 +240,16 @@ def collect_alarm_indices(
     cache_hits: dict[str, bool] = {}
     for detector_name in detector_names:
         config = prepare_config(config_path, strategy, detector_name, device)
+        config["data"]["feature_names"] = list(dataset.feature_names)
+        config["data"]["target_names"] = list(dataset.target_names)
         config["drift"]["source"] = source
-        config["drift"]["parameters"].update(overrides.get(source, {}).get(detector_name, {}))
+        parameters, variable_parameters = detector_parameters(
+            overrides, config["data"]["name"], source, strategy, detector_name
+        )
+        config["drift"]["parameters"].update(parameters)
+        config["drift"]["variable_parameters"] = variable_parameters
         key = cache_key({
-            "version": 1, "input": input_key, "code": code_digest,
+            "version": 2, "input": input_key,
             "drift": config["drift"],
         })
         cache_path = cache_dir / f"detector-{key}.json"
@@ -319,13 +368,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.detector_overrides is not None:
         with args.detector_overrides.open("r", encoding="utf-8") as handle:
             detector_overrides = yaml.safe_load(handle) or {}
-        if not isinstance(detector_overrides, dict) or set(detector_overrides) - {"features", "residual"}:
-            raise ValueError("detector overrides must contain only features and residual mappings")
-        for source, settings in detector_overrides.items():
-            if not isinstance(settings, dict) or set(settings) - set(args.detectors):
-                raise ValueError(f"{source} overrides must use selected detector names")
-            if any(not isinstance(parameters, dict) for parameters in settings.values()):
-                raise ValueError(f"{source} detector parameters must be mappings")
+        if not isinstance(detector_overrides, dict) or set(detector_overrides) - {
+            "features", "residual", "datasets"
+        }:
+            raise ValueError("detector overrides must contain only features, residual, and datasets")
+        for source in ("features", "residual"):
+            if source in detector_overrides:
+                validate_detector_settings(detector_overrides[source], args.detectors, source)
 
     first_config = prepare_config(args.config, strategies[0], args.detectors[0], args.device)
     data_config = first_config["data"]
@@ -336,6 +385,44 @@ def main(argv: Sequence[str] | None = None) -> None:
         horizon=data_config["horizon"],
         stride=data_config.get("stride", 1),
     )
+    datasets = detector_overrides.get("datasets", {})
+    if not isinstance(datasets, dict):
+        raise ValueError("detector overrides datasets must be a mapping")
+    for dataset_name, settings in datasets.items():
+        if not isinstance(settings, dict) or set(settings) - {
+            "features", "residual", "feature_variables", "residual_models", "residual_variables"
+        }:
+            raise ValueError(f"datasets.{dataset_name} has invalid override sections")
+        for source in ("features", "residual"):
+            if source in settings:
+                validate_detector_settings(settings[source], args.detectors, f"datasets.{dataset_name}.{source}")
+        for section, known_names in (
+            ("feature_variables", dataset.feature_names), ("residual_models", strategies)
+        ):
+            entries = settings.get(section, {})
+            if not isinstance(entries, dict):
+                raise ValueError(f"datasets.{dataset_name}.{section} must be a mapping")
+            for name, parameters in entries.items():
+                if dataset_name == data_config["name"] and name not in known_names:
+                    raise ValueError(f"unknown {section} name {name!r} for {dataset_name}")
+                validate_detector_settings(
+                    parameters, args.detectors, f"datasets.{dataset_name}.{section}.{name}"
+                )
+        residual_variables = settings.get("residual_variables", {})
+        if not isinstance(residual_variables, dict):
+            raise ValueError(f"datasets.{dataset_name}.residual_variables must be a mapping")
+        for strategy, variables in residual_variables.items():
+            if dataset_name == data_config["name"] and strategy not in strategies:
+                raise ValueError(f"unknown residual model {strategy!r} for {dataset_name}")
+            if not isinstance(variables, dict):
+                raise ValueError("residual_variables model entries must be mappings")
+            for variable, parameters in variables.items():
+                if dataset_name == data_config["name"] and variable not in dataset.target_names:
+                    raise ValueError(f"unknown residual variable {variable!r} for {dataset_name}")
+                validate_detector_settings(
+                    parameters, args.detectors,
+                    f"datasets.{dataset_name}.residual_variables.{strategy}.{variable}",
+                )
     context = dataset.context_length
     horizon = dataset.horizon
     stride = dataset.stride
@@ -352,21 +439,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         eligible_start = online_start
 
     last_window_start = online_stop - args.window_size
-    candidate_starts = list(range(eligible_start, last_window_start + 1, args.window_step))
-    if candidate_starts and candidate_starts[-1] != last_window_start:
-        candidate_starts.append(last_window_start)
-    candidate_ranges = [(start, start + args.window_size) for start in candidate_starts]
-    if not candidate_ranges:
-        raise ValueError("no complete candidate window remains after excluding offline-training data")
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     dataset_digest = file_digest(data_config["path"])
-    code_digest = cache_key({
-        str(path.relative_to(SOURCE_ROOT)): file_digest(path)
-        for path in sorted((SOURCE_ROOT / "onlinetsf").rglob("*.py"))
-    })
     runs: dict[str, OnlineRun] = {}
     losses: dict[str, dict[int, float]] = {}
+    forecast_keys: dict[str, str] = {}
     residual_alarms: set[int] = set()
     alarm_counts: dict[str, dict[str, int]] = {}
     alarm_events: list[dict[str, Any]] = []
@@ -376,7 +454,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     for strategy in strategies:
         config = prepare_config(args.config, strategy, args.detectors[0], args.device)
         key = cache_key({
-            "version": 1, "dataset": dataset_digest, "code": code_digest,
+            "version": 2, "dataset": dataset_digest,
             "seed": config.get("seed"),
             "data": config["data"], "forecasting": config["forecasting"],
             "method": config["method"], "offline": config["offline"],
@@ -400,10 +478,74 @@ def main(argv: Sequence[str] | None = None) -> None:
             }, temporary_path)
             temporary_path.replace(cache_path)
         runs[strategy] = run
+        forecast_keys[strategy] = key
         losses[strategy] = aggregate_event_losses(run.events)
+
+    calibration_report: dict[str, Any] = {}
+    if args.auto_calibrate_detectors:
+        calibration_start = eligible_start
+        available = online_stop - calibration_start - args.window_size
+        calibration_length = min(args.calibration_samples, available // 2)
+        if calibration_length < 64:
+            raise ValueError("not enough post-training data for calibration and a candidate window")
+        calibration_end = calibration_start + calibration_length
+        calibration_report = {
+            "sample_start": calibration_start,
+            "sample_end_exclusive": calibration_end,
+            "streams": {"features": {}, "residual": {}},
+        }
+        for source in ("features", "residual"):
+            source_strategies = strategies[:1] if source == "features" else strategies
+            for strategy in source_strategies:
+                stream_reports = (
+                    calibration_report["streams"]["features"] if source == "features"
+                    else calibration_report["streams"]["residual"].setdefault(strategy, {})
+                )
+                for detector_name in args.detectors:
+                    config = prepare_config(args.config, strategy, detector_name, args.device)
+                    config["data"]["feature_names"] = list(dataset.feature_names)
+                    config["data"]["target_names"] = list(dataset.target_names)
+                    config["drift"]["source"] = source
+                    parameters, variable_parameters = detector_parameters(
+                        detector_overrides, data_config["name"], source, strategy, detector_name
+                    )
+                    config["drift"]["parameters"].update(parameters)
+                    streams = calibration_streams(
+                        config, runs[strategy], calibration_start, calibration_end
+                    )
+                    for variable, values in streams.items():
+                        stream_config = {**config, "drift": {
+                            **config["drift"], "parameters": {
+                                **config["drift"]["parameters"], **variable_parameters.get(variable, {}),
+                            },
+                        }}
+                        selected, report = calibrate_stream(stream_config, values)
+                        stream_reports.setdefault(variable, {})[detector_name] = report
+                        if source == "features":
+                            target = detector_overrides.setdefault("datasets", {}).setdefault(
+                                data_config["name"], {}
+                            ).setdefault("feature_variables", {}).setdefault(variable, {})
+                        else:
+                            target = detector_overrides.setdefault("datasets", {}).setdefault(
+                                data_config["name"], {}
+                            ).setdefault("residual_variables", {}).setdefault(strategy, {}).setdefault(variable, {})
+                        target.setdefault(detector_name, {}).update(selected)
+        # Keep calibration targets/contexts out of the selected raw intervals.
+        eligible_start = max(
+            eligible_start, calibration_end + math.ceil((context + horizon) / stride)
+        )
+
+    candidate_starts = list(range(eligible_start, last_window_start + 1, args.window_step))
+    if candidate_starts and candidate_starts[-1] != last_window_start:
+        candidate_starts.append(last_window_start)
+    candidate_ranges = [(start, start + args.window_size) for start in candidate_starts]
+    if not candidate_ranges:
+        raise ValueError("no complete candidate window remains after calibration and offline training")
+
+    for strategy in strategies:
         alarms, counts, events, hits = collect_alarm_indices(
-            args.config, args.detectors, strategy, run, "residual", args.device,
-            detector_overrides, args.cache_dir, key, code_digest,
+            args.config, args.detectors, strategy, runs[strategy], "residual", args.device,
+            detector_overrides, dataset, args.cache_dir, forecast_keys[strategy],
         )
         detector_cache_hits[f"residual:{strategy}"] = hits
         residual_alarms.update(alarms)
@@ -427,9 +569,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "features",
         args.device,
         detector_overrides,
+        dataset,
         args.cache_dir,
         feature_input_key,
-        code_digest,
     )
     detector_cache_hits["features"] = hits
     alarm_events.extend(events)
@@ -584,9 +726,52 @@ def main(argv: Sequence[str] | None = None) -> None:
     retained_rows = covered_raw_length(intervals)
     analyzed_rows = analyzed_raw_end - analyzed_raw_start
     timestamps = read_timestamps(data_config["path"], "date")
+    effective_detector_parameters: dict[str, dict[str, dict[str, Any]]] = {}
+    for source in ("features", "residual"):
+        effective_detector_parameters[source] = {}
+        for detector_name in args.detectors:
+            parameters, _ = detector_parameters(
+                detector_overrides, data_config["name"], source, "", detector_name
+            )
+            effective_detector_parameters[source][detector_name] = {
+                **prepare_config(args.config, strategies[0], detector_name, args.device)["drift"]["parameters"],
+                **parameters,
+            }
+    effective_stream_parameters: dict[str, Any] = {"features": {}, "residual": {}}
+    for variable in dataset.feature_names:
+        effective_stream_parameters["features"][variable] = {}
+        for detector_name in args.detectors:
+            _, per_variable = detector_parameters(
+                detector_overrides, data_config["name"], "features", strategies[0], detector_name
+            )
+            effective_stream_parameters["features"][variable][detector_name] = {
+                **effective_detector_parameters["features"][detector_name],
+                **per_variable.get(variable, {}),
+            }
+    for strategy in strategies:
+        effective_stream_parameters["residual"][strategy] = {}
+        for detector_name in args.detectors:
+            parameters, per_variable = detector_parameters(
+                detector_overrides, data_config["name"], "residual", strategy, detector_name
+            )
+            baseline = {
+                **prepare_config(args.config, strategy, detector_name, args.device)["drift"]["parameters"],
+                **parameters,
+            }
+            if per_variable:
+                effective_stream_parameters["residual"][strategy][detector_name] = {
+                    variable: {**baseline, **per_variable.get(variable, {})}
+                    for variable in dataset.target_names
+                }
+            else:
+                effective_stream_parameters["residual"][strategy][detector_name] = baseline
 
     destination = output_directory(args, data_config["name"])
     destination.mkdir(parents=True, exist_ok=False)
+    if calibration_report:
+        with (destination / "detector_calibration.json").open("w", encoding="utf-8") as handle:
+            json.dump(calibration_report, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
     window_fields = [
         "sample_start", "sample_end", "raw_start", "raw_end",
         "feature_detector_ok", "residual_detector_ok", "detector_ok",
@@ -808,15 +993,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 for strategy in strategies
             },
         },
-        "effective_detector_parameters": {
-            source: {
-                detector_name: {
-                    **prepare_config(args.config, strategies[0], detector_name, args.device)["drift"]["parameters"],
-                    **detector_overrides.get(source, {}).get(detector_name, {}),
-                }
-                for detector_name in args.detectors
-            }
-            for source in ("features", "residual")
+        "effective_detector_parameters": effective_detector_parameters,
+        "effective_detector_stream_parameters": effective_stream_parameters,
+        "detector_calibration": {
+            "enabled": args.auto_calibrate_detectors,
+            "sample_start": calibration_report.get("sample_start"),
+            "sample_end_exclusive": calibration_report.get("sample_end_exclusive"),
+            "report": "detector_calibration.json" if calibration_report else None,
         },
         "stable_interval_count": len(intervals),
         "analyzed_raw_rows": analyzed_rows,
@@ -831,6 +1014,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "loss_cv_threshold": args.loss_cv_threshold,
             "loss_block_size": args.loss_block_size,
             "detector_overrides": str(args.detector_overrides) if args.detector_overrides else None,
+            "auto_calibrate_detectors": args.auto_calibrate_detectors,
+            "calibration_samples": args.calibration_samples,
             "extra_min_length": extra_min_length,
         },
     }
