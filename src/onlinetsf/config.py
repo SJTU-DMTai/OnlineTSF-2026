@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +12,15 @@ import yaml
 
 BACKBONES = frozenset(("linear", "lstm", "tcn", "patchtst", "fsnet_tcn", "onenet_tcn"))
 METHODS = frozenset(("ogd", "fsnet", "onenet"))
-DRIFT_DETECTORS = frozenset(("none", "page_hinkley", "adwin", "kswin"))
+DRIFT_DETECTORS = frozenset(("none", "page_hinkley", "adwin", "kswin", "seed", "stepd", "hddmw", "abcd"))
 DRIFT_SOURCES = frozenset(("features", "target", "residual"))
+BINARY_RESIDUAL_DETECTORS = frozenset(("stepd", "hddmw"))
+DETECTOR_SOURCES = {
+    "seed": frozenset(("features", "residual")),
+    "stepd": frozenset(("residual",)),
+    "hddmw": frozenset(("residual",)),
+    "abcd": frozenset(("features",)),
+}
 
 
 def _load_mapping(source: Path, label: str) -> dict[str, Any]:
@@ -184,6 +192,15 @@ def load_config(
     if drift_source not in DRIFT_SOURCES:
         valid_sources = ", ".join(sorted(DRIFT_SOURCES))
         raise ValueError(f"config.drift.source must be one of: {valid_sources}")
+    if drift_source not in DETECTOR_SOURCES.get(detector_name, DRIFT_SOURCES):
+        allowed = ", ".join(sorted(DETECTOR_SOURCES[detector_name]))
+        raise ValueError(f"{detector_name} requires drift.source: {allowed}")
+    if detector_name in BINARY_RESIDUAL_DETECTORS:
+        threshold = drift.get("error_threshold")
+        if (not isinstance(threshold, (int, float)) or isinstance(threshold, bool)
+                or not math.isfinite(threshold) or threshold <= 0):
+            raise ValueError(f"{detector_name} requires a positive drift.error_threshold")
+        drift["error_threshold"] = float(threshold)
     drift["source"] = drift_source
     drift["parameters"] = _parameters(drift, "drift")
 

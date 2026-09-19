@@ -77,3 +77,25 @@ detectors:
     name: kswin
     source: features
     parameters: {alpha: 0.005, window_size: 100, stat_size: 30}
+
+  seed:
+    name: seed
+    source: residual
+    parameters: {delta: 0.05, block_size: 32, epsilon_prime: 0.01, alpha: 0.8}
+
+  stepd:
+    name: stepd
+    source: residual
+    error_threshold: 1.0
+    parameters: {window_size: 30, alpha_drift: 0.003, alpha_warning: 0.05}
+
+  hddmw:
+    name: hddmw
+    source: residual
+    error_threshold: 1.0
+    parameters: {drift_confidence: 0.001, warning_confidence: 0.005, lambda_val: 0.05, two_sided_test: false}
+
+  abcd:
+    name: abcd
+    source: features
+    parameters: {model_id: pca, maximum_absolute_value: 1.0}

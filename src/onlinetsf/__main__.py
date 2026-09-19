@@ -13,10 +13,13 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 
-from .config import load_config
+from .config import BINARY_RESIDUAL_DETECTORS, load_config
 from .data import load_benchmark_dataset
 from .documentation import write_experiment_documents
-from .drift import ADWINDetector, DriftObservation, DriftRecord, KSWINDetector, PageHinkleyDetector
+from .drift import (
+    ADWINDetector, CapyMOADetector, DriftObservation, DriftRecord,
+    HDDMWDetector, KSWINDetector, PageHinkleyDetector,
+)
 from .forecasting import (
     LinearForecastBackbone,
     LSTMForecastBackbone,
@@ -147,7 +150,11 @@ def _build_detector(config: dict[str, Any], parameters: dict[str, Any] | None = 
         return PageHinkleyDetector(**options)
     if drift["name"] == "adwin":
         return ADWINDetector(**options)
-    return KSWINDetector(**options)
+    if drift["name"] == "kswin":
+        return KSWINDetector(**options)
+    if drift["name"] == "hddmw":
+        return HDDMWDetector(**options)
+    return CapyMOADetector(drift["name"], **options)
 
 
 def run_forecast(config: dict[str, Any]) -> OnlineRun:
@@ -231,6 +238,11 @@ def _drift_values(config: dict[str, Any], event: FeedbackEvent) -> list[DriftObs
                 if event.prediction is None:
                     raise ValueError("residual drift detection requires retained forecast values")
                 value = event.prediction[horizon_index, target_index].item() - value
+                if config["drift"]["name"] in BINARY_RESIDUAL_DETECTORS:
+                    error = abs(value) > config["drift"]["error_threshold"]
+                    value = float(error if config["drift"]["name"] == "hddmw" else not error)
+                elif config["drift"]["name"] == "seed":
+                    value = abs(value)
             values.append(
                 DriftObservation(
                     target_names[target_index],
@@ -251,6 +263,22 @@ def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftR
     processed_feature_indices: set[int] = set()
     processed_target_positions: set[tuple[int, int]] = set()
     source = config["drift"]["source"]
+    if config["drift"]["name"] == "abcd":
+        detector = _build_detector(config)
+        for event in run.events:
+            if event.index in processed_feature_indices:
+                continue
+            processed_feature_indices.add(event.index)
+            if event.features is None:
+                raise ValueError("ABCD requires retained feature values")
+            update = detector.update(event.features)
+            records.append(DriftRecord(
+                detector="abcd", source="features", index=event.index,
+                available_at=event.index, variable_name="all_features",
+                variable_index=-1, horizon_step=None, value=update.value,
+                detected=update.detected,
+            ))
+        return records
     if config["drift"]["name"] != "none":
         for event in run.events:
             if source == "features" and event.index in processed_feature_indices:

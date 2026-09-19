@@ -28,7 +28,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from onlinetsf.__main__ import collect_drift_records, run_forecast
-from onlinetsf.config import load_config
+from onlinetsf.config import DETECTOR_SOURCES, DRIFT_SOURCES, load_config
 from onlinetsf.data import SlidingWindowDataset, load_benchmark_dataset
 from onlinetsf.online import FeedbackEvent, OnlineMetrics, OnlineRun
 from scripts.stability_calibration import calibrate_stream, calibration_streams
@@ -60,7 +60,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--detectors",
         nargs="+",
         default=["page_hinkley", "adwin", "kswin"],
-        help="detector profiles used for both feature and residual inputs",
+        help="detector profiles; each runs only on its supported feature or residual input",
     )
     parser.add_argument("--window-size", type=int, default=256, help="forecast samples per candidate window")
     parser.add_argument(
@@ -147,6 +147,8 @@ def validate_args(args: argparse.Namespace, strategies: Sequence[str]) -> None:
         raise ValueError("each candidate window needs at least two loss blocks")
     if not strategies:
         raise ValueError("at least one non-linear strategy is required")
+    if len(args.detectors) != len(set(args.detectors)):
+        raise ValueError("--detectors must not contain duplicate names")
 
 
 def prepare_config(
@@ -239,6 +241,8 @@ def collect_alarm_indices(
     alarm_events: list[dict[str, Any]] = []
     cache_hits: dict[str, bool] = {}
     for detector_name in detector_names:
+        if source not in DETECTOR_SOURCES.get(detector_name, DRIFT_SOURCES):
+            continue
         config = prepare_config(config_path, strategy, detector_name, device)
         config["data"]["feature_names"] = list(dataset.feature_names)
         config["data"]["target_names"] = list(dataset.target_names)
@@ -289,6 +293,12 @@ def raw_bounds(sample_start: int, sample_end: int, stride: int, context: int, ho
     return raw_start, raw_end
 
 
+def detector_alarm_votes(start: int, end: int, alarm_prefixes: dict[str, list[int]]) -> int:
+    """Count methods with at least one alarm in the candidate window."""
+
+    return sum(prefix[end] > prefix[start] for prefix in alarm_prefixes.values())
+
+
 def evaluate_window(
     sample_start: int,
     sample_end: int,
@@ -297,7 +307,7 @@ def evaluate_window(
     strategies: Sequence[str],
     losses: dict[str, dict[int, float]],
     loss_thresholds: dict[str, float],
-    alarm_prefix: Sequence[int],
+    alarm_prefixes: dict[str, list[int]],
     args: argparse.Namespace,
     distributions: dict[tuple[int, int], DistributionMetrics],
     model_losses: dict[tuple[int, int], dict[str, LossMetrics]],
@@ -331,7 +341,10 @@ def evaluate_window(
         sample_end=sample_end,
         raw_start=raw_start,
         raw_end=raw_end,
-        detector_ok=alarm_prefix[sample_end] == alarm_prefix[sample_start],
+        detector_ok=(
+            detector_alarm_votes(sample_start, sample_end, alarm_prefixes)
+            <= len(alarm_prefixes) // 2
+        ),
         distribution_ok=(
             distribution.mean_change <= args.mean_threshold
             and distribution.std_change <= args.std_threshold
@@ -482,7 +495,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         losses[strategy] = aggregate_event_losses(run.events)
 
     calibration_report: dict[str, Any] = {}
-    if args.auto_calibrate_detectors:
+    calibratable_detectors = [
+        name for name in args.detectors if name in {"page_hinkley", "adwin", "kswin"}
+    ]
+    if args.auto_calibrate_detectors and calibratable_detectors:
         calibration_start = eligible_start
         available = online_stop - calibration_start - args.window_size
         calibration_length = min(args.calibration_samples, available // 2)
@@ -501,7 +517,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     calibration_report["streams"]["features"] if source == "features"
                     else calibration_report["streams"]["residual"].setdefault(strategy, {})
                 )
-                for detector_name in args.detectors:
+                for detector_name in calibratable_detectors:
                     config = prepare_config(args.config, strategy, detector_name, args.device)
                     config["data"]["feature_names"] = list(dataset.feature_names)
                     config["data"]["target_names"] = list(dataset.target_names)
@@ -552,6 +568,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         alarm_events.extend(events)
         alarm_counts[f"residual:{strategy}"] = counts
         for detector_name in args.detectors:
+            if "residual" not in DETECTOR_SOURCES.get(detector_name, DRIFT_SOURCES):
+                continue
             alarm_indices_by_stream[f"residual:{strategy}:{detector_name}"] = {
                 event["sample_index"] for event in events if event["detector"] == detector_name
             }
@@ -577,15 +595,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     alarm_events.extend(events)
     alarm_counts["features"] = counts
     for detector_name in args.detectors:
+        if "features" not in DETECTOR_SOURCES.get(detector_name, DRIFT_SOURCES):
+            continue
         alarm_indices_by_stream[f"features:{detector_name}"] = {
             event["sample_index"] for event in events if event["detector"] == detector_name
         }
-    all_alarm_indices = feature_alarms | residual_alarms
-    alarm_prefix = [0] * (len(dataset) + 1)
-    for index in all_alarm_indices:
-        alarm_prefix[index + 1] = 1
-    for index in range(1, len(alarm_prefix)):
-        alarm_prefix[index] += alarm_prefix[index - 1]
+    alarm_indices_by_detector = {name: set() for name in args.detectors}
+    for stream, indices in alarm_indices_by_stream.items():
+        alarm_indices_by_detector[stream.rsplit(":", 1)[-1]].update(indices)
+    alarm_prefixes: dict[str, list[int]] = {}
+    for name, indices in alarm_indices_by_detector.items():
+        prefix = [0] * (len(dataset) + 1)
+        for index in indices:
+            prefix[index + 1] = 1
+        for index in range(1, len(prefix)):
+            prefix[index] += prefix[index - 1]
+        alarm_prefixes[name] = prefix
 
     distribution_by_range: dict[tuple[int, int], DistributionMetrics] = {}
     loss_by_range: dict[tuple[int, int], dict[str, LossMetrics]] = {}
@@ -613,7 +638,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 strategies=strategies,
                 losses=losses,
                 loss_thresholds=loss_thresholds,
-                alarm_prefix=alarm_prefix,
+                alarm_prefixes=alarm_prefixes,
                 args=args,
                 distributions=distribution_by_range,
                 model_losses=loss_by_range,
@@ -632,7 +657,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             result = evaluate_window(
                 candidate_start, candidate_start + args.window_size,
                 dataset=dataset, strategies=strategies, losses=losses,
-                loss_thresholds=loss_thresholds, alarm_prefix=alarm_prefix,
+                loss_thresholds=loss_thresholds, alarm_prefixes=alarm_prefixes,
                 args=args, distributions=distribution_by_range, model_losses=loss_by_range,
             )
             if not result.stable:
@@ -643,7 +668,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             result = evaluate_window(
                 candidate_start, candidate_start + args.window_size,
                 dataset=dataset, strategies=strategies, losses=losses,
-                loss_thresholds=loss_thresholds, alarm_prefix=alarm_prefix,
+                loss_thresholds=loss_thresholds, alarm_prefixes=alarm_prefixes,
                 args=args, distributions=distribution_by_range, model_losses=loss_by_range,
             )
             if not result.stable:
@@ -663,6 +688,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         core_end = end - (args.window_size - 1) // 2
         raw_start = core_start * stride + context
         raw_end = core_end * stride + context
+        core_alarm_votes = detector_alarm_votes(core_start, core_end, alarm_prefixes)
         maximum_run_length = max(maximum_run_length, raw_end - raw_start)
         candidate: dict[str, Any] = {
             "sample_start": core_start,
@@ -675,7 +701,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 raw_end - raw_start > minimum_raw_length
                 and core_end - core_start >= 2 * args.loss_block_size
             ),
-            "detector_ok": alarm_prefix[core_end] == alarm_prefix[core_start],
+            "detector_alarm_votes": core_alarm_votes,
+            "detector_ok": core_alarm_votes <= len(alarm_prefixes) // 2,
         }
         if not candidate["length_ok"]:
             runs_rejected_by_length += 1
@@ -730,6 +757,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     for source in ("features", "residual"):
         effective_detector_parameters[source] = {}
         for detector_name in args.detectors:
+            if source not in DETECTOR_SOURCES.get(detector_name, DRIFT_SOURCES):
+                continue
             parameters, _ = detector_parameters(
                 detector_overrides, data_config["name"], source, "", detector_name
             )
@@ -741,6 +770,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     for variable in dataset.feature_names:
         effective_stream_parameters["features"][variable] = {}
         for detector_name in args.detectors:
+            if "features" not in DETECTOR_SOURCES.get(detector_name, DRIFT_SOURCES) or detector_name == "abcd":
+                continue
             _, per_variable = detector_parameters(
                 detector_overrides, data_config["name"], "features", strategies[0], detector_name
             )
@@ -748,9 +779,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 **effective_detector_parameters["features"][detector_name],
                 **per_variable.get(variable, {}),
             }
+    if "abcd" in args.detectors:
+        effective_stream_parameters["features"]["all_features"] = {
+            "abcd": effective_detector_parameters["features"]["abcd"]
+        }
     for strategy in strategies:
         effective_stream_parameters["residual"][strategy] = {}
         for detector_name in args.detectors:
+            if "residual" not in DETECTOR_SOURCES.get(detector_name, DRIFT_SOURCES):
+                continue
             parameters, per_variable = detector_parameters(
                 detector_overrides, data_config["name"], "residual", strategy, detector_name
             )
@@ -774,7 +811,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             handle.write("\n")
     window_fields = [
         "sample_start", "sample_end", "raw_start", "raw_end",
-        "feature_detector_ok", "residual_detector_ok", "detector_ok",
+        "feature_detector_ok", "residual_detector_ok", "detector_alarm_votes", "detector_ok",
         "feature_alarm_indices", "residual_alarm_indices",
         "distribution_ok", "loss_ok", "stable",
         "mean_change", "mean_ok", "std_change", "std_ok",
@@ -813,6 +850,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     window.sample_start <= index < window.sample_end
                     for index in residual_alarms
                 ),
+                "detector_alarm_votes": detector_alarm_votes(
+                    window.sample_start, window.sample_end, alarm_prefixes
+                ),
                 "stable": window.stable,
                 "mean_change": distribution.mean_change,
                 "mean_ok": distribution.mean_change <= args.mean_threshold,
@@ -846,7 +886,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     interval_candidate_fields = [
         "sample_start", "sample_end", "raw_start", "raw_end_exclusive", "raw_length",
-        "window_count", "length_ok", "detector_ok", "mean_change", "std_change",
+        "window_count", "length_ok", "detector_alarm_votes", "detector_ok", "mean_change", "std_change",
         "quantile_change", "distribution_ok", "loss_ok", "stable",
     ]
     for strategy in strategies:
@@ -893,6 +933,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "source_path": str(data_config["path"]),
         "strategies": list(strategies),
         "detectors": list(args.detectors),
+        "detector_voting": {
+            "rule": "strict_majority_alarm_veto",
+            "voters": list(args.detectors),
+            "votes_to_veto": len(args.detectors) // 2 + 1,
+            "scope": "at least one alarm per detector method in the window",
+        },
         "offline_train_ratio": first_config["offline"]["train_ratio"],
         "offline_training_windows": train_size,
         "offline_raw_end_exclusive": offline_raw_end,
@@ -996,7 +1042,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "effective_detector_parameters": effective_detector_parameters,
         "effective_detector_stream_parameters": effective_stream_parameters,
         "detector_calibration": {
-            "enabled": args.auto_calibrate_detectors,
+            "enabled": bool(calibration_report),
+            "not_calibrated": [name for name in args.detectors if name not in calibratable_detectors],
             "sample_start": calibration_report.get("sample_start"),
             "sample_end_exclusive": calibration_report.get("sample_end_exclusive"),
             "report": "detector_calibration.json" if calibration_report else None,

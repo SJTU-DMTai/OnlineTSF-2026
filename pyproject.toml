@@ -12,6 +12,7 @@ dependencies = ["torch>=2.0", "PyYAML>=6.0", "river>=0.23"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+capymoa = ["capymoa>=0.14"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
