@@ -41,7 +41,6 @@ from scripts.stability import (
     covered_raw_length,
     distribution_metrics,
     loss_metrics,
-    merge_stable_windows,
     quantile_threshold,
 )
 
@@ -74,10 +73,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--loss-low-quantile",
         type=float,
-        default=0.55,
+        default=0.60,
         help="quantile of candidate mean losses defining a low loss for each model",
     )
-    parser.add_argument("--loss-cv-threshold", type=float, default=1.1)
+    parser.add_argument("--loss-cv-threshold", type=float, default=1.5)
     parser.add_argument(
         "--loss-block-size", type=int, default=16,
         help="forecast steps averaged before computing loss CV",
@@ -97,7 +96,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--extra-min-length",
         type=int,
-        help="extra raw rows beyond context+horizon; defaults to context+horizon",
+        help="optional extra raw rows beyond context+horizon required for each selected window",
     )
     parser.add_argument("--device", help="override online.device for every model")
     parser.add_argument(
@@ -314,8 +313,8 @@ def build_alarm_vote_prefixes(
     votes_by_scope: dict[tuple[str, str, int], set[str]] = defaultdict(set)
     for event in alarm_events:
         source = event["source"]
-        strategy = event["strategy"] if source == "residual" else ""
-        votes_by_scope[(source, strategy, event["sample_index"])].add(event["detector"])
+        scope = event["strategy"] if source == "residual" else event["variable_name"]
+        votes_by_scope[(source, scope, event["sample_index"])].add(event["detector"])
 
     votes_by_index = [0] * dataset_length
     consensus_indices: dict[str, set[int]] = {source: set() for source in sources}
@@ -673,114 +672,55 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         )
 
-    extra_min_length = args.extra_min_length if args.extra_min_length is not None else context + horizon
-    minimum_raw_length = context + horizon + extra_min_length
-    runs_before_length = merge_stable_windows(windows, minimum_raw_length=0)
-    refined_runs = []
-    for run in runs_before_length:
-        start = run.sample_start
-        end = run.sample_end
-        left_limit = max(eligible_start, start - args.window_step + 1)
-        for candidate_start in range(start - 1, left_limit - 1, -1):
-            result = evaluate_window(
-                candidate_start, candidate_start + args.window_size,
-                dataset=dataset, strategies=strategies, losses=losses,
-                loss_thresholds=loss_thresholds, alarm_prefixes=alarm_prefixes,
-                args=args, distributions=distribution_by_range, model_losses=loss_by_range,
-            )
-            if not result.stable:
-                break
-            start = candidate_start
-        right_limit = min(online_stop - args.window_size, end - args.window_size + args.window_step - 1)
-        for candidate_start in range(end - args.window_size + 1, right_limit + 1):
-            result = evaluate_window(
-                candidate_start, candidate_start + args.window_size,
-                dataset=dataset, strategies=strategies, losses=losses,
-                loss_thresholds=loss_thresholds, alarm_prefixes=alarm_prefixes,
-                args=args, distributions=distribution_by_range, model_losses=loss_by_range,
-            )
-            if not result.stable:
-                break
-            end = candidate_start + args.window_size
-        refined_runs.append((start, end, run.window_count))
-
-    intervals = []
+    minimum_raw_length = (
+        context + horizon + args.extra_min_length if args.extra_min_length is not None else 0
+    )
+    intervals: list[StableInterval] = []
     interval_candidates: list[dict[str, Any]] = []
-    whole_interval_pass_count = 0
-    runs_rejected_by_length = 0
-    maximum_run_length = 0
-    for start, end, window_count in refined_runs:
-        # Only the centers of passing windows become the selected raw interval.
-        # This keeps intervals disjoint when a failed window separates two runs.
-        core_start = start + args.window_size // 2
-        core_end = end - (args.window_size - 1) // 2
-        raw_start = core_start * stride + context
-        raw_end = core_end * stride + context
-        core_alarm_votes = detector_alarm_votes(core_start, core_end, votes_by_index)
-        maximum_run_length = max(maximum_run_length, raw_end - raw_start)
+    for window in windows:
+        if not window.stable:
+            continue
+        # The context is used to predict, but only the target rows are selected.
+        raw_start = window.sample_start * stride + context
+        raw_end = (window.sample_end - 1) * stride + context + horizon
+        length_ok = raw_end - raw_start > minimum_raw_length
+        selected = length_ok and (not intervals or raw_start >= intervals[-1].raw_end)
+        distribution = distribution_by_range[(window.sample_start, window.sample_end)]
         candidate: dict[str, Any] = {
-            "sample_start": core_start,
-            "sample_end": core_end,
+            "sample_start": window.sample_start,
+            "sample_end": window.sample_end,
             "raw_start": raw_start,
             "raw_end_exclusive": raw_end,
             "raw_length": raw_end - raw_start,
-            "window_count": window_count,
-            "length_ok": (
-                raw_end - raw_start > minimum_raw_length
-                and core_end - core_start >= 2 * args.loss_block_size
+            "window_count": 1,
+            "length_ok": length_ok,
+            "selected": selected,
+            "detector_alarm_votes": detector_alarm_votes(
+                window.sample_start, window.sample_end, votes_by_index
             ),
-            "detector_alarm_votes": core_alarm_votes,
-            "detector_ok": all(
-                prefix[core_end] == prefix[core_start]
-                for prefix in alarm_prefixes.values()
-            ),
+            "detector_ok": window.detector_ok,
+            "mean_change": distribution.mean_change,
+            "std_change": distribution.std_change,
+            "quantile_change": distribution.quantile_change,
+            "distribution_ok": window.distribution_ok,
+            "loss_ok": window.loss_ok,
+            "stable": window.stable,
         }
-        if not candidate["length_ok"]:
-            runs_rejected_by_length += 1
-            interval_candidates.append(candidate)
-            continue
-        distribution = distribution_metrics(
-            dataset.values[raw_start:raw_end],
-            feature_quantile=args.distribution_feature_quantile,
-        )
-        distribution_ok = (
-            distribution.mean_change <= args.mean_threshold
-            and distribution.std_change <= args.std_threshold
-            and distribution.quantile_change <= args.quantile_threshold
-        )
-        candidate.update(
-            mean_change=distribution.mean_change,
-            std_change=distribution.std_change,
-            quantile_change=distribution.quantile_change,
-            distribution_ok=distribution_ok,
-        )
-        loss_ok = True
         for strategy in strategies:
-            metrics = loss_metrics(
-                [losses[strategy][index] for index in range(core_start, core_end)],
-                block_size=args.loss_block_size,
-            )
-            if (
-                metrics.mean > loss_thresholds[strategy]
-                or metrics.coefficient_of_variation > args.loss_cv_threshold
-            ):
-                loss_ok = False
+            metrics = loss_by_range[(window.sample_start, window.sample_end)][strategy]
             candidate[f"{strategy}_loss_mean"] = metrics.mean
             candidate[f"{strategy}_loss_mean_ok"] = metrics.mean <= loss_thresholds[strategy]
             candidate[f"{strategy}_loss_cv"] = metrics.coefficient_of_variation
             candidate[f"{strategy}_loss_cv_ok"] = (
                 metrics.coefficient_of_variation <= args.loss_cv_threshold
             )
-        candidate["loss_ok"] = loss_ok
-        candidate["stable"] = candidate["detector_ok"] and distribution_ok and loss_ok
         interval_candidates.append(candidate)
-        if candidate["stable"]:
-            whole_interval_pass_count += 1
+        if selected:
             intervals.append(
-                StableInterval(core_start, core_end, raw_start, raw_end, window_count)
+                StableInterval(window.sample_start, window.sample_end, raw_start, raw_end, 1)
             )
-    analyzed_raw_start = windows[0].raw_start
-    analyzed_raw_end = windows[-1].raw_end
+    analyzed_raw_start = windows[0].sample_start * stride + context
+    analyzed_raw_end = (windows[-1].sample_end - 1) * stride + context + horizon
     retained_rows = covered_raw_length(intervals)
     analyzed_rows = analyzed_raw_end - analyzed_raw_start
     timestamps = read_timestamps(data_config["path"], "date")
@@ -917,7 +857,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     interval_candidate_fields = [
         "sample_start", "sample_end", "raw_start", "raw_end_exclusive", "raw_length",
-        "window_count", "length_ok", "detector_alarm_votes", "detector_ok", "mean_change", "std_change",
+        "window_count", "length_ok", "selected", "detector_alarm_votes", "detector_ok", "mean_change", "std_change",
         "quantile_change", "distribution_ok", "loss_ok", "stable",
     ]
     for strategy in strategies:
@@ -968,7 +908,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "rule": "simultaneous_majority_alarm_veto",
             "voters": list(args.detectors),
             "votes_to_veto": votes_to_veto,
-            "scope": "same sample index and source; residual alarms also share a strategy",
+            "scope": "same sample index and source; feature alarms share a variable, residual alarms share a strategy",
         },
         "offline_train_ratio": first_config["offline"]["train_ratio"],
         "offline_training_windows": train_size,
@@ -978,12 +918,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "candidate_window_size": args.window_size,
         "candidate_window_step": args.window_step,
         "minimum_raw_length_strictly_greater_than": minimum_raw_length,
-        "stable_runs_before_length_filter": len(runs_before_length),
-        "runs_rejected_by_length": runs_rejected_by_length,
-        "runs_rejected_by_whole_interval_check": (
-            len(refined_runs) - runs_rejected_by_length - whole_interval_pass_count
+        "passing_window_count": len(interval_candidates),
+        "windows_rejected_by_length": sum(not candidate["length_ok"] for candidate in interval_candidates),
+        "windows_skipped_due_to_overlap": sum(
+            candidate["length_ok"] and not candidate["selected"] for candidate in interval_candidates
         ),
-        "maximum_stable_run_raw_length": maximum_run_length,
+        "maximum_selected_raw_length": max((interval.raw_length for interval in intervals), default=0),
         "condition_pass_counts": condition_counts(windows),
         "subcondition_pass_counts": {
             "feature_detector": sum(
@@ -1096,7 +1036,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "detector_overrides": str(args.detector_overrides) if args.detector_overrides else None,
             "auto_calibrate_detectors": args.auto_calibrate_detectors,
             "calibration_samples": args.calibration_samples,
-            "extra_min_length": extra_min_length,
+            "extra_min_length": args.extra_min_length,
         },
     }
     with (destination / "summary.json").open("w", encoding="utf-8", newline="\n") as handle:
