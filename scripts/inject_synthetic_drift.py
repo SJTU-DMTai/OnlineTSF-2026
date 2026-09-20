@@ -20,6 +20,7 @@ METHODS = ("mean", "scale", "permutation")
 MEAN_STD_MULTIPLIER_RANGE = (0.5, 1.5)
 SCALE_FACTOR_RANGES = ((0.5, 0.8), (1.25, 2.0))
 GRADUAL_PROBABILITY = 0.5
+SPLICE_GUARD_ROWS = 32
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--method", required=True, choices=METHODS)
     parser.add_argument("--min-length", type=int, default=512, help="minimum generated stream rows")
     parser.add_argument("--time-column", default="date")
+    parser.add_argument(
+        "--splice-guard-rows",
+        type=int,
+        default=SPLICE_GUARD_ROWS,
+        help="minimum generated rows between an injected transition and a splice",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", required=True, help="new output directory")
     return parser.parse_args(argv)
@@ -64,6 +71,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.min_length < 2:
         raise ValueError("--min-length must be at least two")
+    if args.splice_guard_rows < 0:
+        raise ValueError("--splice-guard-rows must be non-negative")
 
 
 def new_concept_probability(position: int, onset: int, width: int) -> float:
@@ -219,12 +228,31 @@ def restore_timestamps(
         row[time_index] = available[index]
 
 
-def choose_onset(length: int, width: int, rng: random.Random) -> int:
+def choose_onset(
+    length: int,
+    width: int,
+    rng: random.Random,
+    splice_points: Sequence[int] = (),
+    splice_guard_rows: int = SPLICE_GUARD_ROWS,
+) -> int:
     first = math.ceil(DRIFT_REGION[0] * length)
     last = min(math.floor(DRIFT_REGION[1] * length), length - width - 1)
     if first > last:
         raise ValueError("drift width leaves no valid onset in the 40%-80% region")
-    return rng.randint(first, last)
+    if splice_guard_rows < 0:
+        raise ValueError("splice guard rows must be non-negative")
+    candidates = [
+        onset
+        for onset in range(first, last + 1)
+        if all(
+            onset + max(width, 1) + splice_guard_rows <= splice
+            or onset >= splice + splice_guard_rows
+            for splice in splice_points
+        )
+    ]
+    if not candidates:
+        raise ValueError("no drift onset remains outside the splice guard regions")
+    return rng.choice(candidates)
 
 
 def choose_width(maximum: int, rng: random.Random) -> int:
@@ -404,7 +432,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     restore_timestamps(rows, source_rows, header.index(args.time_column))
     width = choose_width(maximum_gradual_width, rng)
-    onset = choose_onset(len(rows), width, rng)
+    onset = choose_onset(
+        len(rows),
+        width,
+        rng,
+        [label.start_index for label in labels if label.method == "splice"],
+        args.splice_guard_rows,
+    )
     variables = choose_variables(variable_names, args.method, rng)
     drift_parameters = sample_drift_parameters(rows, header, args.method, variables, rng)
     labels.append(
@@ -434,6 +468,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "transition": "abrupt" if width == 0 else "gradual",
         "width": width,
         "maximum_gradual_width": maximum_gradual_width,
+        "splice_guard_rows": args.splice_guard_rows,
         "drift_region": list(DRIFT_REGION),
         "drift_onset": onset,
         "seed": args.seed,

@@ -37,6 +37,7 @@ class DriftRecord:
     source: str
     index: int
     available_at: int
+    raw_signal_index: int
     variable_name: str
     variable_index: int
     horizon_step: int | None

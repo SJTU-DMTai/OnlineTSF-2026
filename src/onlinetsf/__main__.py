@@ -255,6 +255,20 @@ def _drift_values(config: dict[str, Any], event: FeedbackEvent) -> list[DriftObs
     return values
 
 
+def raw_signal_index(
+    data: dict[str, Any], forecast_index: int, source: str, horizon_step: int | None
+) -> int:
+    """Map a detector input to its zero-based row in the generated CSV."""
+
+    context_length = data["context_length"]
+    raw_context_start = forecast_index * data.get("stride", 1)
+    if source == "features":
+        return raw_context_start + context_length - 1
+    if horizon_step is None:
+        raise ValueError("target and residual observations require a horizon step")
+    return raw_context_start + context_length + horizon_step - 1
+
+
 def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftRecord]:
     """Apply independent detectors to the configured source variables."""
 
@@ -274,7 +288,9 @@ def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftR
             update = detector.update(event.features)
             records.append(DriftRecord(
                 detector="abcd", source="features", index=event.index,
-                available_at=event.index, variable_name="all_features",
+                available_at=event.index,
+                raw_signal_index=raw_signal_index(config["data"], event.index, "features", None),
+                variable_name="all_features",
                 variable_index=-1, horizon_step=None, value=update.value,
                 detected=update.detected,
             ))
@@ -312,6 +328,9 @@ def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftR
                         source=source,
                         index=event.index,
                         available_at=observation.available_at,
+                        raw_signal_index=raw_signal_index(
+                            config["data"], event.index, source, observation.horizon_step
+                        ),
                         variable_name=observation.variable_name,
                         variable_index=observation.variable_index,
                         horizon_step=observation.horizon_step,

@@ -18,6 +18,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--min-length", type=int, default=512)
     parser.add_argument("--time-column", default="date")
+    parser.add_argument("--splice-guard-rows", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
     if args.repetitions <= 0:
@@ -36,6 +37,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "--method", method,
                 "--min-length", str(args.min_length),
                 "--time-column", args.time_column,
+                "--splice-guard-rows", str(args.splice_guard_rows),
                 "--seed", str(args.seed + repetition),
                 "--output", str(destination / f"{method}-{repetition:03d}"),
             ]

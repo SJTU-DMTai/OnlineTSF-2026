@@ -252,7 +252,7 @@ def collect_alarm_indices(
         config["drift"]["parameters"].update(parameters)
         config["drift"]["variable_parameters"] = variable_parameters
         key = cache_key({
-            "version": 2, "input": input_key,
+            "version": 3, "input": input_key,
             "drift": config["drift"],
         })
         cache_path = cache_dir / f"detector-{key}.json"
@@ -269,6 +269,7 @@ def collect_alarm_indices(
                     "detector": detector_name,
                     "sample_index": record.index,
                     "available_at": record.available_at,
+                    "raw_signal_index": record.raw_signal_index,
                     "variable_name": record.variable_name,
                     "variable_index": record.variable_index,
                     "horizon_step": record.horizon_step,
@@ -851,7 +852,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             writer.writerow(row)
 
     event_fields = [
-        "source", "strategy", "detector", "sample_index", "available_at",
+        "source", "strategy", "detector", "sample_index", "available_at", "raw_signal_index",
         "variable_name", "variable_index", "horizon_step", "value",
     ]
     with (destination / "alarm_events.csv").open("w", encoding="utf-8", newline="") as handle:

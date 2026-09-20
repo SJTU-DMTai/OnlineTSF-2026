@@ -62,6 +62,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "seed",
                 "forecast_index",
                 "feedback_available_at",
+                "raw_context_start_index",
+                "raw_context_end_index",
+                "raw_target_start_index",
+                "raw_target_end_exclusive",
                 "observed_values",
                 "step_mae",
                 "step_mse",
@@ -76,6 +80,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "seed",
                 "forecast_index",
                 "feedback_available_at",
+                "raw_context_start_index",
+                "raw_context_end_index",
+                "raw_target_index",
                 "horizon_step",
                 "target_position",
                 "target_name",
@@ -93,6 +100,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "source",
                 "forecast_index",
                 "available_at",
+                "raw_signal_index",
                 "variable_name",
                 "variable_index",
                 "horizon_step",
@@ -108,6 +116,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "source",
                 "forecast_index",
                 "available_at",
+                "raw_signal_index",
                 "variable_name",
                 "variable_index",
                 "horizon_step",
@@ -178,12 +187,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
 
                 for feedback in run.events:
+                    raw_context_start = feedback.index * config["data"].get("stride", 1)
+                    raw_target_start = raw_context_start + config["data"]["context_length"]
                     step_writer.writerow(
                         (
                             strategy,
                             seed,
                             feedback.index,
                             feedback.available_at,
+                            raw_context_start,
+                            raw_context_start + config["data"]["context_length"] - 1,
+                            raw_target_start,
+                            raw_target_start + config["data"]["horizon"],
                             feedback.observed_values,
                             feedback.mae,
                             feedback.mse,
@@ -208,6 +223,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             record.source,
                             record.index,
                             record.available_at,
+                            record.raw_signal_index,
                             record.variable_name,
                             record.variable_index,
                             record.horizon_step,
@@ -224,6 +240,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 record.source,
                                 record.index,
                                 record.available_at,
+                                record.raw_signal_index,
                                 record.variable_name,
                                 record.variable_index,
                                 record.horizon_step,

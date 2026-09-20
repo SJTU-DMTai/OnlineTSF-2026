@@ -97,6 +97,12 @@ def test_onset_is_random_in_common_region_for_both_widths():
             assert onset + width < 100
 
 
+def test_onset_keeps_the_whole_injected_transition_away_from_splices():
+    for seed in range(30):
+        onset = choose_onset(512, 32, random.Random(seed), (256,), 32)
+        assert onset + 32 + 32 <= 256 or onset >= 256 + 32
+
+
 def test_width_randomly_selects_abrupt_or_a_short_gradual_transition():
     widths = {choose_width(8, random.Random(seed)) for seed in range(30)}
 
@@ -204,6 +210,7 @@ def test_integration_generates_schema_labels_and_batch(tmp_path):
             "--stable-intervals", str(intervals),
             "--method", "scale",
             "--min-length", "40",
+            "--splice-guard-rows", "0",
             "--seed", "1",
             "--output", str(output),
         ]
@@ -252,6 +259,7 @@ def test_integration_generates_schema_labels_and_batch(tmp_path):
             "--output", str(batch_output),
             "--repetitions", "1",
             "--min-length", "40",
+            "--splice-guard-rows", "0",
         ]
     )
     assert sorted(path.name for path in batch_output.iterdir()) == [
@@ -266,6 +274,7 @@ def test_integration_generates_schema_labels_and_batch(tmp_path):
             "--stable-intervals", str(intervals),
             "--method", "scale",
             "--min-length", "40",
+            "--splice-guard-rows", "0",
             "--seed", "1",
             "--output", str(repeat),
         ]

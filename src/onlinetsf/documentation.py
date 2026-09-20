@@ -39,14 +39,22 @@ def write_experiment_documents(
     """Write the resolved config, per-step errors, detector trace, and result report."""
 
     directory = _run_directory(output_directory, run_name)
+    data = config["data"]
+    stride = data.get("stride", 1)
+    context_length = data["context_length"]
+    horizon = data["horizon"]
     with (directory / "config.txt").open("w", encoding="utf-8", newline="\n") as handle:
         yaml.safe_dump(config, handle, sort_keys=False)
 
     with (directory / "online_training.log").open("w", encoding="utf-8", newline="\n") as handle:
         for event in run.events:
             loss = "N/A" if event.adaptation_loss is None else f"{event.adaptation_loss:.6f}"
+            raw_context_start = event.index * stride
+            raw_target_start = raw_context_start + context_length
             handle.write(
                 f"feedback index={event.index} available_at={event.available_at} "
+                f"raw_context_start={raw_context_start} "
+                f"raw_target_start={raw_target_start} "
                 f"observed_values={event.observed_values} mae={event.mae:.6f} "
                 f"mse={event.mse:.6f} cumulative_mae={event.cumulative_mae:.6f} "
                 f"cumulative_mse={event.cumulative_mse:.6f} adaptation_loss={loss}\n"
@@ -65,6 +73,9 @@ def write_experiment_documents(
             (
                 "forecast_index",
                 "feedback_available_at",
+                "raw_context_start_index",
+                "raw_context_end_index",
+                "raw_target_index",
                 "horizon_step",
                 "target_position",
                 "target_name",
@@ -77,6 +88,7 @@ def write_experiment_documents(
         for event in run.events:
             if event.prediction is None or event.target is None or event.observed_mask is None:
                 continue
+            raw_context_start = event.index * stride
             for horizon_index in range(event.prediction.shape[0]):
                 for target_index in range(event.prediction.shape[1]):
                     if not event.observed_mask[horizon_index, target_index].item():
@@ -88,6 +100,9 @@ def write_experiment_documents(
                         (
                             event.index,
                             event.available_at,
+                            raw_context_start,
+                            raw_context_start + context_length - 1,
+                            raw_context_start + context_length + horizon_index,
                             horizon_index + 1,
                             target_index,
                             target_names[target_index],
@@ -106,6 +121,7 @@ def write_experiment_documents(
                 "source",
                 "forecast_index",
                 "available_at",
+                "raw_signal_index",
                 "variable_name",
                 "variable_index",
                 "horizon_step",
@@ -120,6 +136,7 @@ def write_experiment_documents(
                     record.source,
                     record.index,
                     record.available_at,
+                    record.raw_signal_index,
                     record.variable_name,
                     record.variable_index,
                     record.horizon_step,
@@ -128,7 +145,6 @@ def write_experiment_documents(
                 )
             )
 
-    data = config["data"]
     forecasting = config["forecasting"]
     method = config["method"]
     drift = config["drift"]
@@ -162,7 +178,8 @@ def write_experiment_documents(
             for record in detected_records:
                 handle.write(
                     f"{record.detector} detected at forecast index {record.index} "
-                    f"(feedback available at {record.available_at}).\n"
+                    f"(generated CSV row {record.raw_signal_index}; "
+                    f"feedback available at {record.available_at}).\n"
                 )
         elif drift_indices:
             for index in drift_indices:
@@ -171,6 +188,6 @@ def write_experiment_documents(
             handle.write("No drift events were detected.\n")
         handle.write("\nThe complete resolved configuration is saved in config.txt; "
                      "per-feedback online updates are saved in online_training.log.\n")
-        handle.write("forecast_values.csv contains one row per observed horizon and target value; "
-                     "drift_trace.csv contains every detector update.\n")
+        handle.write("forecast_values.csv and drift_trace.csv include zero-based generated CSV row "
+                     "coordinates for direct comparison with drift_labels.csv.\n")
     return directory
