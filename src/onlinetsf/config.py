@@ -10,8 +10,8 @@ from typing import Any
 import yaml
 
 
-BACKBONES = frozenset(("linear", "lstm", "tcn", "patchtst", "fsnet_tcn", "onenet_tcn"))
-METHODS = frozenset(("ogd", "fsnet", "onenet"))
+BACKBONES = frozenset(("linear", "dlinear", "lstm", "tcn", "patchtst", "fsnet_tcn", "onenet_tcn"))
+METHODS = frozenset(("ogd", "fsnet", "onenet", "dsof", "under_cali"))
 DRIFT_DETECTORS = frozenset(("none", "page_hinkley", "adwin", "kswin", "seed", "stepd", "hddmw", "abcd"))
 DRIFT_SOURCES = frozenset(("features", "target", "residual"))
 BINARY_RESIDUAL_DETECTORS = frozenset(("stepd", "hddmw"))
@@ -123,6 +123,34 @@ def load_config(
         raise ValueError(f"backbone {backbone} requires its matching online method")
     if method_name in paired_backbones and method.get("learning_rate") is None:
         raise ValueError(f"config.method.learning_rate is required for {method_name}")
+    if method_name == "dsof":
+        if backbone in {"fsnet_tcn", "onenet_tcn"}:
+            raise ValueError("dsof requires a standard forecasting backbone")
+        for option in ("learning_rate", "student_learning_rate", "online_learning_rate"):
+            value = method.get(option, 1e-3)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"config.method.{option} must be positive for dsof")
+            method[option] = float(value)
+        for option, default in (("student_hidden", 16), ("student_depth", 3),
+                                ("replay_buffer_size", 300), ("replay_batch_size", 32),
+                                ("replay_epochs", 1), ("replay_frequency", 1)):
+            value = method.get(option, default)
+            minimum = 2 if option == "student_depth" else 1
+            if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                raise ValueError(f"config.method.{option} must be an integer >= {minimum} for dsof")
+            method[option] = value
+        if method["replay_batch_size"] > method["replay_buffer_size"]:
+            raise ValueError("config.method.replay_batch_size cannot exceed replay_buffer_size")
+        dropout = method.get("student_dropout", 0.0)
+        if not isinstance(dropout, (int, float)) or isinstance(dropout, bool) or not math.isfinite(dropout) or not 0 <= dropout < 1:
+            raise ValueError("config.method.student_dropout must be in [0, 1) for dsof")
+        method["student_dropout"] = float(dropout)
+        discount = method.get("discount", 0.9)
+        if not isinstance(discount, (int, float)) or isinstance(discount, bool) or not math.isfinite(discount) or not 0 < discount <= 1:
+            raise ValueError("config.method.discount must be in (0, 1] for dsof")
+        method["discount"] = float(discount)
+        if data.get("stride", 1) != 1:
+            raise ValueError("dsof requires data.stride: 1 for one observation per step")
     if method_name == "fsnet":
         n_inner = method.get("n_inner", 1)
         if not isinstance(n_inner, int) or isinstance(n_inner, bool) or n_inner <= 0:
@@ -151,6 +179,32 @@ def load_config(
             raise ValueError("config.method.n_inner must be a positive integer for onenet")
         method["n_inner"] = n_inner
 
+    if method_name == "under_cali":
+        if backbone in {"fsnet_tcn", "onenet_tcn"}:
+            raise ValueError("under_cali requires a standard forecasting backbone")
+        for option, default in (("learning_rate", None), ("adapt_lr", 1e-3),
+                                ("uncertainty_lr", 1e-4), ("uncertainty_adapt_lr", 1e-4)):
+            value = method.get(option, default)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"config.method.{option} must be positive for under_cali")
+            method[option] = float(value)
+        for option, default in (("calibrator_hidden_dim", 64), ("uncertainty_hidden_dim", 128),
+                                ("uncertainty_epochs", 20), ("update_steps", 5)):
+            value = method.get(option, default)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"config.method.{option} must be a positive integer for under_cali")
+            method[option] = value
+        for option, default in (("allocation_alpha", 0.75), ("trigger_alpha", 0.25)):
+            value = method.get(option, default)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < value <= 1:
+                raise ValueError(f"config.method.{option} must be in (0, 1] for under_cali")
+            method[option] = float(value)
+        for option, default in (("allocation_std_k", 0.25), ("trigger_std_k", 0.75)):
+            value = method.get(option, default)
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"config.method.{option} must be non-negative for under_cali")
+            method[option] = float(value)
+
     offline_train_ratio = offline.get("train_ratio", 0.0)
     if (
         not isinstance(offline_train_ratio, (int, float))
@@ -167,6 +221,8 @@ def load_config(
     if not isinstance(offline_batch_size, int) or isinstance(offline_batch_size, bool) or offline_batch_size <= 0:
         raise ValueError("config.offline.batch_size must be a positive integer")
     offline["batch_size"] = offline_batch_size
+    if method_name == "under_cali" and offline["train_ratio"] == 0.0:
+        raise ValueError("under_cali requires offline.train_ratio > 0")
     if offline["train_ratio"] > 0.0 and method.get("learning_rate") is None:
         raise ValueError("config.method.learning_rate is required when offline training is enabled")
 
@@ -179,7 +235,9 @@ def load_config(
         raise ValueError("config.online.feedback_delay must be an integer or integer list")
     if isinstance(feedback_delay, int) and feedback_delay < 0:
         raise ValueError("config.online.feedback_delay must be non-negative")
-    if method_name in {"fsnet", "onenet"} and isinstance(feedback_delay, list):
+    if method_name == "dsof" and feedback_delay != list(range(1, data["horizon"] + 1)):
+        raise ValueError("dsof requires online.feedback_delay: [1, ..., horizon]")
+    if method_name in {"fsnet", "onenet", "under_cali"} and isinstance(feedback_delay, list):
         raise ValueError(f"{method_name} requires a scalar complete-feedback delay")
 
     detector_name = drift.get("name")

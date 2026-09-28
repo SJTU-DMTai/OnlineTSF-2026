@@ -21,13 +21,14 @@ from .drift import (
     HDDMWDetector, KSWINDetector, PageHinkleyDetector,
 )
 from .forecasting import (
+    DLinearForecastBackbone,
     LinearForecastBackbone,
     LSTMForecastBackbone,
     PatchTSTForecastBackbone,
     TCNForecastBackbone,
     TimeTCNForecastBackbone,
 )
-from .methods import FSNetMethod, FSNetTCN, OGDMethod, OneNetEnsemble, OneNetMethod
+from .methods import DSOFMethod, DSOFModel, FSNetMethod, FSNetTCN, OGDMethod, OneNetEnsemble, OneNetMethod, UnderCaliMethod
 from .online import FeedbackEvent, OnlineExecutor, OnlineRun
 
 
@@ -41,15 +42,18 @@ def _build_backbone(config: dict[str, Any], num_features: int, num_targets: int,
         "horizon": data["horizon"],
         "num_targets": num_targets,
     }
-    if forecasting["backbone"] == "linear":
-        return LinearForecastBackbone(**dimensions, **options)
-    if forecasting["backbone"] == "lstm":
-        return LSTMForecastBackbone(**dimensions, **options)
-    if forecasting["backbone"] == "tcn":
-        return TCNForecastBackbone(**dimensions, **options)
-    if forecasting["backbone"] == "patchtst":
-        return PatchTSTForecastBackbone(**dimensions, target_indices=target_indices, **options)
-    if forecasting["backbone"] == "onenet_tcn":
+    backbone = forecasting["backbone"]
+    if backbone == "linear":
+        model = LinearForecastBackbone(**dimensions, **options)
+    elif backbone == "dlinear":
+        model = DLinearForecastBackbone(**dimensions, target_indices=target_indices, **options)
+    elif backbone == "lstm":
+        model = LSTMForecastBackbone(**dimensions, **options)
+    elif backbone == "tcn":
+        model = TCNForecastBackbone(**dimensions, **options)
+    elif backbone == "patchtst":
+        model = PatchTSTForecastBackbone(**dimensions, target_indices=target_indices, **options)
+    elif backbone == "onenet_tcn":
         cross_time = TimeTCNForecastBackbone(
             **dimensions, target_indices=target_indices, **options
         )
@@ -62,13 +66,39 @@ def _build_backbone(config: dict[str, Any], num_features: int, num_targets: int,
             decision_hidden=config["method"].get("decision_hidden", 32),
             decision_dropout=config["method"].get("decision_dropout", 0.1),
         )
-    return FSNetTCN(**dimensions, **options)
-
+    else:
+        model = FSNetTCN(**dimensions, **options)
+    if config["method"]["name"] == "dsof":
+        method = config["method"]
+        return DSOFModel(
+            model,
+            context_length=data["context_length"],
+            horizon=data["horizon"],
+            target_indices=tuple(target_indices),
+            student_hidden=method.get("student_hidden", 16),
+            student_depth=method.get("student_depth", 3),
+            student_dropout=method.get("student_dropout", 0.0),
+        )
+    return model
 
 def _build_method(config: dict[str, Any], model: nn.Module):
     method = config["method"]
     device = config["online"].get("device")
     learning_rate = method.get("learning_rate")
+    if method["name"] == "dsof":
+        assert isinstance(model, DSOFModel)
+        return DSOFMethod(
+            model,
+            learning_rate=learning_rate,
+            student_learning_rate=method.get("student_learning_rate", 1e-3),
+            online_learning_rate=method.get("online_learning_rate", 1e-3),
+            replay_buffer_size=method.get("replay_buffer_size", 300),
+            replay_batch_size=method.get("replay_batch_size", 32),
+            replay_epochs=method.get("replay_epochs", 1),
+            replay_frequency=method.get("replay_frequency", 1),
+            discount=method.get("discount", 0.9),
+            device=device,
+        )
     if method["name"] == "onenet":
         assert isinstance(model, OneNetEnsemble)
         return OneNetMethod(
@@ -88,6 +118,28 @@ def _build_method(config: dict[str, Any], model: nn.Module):
             device=device,
         )
 
+    if method["name"] == "under_cali":
+        return UnderCaliMethod(
+            model,
+            context_length=config["data"]["context_length"],
+            horizon=config["data"]["horizon"],
+            num_features=config["data"]["num_features"],
+            num_targets=len(config["data"]["target_names"]),
+            learning_rate=learning_rate,
+            adapt_lr=method["adapt_lr"],
+            uncertainty_lr=method["uncertainty_lr"],
+            uncertainty_adapt_lr=method["uncertainty_adapt_lr"],
+            calibrator_hidden_dim=method["calibrator_hidden_dim"],
+            uncertainty_hidden_dim=method["uncertainty_hidden_dim"],
+            uncertainty_epochs=method["uncertainty_epochs"],
+            update_steps=method["update_steps"],
+            allocation_alpha=method["allocation_alpha"],
+            allocation_std_k=method["allocation_std_k"],
+            trigger_alpha=method["trigger_alpha"],
+            trigger_std_k=method["trigger_std_k"],
+            device=device,
+        )
+
     if learning_rate is None:
         return OGDMethod(model, device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -101,7 +153,7 @@ def _build_method(config: dict[str, Any], model: nn.Module):
 
 
 def _run_offline_training(
-    dataset, method: OGDMethod | FSNetMethod | OneNetMethod, offline: dict[str, Any]
+    dataset, method: OGDMethod | FSNetMethod | OneNetMethod | DSOFMethod | UnderCaliMethod, offline: dict[str, Any]
 ) -> int:
     """Train the model on an initial window prefix before online evaluation."""
 
@@ -116,6 +168,13 @@ def _run_offline_training(
         batch_size=offline["batch_size"],
         shuffle=True,
     )
+    if isinstance(method, DSOFMethod):
+        for _ in range(offline["epochs"]):
+            for context, target in loader:
+                method.train_batch(context, target)
+        method.reset_online_state()
+        return train_size
+
     if isinstance(method, OneNetMethod):
         for _ in range(offline["epochs"]):
             for context, target in loader:
@@ -172,14 +231,25 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         context_length=data["context_length"],
         horizon=data["horizon"],
         stride=data.get("stride", 1),
+        time_column=data.get("time_column"),
+        target_columns=data.get("target_columns"),
+        feature_columns=data.get("feature_columns"),
+        include_time_features=config["forecasting"]["backbone"] in {
+            "tcn", "fsnet_tcn", "onenet_tcn"
+        },
     )
+    train_windows = int(len(dataset) * config["offline"]["train_ratio"])
+    dataset.standardize(train_windows)
     data["target_names"] = list(dataset.target_names)
     data["feature_names"] = list(dataset.feature_names)
+    data["num_features"] = dataset.num_features
     model = _build_backbone(config, dataset.num_features, dataset.num_targets, dataset.target_indices)
     method = _build_method(config, model)
     setup_seconds = perf_counter() - experiment_started
     offline_started = perf_counter()
     offline_stop = _run_offline_training(dataset, method, config["offline"])
+    if isinstance(method, UnderCaliMethod):
+        method.pretrain_uncertainty(dataset, offline_stop, config["offline"]["batch_size"])
     offline_training_seconds = perf_counter() - offline_started
     online = config["online"]
     executor = OnlineExecutor(
@@ -192,9 +262,13 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         ),
     )
     online_started = perf_counter()
+    # The final offline window's target must end before the first evaluated target begins.
+    online_start = offline_stop
+    if offline_stop:
+        online_start += (data["horizon"] - 1) // data.get("stride", 1)
     run = executor.run_dataset(
         dataset,
-        start=max(offline_stop, online.get("start", 0)),
+        start=max(online_start, online.get("start", 0)),
         stop=online.get("stop"),
     )
     online_evaluation_seconds = perf_counter() - online_started
@@ -219,7 +293,7 @@ def _drift_values(config: dict[str, Any], event: FeedbackEvent) -> list[DriftObs
         return [
             DriftObservation(name, index, None, value, event.index)
             for index, (name, value) in enumerate(
-                zip(feature_names, event.features.tolist(), strict=True)
+                zip(feature_names, event.features[:len(feature_names)].tolist(), strict=True)
             )
         ]
 
@@ -285,7 +359,8 @@ def collect_drift_records(config: dict[str, Any], run: OnlineRun) -> list[DriftR
             processed_feature_indices.add(event.index)
             if event.features is None:
                 raise ValueError("ABCD requires retained feature values")
-            update = detector.update(event.features)
+            numeric_features = config["data"].get("feature_names", event.features)
+            update = detector.update(event.features[:len(numeric_features)])
             records.append(DriftRecord(
                 detector="abcd", source="features", index=event.index,
                 available_at=event.index,

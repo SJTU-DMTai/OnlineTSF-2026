@@ -37,6 +37,24 @@ strategies:
       learning_rate: 0.001
       update_steps: 1
 
+  dlinear_dsof:
+    forecasting:
+      backbone: dlinear
+      parameters: {}
+    method:
+      name: dsof
+      learning_rate: 0.001
+      student_learning_rate: 0.001
+      online_learning_rate: 0.001
+      student_hidden: 16
+      student_depth: 3
+      student_dropout: 0.0
+      replay_buffer_size: 300
+      replay_batch_size: 32
+      replay_epochs: 1
+      replay_frequency: 1
+      discount: 0.9
+
   fsnet:
     forecasting:
       backbone: fsnet_tcn
@@ -58,6 +76,25 @@ strategies:
       decision_hidden: 32
       decision_dropout: 0.1
       n_inner: 1
+
+  tcn_under_cali:
+    forecasting:
+      backbone: tcn
+      parameters: {channels: [32, 32, 32, 32, 32], kernel_size: 3, dropout: 0.0}
+    method:
+      name: under_cali
+      learning_rate: 0.001
+      adapt_lr: 0.001
+      uncertainty_lr: 0.0001
+      uncertainty_adapt_lr: 0.0001
+      calibrator_hidden_dim: 64
+      uncertainty_hidden_dim: 128
+      uncertainty_epochs: 20
+      update_steps: 5
+      allocation_alpha: 0.75
+      allocation_std_k: 0.25
+      trigger_alpha: 0.25
+      trigger_std_k: 0.75
 
 detectors:
   none:

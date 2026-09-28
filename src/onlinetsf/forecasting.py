@@ -63,6 +63,40 @@ class LinearForecastBackbone(ForecastBackbone):
         return forecast.reshape(context.shape[0], self.horizon, self.num_targets)
 
 
+class DLinearForecastBackbone(ForecastBackbone):
+    """Shared-weight DLinear decomposition used as the DSOF teacher."""
+
+    def __init__(
+        self,
+        context_length: int,
+        num_features: int,
+        horizon: int,
+        num_targets: int | None = None,
+        target_indices: Sequence[int] | None = None,
+    ) -> None:
+        super().__init__()
+        if context_length <= 0 or num_features <= 0 or horizon <= 0:
+            raise ValueError("context_length, num_features, and horizon must be positive")
+        self.context_length = context_length
+        self.num_features = num_features
+        self.horizon = horizon
+        self.target_indices = tuple(range(num_features) if target_indices is None else target_indices)
+        if not self.target_indices or any(index < 0 or index >= num_features for index in self.target_indices):
+            raise ValueError("target_indices must select input features")
+        if num_targets is not None and num_targets != len(self.target_indices):
+            raise ValueError("num_targets must match target_indices")
+        self.seasonal = nn.Linear(context_length, horizon)
+        self.trend = nn.Linear(context_length, horizon)
+
+    def forward(self, context: Tensor) -> Tensor:
+        _validate_context(context, self.context_length, self.num_features)
+        values = context.transpose(1, 2)
+        # Official DLinear uses a 25-point moving average with replicated endpoints.
+        trend = F.avg_pool1d(F.pad(values, (12, 12), mode="replicate"), kernel_size=25, stride=1)
+        prediction = self.seasonal(values - trend) + self.trend(trend)
+        return prediction[:, self.target_indices, :].transpose(1, 2)
+
+
 class LSTMForecastBackbone(ForecastBackbone):
     """Stacked LSTM encoder with a direct multi-horizon forecasting head."""
 

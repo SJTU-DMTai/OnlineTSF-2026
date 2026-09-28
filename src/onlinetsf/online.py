@@ -22,6 +22,7 @@ class MethodFeedback:
     target: Tensor
     observed_mask: Tensor
     prediction: Tensor
+    current_context: Tensor | None = None
 
 
 class OnlineMethod(Protocol):
@@ -189,13 +190,16 @@ class OnlineExecutor:
         if context.ndim != 2 or target.ndim != 2:
             raise ValueError("context and target must have shapes [time, features]")
 
-        feedback = list(self._deliver_through(index))
+        feedback = list(self._deliver_through(index, context))
         prediction = self.method.predict(context.detach().clone()).detach().to(device="cpu").clone()
         if prediction.shape != target.shape:
             raise ValueError(
                 "method prediction and target shapes differ: "
                 f"{tuple(prediction.shape)} != {tuple(target.shape)}"
             )
+
+        if hasattr(self.method, "on_emission"):
+            self.method.on_emission(index)
 
         emission_available_at = self._schedule_feedback(index, context, target, prediction)
         self._last_index = index
@@ -205,7 +209,7 @@ class OnlineExecutor:
             available_at=emission_available_at,
             prediction=prediction.clone(),
         )
-        feedback.extend(self._deliver_through(index))
+        feedback.extend(self._deliver_through(index, context))
         return OnlineStep(emission=emission, feedback=tuple(feedback))
 
     def flush(self) -> tuple[FeedbackEvent, ...]:
@@ -344,14 +348,14 @@ class OnlineExecutor:
             self._next_pending_order += 1
         return emission_available_at
 
-    def _deliver_through(self, index: int) -> tuple[FeedbackEvent, ...]:
+    def _deliver_through(self, index: int, current_context: Tensor | None = None) -> tuple[FeedbackEvent, ...]:
         feedback: list[FeedbackEvent] = []
         while self._pending and self._pending[0][0] <= index:
             _, _, pending = heapq.heappop(self._pending)
-            feedback.append(self._consume_feedback(pending))
+            feedback.append(self._consume_feedback(pending, current_context))
         return tuple(feedback)
 
-    def _consume_feedback(self, pending: _PendingFeedback) -> FeedbackEvent:
+    def _consume_feedback(self, pending: _PendingFeedback, current_context: Tensor | None) -> FeedbackEvent:
         observed_target = pending.target.masked_fill(~pending.observed_mask, float("nan"))
         error = pending.prediction[pending.observed_mask] - pending.target[pending.observed_mask]
         absolute_error = error.abs()
@@ -370,6 +374,7 @@ class OnlineExecutor:
                 target=observed_target,
                 observed_mask=pending.observed_mask.clone(),
                 prediction=pending.prediction.clone(),
+                current_context=current_context.detach().clone() if current_context is not None else None,
             )
         )
         if adaptation_loss is not None:

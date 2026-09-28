@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -22,12 +23,13 @@ class DatasetSpec:
 
 
 BENCHMARK_SPECS = {
-    "etth1": DatasetSpec(time_column="date", target_columns=("OT",)),
-    "etth2": DatasetSpec(time_column="date", target_columns=("OT",)),
-    "ettm1": DatasetSpec(time_column="date", target_columns=("OT",)),
-    "ettm2": DatasetSpec(time_column="date", target_columns=("OT",)),
+    "etth1": DatasetSpec(time_column="date", target_columns=None),
+    "etth2": DatasetSpec(time_column="date", target_columns=None),
+    "ettm1": DatasetSpec(time_column="date", target_columns=None),
+    "ettm2": DatasetSpec(time_column="date", target_columns=None),
     "traffic": DatasetSpec(time_column="date", target_columns=None),
-    "weather": DatasetSpec(time_column="date", target_columns=("OT",)),
+    "weather": DatasetSpec(time_column="date", target_columns=None),
+    "labeled": DatasetSpec(time_column="index", target_columns=None),
 }
 
 
@@ -46,6 +48,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         target_indices: Sequence[int] | None = None,
         target_names: Sequence[str] | None = None,
         feature_names: Sequence[str] | None = None,
+        time_features: Tensor | None = None,
         stride: int = 1,
     ) -> None:
         if values.ndim != 2:
@@ -57,6 +60,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
 
         # A sliding sample contains visible history (context) followed by its future target.
         self.values = values.to(dtype=torch.float32)
+        self.time_features = time_features
         self.context_length = context_length
         self.horizon = horizon
         # stride controls how far the next forecasting origin moves along the time axis.
@@ -81,7 +85,8 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
 
     @property
     def num_features(self) -> int:
-        return self.values.shape[1]
+        time_channels = 0 if self.time_features is None else self.time_features.shape[1]
+        return self.values.shape[1] + time_channels
 
     @property
     def num_targets(self) -> int:
@@ -100,8 +105,22 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         split = start + self.context_length
         stop = split + self.horizon
         context = self.values[start:split]
+        if self.time_features is not None:
+            context = torch.cat((context, self.time_features[start:split]), dim=1)
         target = self.values[split:stop, list(self.target_indices)]
         return context, target
+
+    def standardize(self, train_windows: int) -> None:
+        """Fit numeric channel statistics on the offline training rows only."""
+
+        if train_windows == 0:
+            return
+        train_end = (train_windows - 1) * self.stride + self.context_length + self.horizon
+        training = self.values[:train_end]
+        mean = training.mean(dim=0)
+        std = training.std(dim=0, unbiased=False)
+        std = torch.where(std < 1e-6, torch.ones_like(std), std)
+        self.values = (self.values - mean) / std
 
     @classmethod
     def from_csv(
@@ -113,6 +132,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         time_column: str = "date",
         target_columns: Sequence[str] | None = None,
         feature_columns: Sequence[str] | None = None,
+        include_time_features: bool = False,
         stride: int = 1,
     ) -> "SlidingWindowDataset":
         """Load numeric columns from a benchmark-style CSV file.
@@ -136,11 +156,14 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
                 raise ValueError(f"CSV columns not found: {sorted(missing)}")
 
             rows: list[list[float]] = []
+            dates: list[datetime] = []
             for row_number, row in enumerate(reader, start=2):
                 try:
                     rows.append([float(row[column]) for column in columns])
+                    if include_time_features:
+                        dates.append(datetime.fromisoformat(row[time_column]))
                 except (TypeError, ValueError) as error:
-                    raise ValueError(f"non-numeric value at CSV row {row_number}") from error
+                    raise ValueError(f"invalid value at CSV row {row_number}") from error
 
         if not rows:
             raise ValueError(f"CSV file has no data rows: {source}")
@@ -151,6 +174,21 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         if missing_targets:
             raise ValueError(f"target columns are not selected features: {sorted(missing_targets)}")
         target_indices = [columns.index(column) for column in selected_targets]
+        time_features = None
+        if include_time_features:
+            include_minute = any(stamp.minute for stamp in dates)
+            time_features = torch.tensor(
+                [
+                    [
+                        (stamp.month - 1) / 11 - 0.5,
+                        (stamp.day - 1) / 30 - 0.5,
+                        stamp.weekday() / 6 - 0.5,
+                        stamp.hour / 23 - 0.5,
+                    ] + ([stamp.minute / 59 - 0.5] if include_minute else [])
+                    for stamp in dates
+                ],
+                dtype=torch.float32,
+            )
         return cls(
             torch.tensor(rows, dtype=torch.float32),
             context_length=context_length,
@@ -158,6 +196,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
             target_indices=target_indices,
             target_names=selected_targets,
             feature_names=columns,
+            time_features=time_features,
             stride=stride,
         )
 
@@ -169,6 +208,10 @@ def load_benchmark_dataset(
     horizon: int,
     *,
     stride: int = 1,
+    time_column: str | None = None,
+    target_columns: Sequence[str] | None = None,
+    feature_columns: Sequence[str] | None = None,
+    include_time_features: bool = False,
 ) -> SlidingWindowDataset:
     """Load datasets."""
 
@@ -182,7 +225,12 @@ def load_benchmark_dataset(
         path,
         context_length=context_length,
         horizon=horizon,
-        time_column=spec.time_column,
-        target_columns=spec.target_columns,
+        time_column=spec.time_column if time_column is None else time_column,
+        target_columns=spec.target_columns if target_columns is None else target_columns,
+        feature_columns=feature_columns,
+        include_time_features=(
+            include_time_features
+            and (spec.time_column if time_column is None else time_column) == "date"
+        ),
         stride=stride,
     )

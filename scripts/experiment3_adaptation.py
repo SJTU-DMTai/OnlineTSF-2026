@@ -203,8 +203,19 @@ def main() -> None:
                 raise ValueError("experiment 3 requires feedback_delay=0")
             data = config["data"]
             dataset = load_benchmark_dataset(
-                data["name"], data["path"], data["context_length"], data["horizon"], stride=1,
+                data["name"], data["path"], data["context_length"], data["horizon"],
+                stride=1,
+                time_column=data.get("time_column"),
+                target_columns=data.get("target_columns"),
+                feature_columns=data.get("feature_columns"),
+                include_time_features=config["forecasting"]["backbone"] in {
+                    "tcn", "fsnet_tcn", "onenet_tcn"
+                },
             )
+            dataset.standardize(int(len(dataset) * config["offline"]["train_ratio"]))
+            data["num_features"] = dataset.num_features
+            data["feature_names"] = list(dataset.feature_names)
+            data["target_names"] = list(dataset.target_names)
             torch.manual_seed(config["seed"])
             model = _build_backbone(
                 config, dataset.num_features, dataset.num_targets, dataset.target_indices,
