@@ -166,8 +166,8 @@ def apply_feedback(method, feedback: MethodFeedback, action: str, rounds: int | 
     if isinstance(method, UnderCaliMethod):
         return under_cali_feedback(method, feedback, action, rounds)
     if action == "skip":
-        if isinstance(method, OneNetMethod):
-            method._pending_predictions.popleft()
+        if isinstance(method, (OneNetMethod, FSNetMethod)):
+            return method.on_feedback(feedback, update_groups=frozenset())
         return None
     option = "n_inner" if isinstance(method, (OneNetMethod, FSNetMethod)) else "update_steps"
     old_steps = getattr(method, option)

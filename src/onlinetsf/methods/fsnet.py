@@ -332,11 +332,28 @@ class FSNetMethod:
             prediction = self.model(context.unsqueeze(0).to(self.device), advance_state=True)
         return prediction.squeeze(0)
 
-    def on_feedback(self, feedback: MethodFeedback) -> float:
+    def parameter_groups(self) -> dict[str, list[nn.Parameter]]:
+        """Disjoint base, gradient-adapter, and prediction-head parameters."""
+        groups: dict[str, list[nn.Parameter]] = {"base": [], "adapter": [], "head": []}
+        for name, parameter in self.model.named_parameters():
+            if name.startswith("head."):
+                group = "head"
+            elif any(f".{part}." in name for part in ("controller", "weight_scale", "bias_scale", "feature_scale")):
+                group = "adapter"
+            else:
+                group = "base"
+            groups[group].append(parameter)
+        return groups
+
+    def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None) -> float | None:
         """Apply official-style inner updates after complete feedback arrives."""
 
         if not feedback.observed_mask.all():
             raise ValueError("FSNetMethod requires complete-horizon feedback")
+        groups = self.parameter_groups()
+        selected = frozenset(groups) if update_groups is None else update_groups
+        if selected - groups.keys():
+            raise ValueError("unknown FSNet update group")
         self.model.eval()
         context = feedback.context.unsqueeze(0).to(self.device)
         target = feedback.target.unsqueeze(0).to(self.device)
@@ -348,7 +365,13 @@ class FSNetMethod:
             if loss.ndim != 0:
                 raise ValueError("loss_fn must return a scalar tensor")
             loss.backward()
-            self.optimizer.step()
+            # Memory observes real gradients even when base parameters stay fixed.
             self.model.record_gradients()
+            for name, parameters in groups.items():
+                if name not in selected:
+                    for parameter in parameters:
+                        parameter.grad = None
+            if selected:
+                self.optimizer.step()
             losses.append(loss.detach().item())
-        return sum(losses) / len(losses)
+        return sum(losses) / len(losses) if selected else None

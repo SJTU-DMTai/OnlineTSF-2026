@@ -40,7 +40,7 @@ class OneNetEnsemble(nn.Module):
         self.horizon = horizon
         self.num_targets = num_targets
         # One logit per target represents the two normalized expert weights as p and 1-p.
-        self.long_logits = nn.Parameter(torch.zeros(num_targets))
+        self.register_buffer("long_logits", torch.zeros(num_targets))
         self.decision = nn.Sequential(
             nn.Linear(3 * horizon, decision_hidden),
             nn.Dropout(decision_dropout),
@@ -101,7 +101,6 @@ class OneNetMethod:
         weight_learning_rate: float = 1e-3,
         decision_learning_rate: float = 1e-3,
         expert_optimizer: Optimizer | None = None,
-        weight_optimizer: Optimizer | None = None,
         decision_optimizer: Optimizer | None = None,
         loss_fn: LossFunction | None = None,
         n_inner: int = 1,
@@ -124,9 +123,7 @@ class OneNetMethod:
             model.cross_variable.parameters()
         )
         self.expert_optimizer = expert_optimizer or AdamW(expert_parameters, lr=learning_rate)
-        self.weight_optimizer = weight_optimizer or Adam(
-            [model.long_logits], lr=weight_learning_rate
-        )
+        self.weight_learning_rate = weight_learning_rate
         self.decision_optimizer = decision_optimizer or Adam(
             model.decision.parameters(), lr=decision_learning_rate
         )
@@ -149,7 +146,11 @@ class OneNetMethod:
         )
         return prediction.squeeze(0)
 
-    def on_feedback(self, feedback: MethodFeedback) -> float:
+    def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None) -> float | None:
+        """EGD and bias refresh remain active even when neural parameters stay fixed."""
+        groups = frozenset({"time", "variable", "decision"}) if update_groups is None else update_groups
+        if groups - {"time", "variable", "decision"}:
+            raise ValueError("unknown OneNet update group")
         if not feedback.observed_mask.all():
             raise ValueError("OneNetMethod requires complete-horizon feedback")
         if not self._pending_predictions:
@@ -162,8 +163,8 @@ class OneNetMethod:
         context = feedback.context.unsqueeze(0).to(self.device)
         adaptation_loss = self.loss_fn(feedback.prediction, feedback.target).detach().item()
         for _ in range(self.n_inner):
-            self._update(context, target, cross_time, cross_variable)
-        return adaptation_loss
+            self._update(context, target, cross_time, cross_variable, groups)
+        return adaptation_loss if groups else None
 
     @torch.no_grad()
     def reset_online_state(self) -> None:
@@ -172,7 +173,6 @@ class OneNetMethod:
         self.model.long_logits.zero_()
         self.model.short_bias.zero_()
         self._pending_predictions.clear()
-        self.weight_optimizer.state.clear()
 
     def train_batch(self, context: Tensor, target: Tensor) -> float:
         """Train all OneNet components on one offline mini-batch."""
@@ -194,43 +194,42 @@ class OneNetMethod:
         target: Tensor,
         emitted_cross_time: Tensor,
         emitted_cross_variable: Tensor,
+        groups: frozenset[str],
     ) -> None:
         self.model.train()
-        current_cross_time, current_cross_variable = self.model.expert_predictions(context)
-        expert_loss = self.loss_fn(current_cross_time, target) + self.loss_fn(
-            current_cross_variable, target
-        )
         self.expert_optimizer.zero_grad(set_to_none=True)
-        expert_loss.backward()
-        self.expert_optimizer.step()
-        self._update_ensemble(emitted_cross_time, emitted_cross_variable, target)
+        if groups & {"time", "variable"}:
+            losses = []
+            if "time" in groups:
+                losses.append(self.loss_fn(self.model.cross_time(context), target))
+            if "variable" in groups:
+                losses.append(self.loss_fn(self.model.cross_variable(context), target))
+            sum(losses).backward()
+            self.expert_optimizer.step()
+        self._update_ensemble(emitted_cross_time, emitted_cross_variable, target, train_decision="decision" in groups)
 
     def _update_ensemble(
         self,
         cross_time: Tensor,
         cross_variable: Tensor,
         target: Tensor,
+        *,
+        train_decision: bool = True,
     ) -> None:
         # The decision network learns a recent correction conditioned on the labeled forecast.
-        bias = self.model.decision_bias(cross_time, cross_variable, target)
-        short_weight = torch.sigmoid(self.model.long_logits.detach().view(1, -1) + bias)
-        short_prediction = (
-            short_weight.unsqueeze(1) * cross_time
-            + (1.0 - short_weight.unsqueeze(1)) * cross_variable
-        )
-        decision_loss = self.loss_fn(short_prediction, target)
         self.decision_optimizer.zero_grad(set_to_none=True)
-        decision_loss.backward()
-        self.decision_optimizer.step()
+        with torch.set_grad_enabled(train_decision):
+            bias = self.model.decision_bias(cross_time, cross_variable, target)
+            if train_decision:
+                short_weight = torch.sigmoid(self.model.long_logits.view(1, -1) + bias)
+                short_prediction = short_weight.unsqueeze(1) * cross_time + (1.0 - short_weight.unsqueeze(1)) * cross_variable
+                self.loss_fn(short_prediction, target).backward()
+                self.decision_optimizer.step()
         self.model.short_bias.copy_(bias.detach().mean(dim=0))
 
-        # The long-term OCP weight is optimized independently of the short-term correction.
-        long_prediction = self.model.combine(
-            cross_time,
-            cross_variable,
-            include_short_term=False,
-        )
-        weight_loss = self.loss_fn(long_prediction, target)
-        self.weight_optimizer.zero_grad(set_to_none=True)
-        weight_loss.backward()
-        self.weight_optimizer.step()
+        # Paper Eq. (2), with per-target horizon-mean squared error as expert loss.
+        # For two experts, log(w_time / w_variable) has this exact EGD update.
+        with torch.no_grad():
+            time_loss = (cross_time - target).square().mean(dim=(0, 1))
+            variable_loss = (cross_variable - target).square().mean(dim=(0, 1))
+            self.model.long_logits.add_(self.weight_learning_rate * (variable_loss - time_loss))

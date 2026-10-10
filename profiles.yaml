@@ -130,7 +130,8 @@ detectors:
     name: hddmw
     source: residual
     error_threshold: 1.0
-    parameters: {drift_confidence: 0.001, warning_confidence: 0.005, lambda_val: 0.05, two_sided_test: false}
+    # Default: one-sided for residual errors, two-sided for feature values.
+    parameters: {drift_confidence: 0.001, warning_confidence: 0.005, lambda_val: 0.05}
 
   abcd:
     name: abcd

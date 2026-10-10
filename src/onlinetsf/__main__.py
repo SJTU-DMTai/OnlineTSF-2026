@@ -212,7 +212,7 @@ def _build_detector(config: dict[str, Any], parameters: dict[str, Any] | None = 
     if drift["name"] == "kswin":
         return KSWINDetector(**options)
     if drift["name"] == "hddmw":
-        return HDDMWDetector(**options)
+        return HDDMWDetector(source=drift["source"], **options)
     return CapyMOADetector(drift["name"], **options)
 
 

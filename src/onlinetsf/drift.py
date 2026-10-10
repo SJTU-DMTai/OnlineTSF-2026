@@ -131,20 +131,29 @@ class KSWINDetector:
 
 
 class HDDMWDetector:
-    """River's weighted Hoeffding detector for binary forecast errors."""
+    """HDDMW for binary errors or sigmoid-bounded continuous features.
+
+    The EWMA/McDiarmid test assumes unit-range inputs. Feature mode applies
+    a fixed sigmoid, without fitting statistics on the stream, and defaults
+    to detecting both increases and decreases of the transformed mean.
+    """
 
     def __init__(
         self,
         drift_confidence: float = 0.001,
         warning_confidence: float = 0.005,
         lambda_val: float = 0.05,
-        two_sided_test: bool = False,
+        two_sided_test: bool | None = None,
+        source: str = "residual",
     ) -> None:
+        if source not in {"features", "residual"}:
+            raise ValueError("HDDMW requires source: features or residual")
+        self.source = source
         self.options = {
             "drift_confidence": drift_confidence,
             "warning_confidence": warning_confidence,
             "lambda_val": lambda_val,
-            "two_sided_test": two_sided_test,
+            "two_sided_test": source == "features" if two_sided_test is None else two_sided_test,
         }
         self.reset()
 
@@ -152,7 +161,12 @@ class HDDMWDetector:
         self.detector = drift.binary.HDDMW(**self.options)
 
     def update(self, value: float) -> DriftUpdate:
-        value = _binary_value(value)
+        if self.source == "features":
+            value = _finite_value(value)
+            # Numerically stable sigmoid for arbitrary finite feature values.
+            value = 0.5 * (1.0 + math.tanh(0.5 * value))
+        else:
+            value = _binary_value(value)
         self.detector.update(value)
         return DriftUpdate(detected=self.detector.drift_detected, value=value)
 

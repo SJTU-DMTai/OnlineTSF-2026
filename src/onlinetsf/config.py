@@ -18,7 +18,7 @@ BINARY_RESIDUAL_DETECTORS = frozenset(("stepd", "hddmw"))
 DETECTOR_SOURCES = {
     "seed": frozenset(("features", "residual")),
     "stepd": frozenset(("residual",)),
-    "hddmw": frozenset(("residual",)),
+    "hddmw": frozenset(("features", "residual")),
     "abcd": frozenset(("features",)),
 }
 
@@ -253,7 +253,7 @@ def load_config(
     if drift_source not in DETECTOR_SOURCES.get(detector_name, DRIFT_SOURCES):
         allowed = ", ".join(sorted(DETECTOR_SOURCES[detector_name]))
         raise ValueError(f"{detector_name} requires drift.source: {allowed}")
-    if detector_name in BINARY_RESIDUAL_DETECTORS:
+    if detector_name in BINARY_RESIDUAL_DETECTORS and drift_source == "residual":
         threshold = drift.get("error_threshold")
         if (not isinstance(threshold, (int, float)) or isinstance(threshold, bool)
                 or not math.isfinite(threshold) or threshold <= 0):
