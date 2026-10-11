@@ -2,7 +2,7 @@
 .agents/
 .pytest_cache/
 tests/*
-!tests/test_update_study.py
+
 runs/
 data/
 figures/
