@@ -63,6 +63,7 @@ def main():
     args = parser.parse_args()
     figures = args.output / "figures"
     figures.mkdir(parents=True, exist_ok=True)
+    states = pd.read_csv(args.analysis / "tables/state_inputs.csv")
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10, "axes.titlesize": 10,
                          "axes.titlepad": 9, "lines.linewidth": 1.7, "pdf.fonttype": 42})
     steps = np.arange(1, 129)
@@ -96,11 +97,12 @@ def main():
                                         "probe_id": probe, "metric": metric, "policy": policy,
                                         "lookahead": lookahead, "mean_loss": cumulative[:, lookahead - 1].mean()})
             method_label = "OneNet" if method == "onenet" else "FSNet"
-            ax.set_title(f"{dataset} / {method_label} / H=24 / {probe}")
+            phase = states[(states.dataset == dataset) & (states.method == method)
+                           & (states.horizon == 24) & (states.probe_id == probe)].phase_at_decision.iloc[0]
+            ax.set_title(f"{dataset} / {method_label} / H=24 / {probe}\nDecision phase: {phase}")
             ax.set_ylabel(f"Cumulative {metric.upper()}")
         if name == "04_fsnet_coordination":
             ax = axes[0, 1]
-            states = pd.read_csv(args.analysis / "tables/state_inputs.csv")
             conditional = pd.read_csv(args.analysis / "tables/module_conditional_effects.csv")
             probes = states[(states.dataset == "ETTh2") & (states.method == "fsnet") & (states.horizon == 24)].probe_id.unique()
             for color, off_policy, on_policy, label in [

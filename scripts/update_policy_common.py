@@ -74,6 +74,37 @@ def decision_features(state: dict, values: np.ndarray, clock: int) -> dict:
     return result
 
 
+def historical_training_data(states: pd.DataFrame, outcomes: pd.DataFrame, train_seeds: list[int],
+                             test_start: int, interval: int, horizon: int, actions: list[str],
+                             metric: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Purge every branch with a target at or after the first test origin.
+
+    A branch at raw origin c, scored over K forecasts of length H, uses target
+    rows [c + 1, c + K + H). Its entire label must be available before test_start.
+    """
+    selected = states[states.seed.isin(train_seeds)].copy()
+    if selected.duplicated(["seed", "probe_id"]).any():
+        raise ValueError("duplicate source states")
+    audit = selected[["seed", "probe_id", "clock"]].copy()
+    audit["target_end_exclusive"] = audit.clock + interval + horizon
+    audit["partition"] = np.where(audit.target_end_exclusive <= test_start, "train", "excluded_future_targets")
+    selected = selected.loc[audit.partition == "train"].reset_index(drop=True)
+    if selected.probe_id.nunique() < 3:
+        raise ValueError("at least three historical training positions are required; choose a later test-start")
+    # Join eligible states first. Excluded future losses never enter validation,
+    # preprocessing, best-fixed selection or fitting.
+    eligible = outcomes[(outcomes.lookahead == interval) & outcomes.policy.isin(actions)].merge(
+        selected[["seed", "probe_id"]], on=["seed", "probe_id"], validate="many_to_one")
+    if eligible.duplicated(["seed", "probe_id", "policy"]).any():
+        raise ValueError("duplicate historical outcomes")
+    losses = eligible.pivot(index=["seed", "probe_id"], columns="policy", values=metric)
+    losses = losses.reindex(index=pd.MultiIndex.from_frame(selected[["seed", "probe_id"]]), columns=actions)
+    if not np.isfinite(losses.to_numpy()).all() or (losses.native <= 0).any():
+        raise ValueError("every historical state requires all action outcomes and positive native loss")
+    losses.index = selected.index
+    return selected, losses, audit
+
+
 def fit_selector(states: pd.DataFrame, gains: pd.DataFrame, actions: list[str], features: list[str],
                  max_depth: int, min_samples_leaf: int) -> tuple[dict, str]:
     """One small regression tree per action predicts relative MAE/MSE improvement."""
@@ -104,7 +135,8 @@ def fit_selector(states: pd.DataFrame, gains: pd.DataFrame, actions: list[str], 
 def select_actions(selector: dict, states: pd.DataFrame) -> tuple[list[str], np.ndarray]:
     raw = states[selector["features"]].to_numpy(dtype=float)
     missing = ~np.isfinite(raw)
-    design = np.column_stack([np.where(missing, selector["medians"], raw), missing.astype(float)])
+    # sklearn's tree prediction casts inputs to float32 before threshold tests.
+    design = np.column_stack([np.where(missing, selector["medians"], raw), missing.astype(float)]).astype(np.float32)
     scores = np.zeros((len(states), len(selector["actions"])))
     for column, action in enumerate(selector["actions"]):
         if action == "native":

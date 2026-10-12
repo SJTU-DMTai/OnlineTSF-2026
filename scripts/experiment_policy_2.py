@@ -1,7 +1,8 @@
-"""Experiment 2: run saved selectors continuously on a few short replay segments.
+"""Train selectors on strictly earlier outcomes, then replay a long test interval.
 
-Run this script on the training server. It reuses initial.pt, performs native
-warmup once, and forks short trajectories; it does not retrain the offline model.
+Standalone experiment 2: no experiment-1 output is required. Plan mode fits
+selectors from existing CSV results without importing torch. Actual causal replay
+runs on the server, reusing initial.pt and preserving state throughout testing.
 """
 
 from __future__ import annotations
@@ -16,24 +17,26 @@ import numpy as np
 import pandas as pd
 
 from update_policy_common import (
-    DEFAULT_ANNOTATIONS, DEFAULT_RUNS, decision_features, file_sha256, find_job, numeric_inputs,
-    plot_forecasts, save_json, select_actions,
+    DATA_FEATURES, DEFAULT_ANNOTATIONS, DEFAULT_RUNS, EXPERT_FEATURES, FEEDBACK_FEATURES,
+    decision_features, file_sha256, find_job, fit_selector, historical_training_data,
+    numeric_inputs, plot_forecasts, save_json, select_actions,
 )
 
 
-def choose_segments(clocks: list[int], steps: int, horizon: int, last_clock: int, count: int) -> list[int]:
-    """Spread sparse, non-overlapping segments across eligible test positions."""
-    candidates = [clock for clock in sorted(set(clocks)) if clock + steps <= last_clock + 1]
-    selected = []
-    # Greedy spacing makes target intervals, as well as origin intervals, disjoint.
-    for clock in candidates:
-        if not selected or clock >= selected[-1] + steps + horizon - 1:
-            selected.append(clock)
-    if not selected:
-        raise ValueError("no complete segment fits; use fewer steps or explicit earlier start-clocks")
-    if len(selected) > count:
-        selected = [selected[index] for index in np.linspace(0, len(selected) - 1, count, dtype=int)]
-    return selected
+def block_metrics(forecasts: pd.DataFrame, decisions: list[dict], interval: int,
+                  phases: np.ndarray) -> pd.DataFrame:
+    """Keep complete local windows and the final partial block explicitly separate."""
+    rows = []
+    for block, offset in enumerate(range(0, len(forecasts), interval)):
+        selected = forecasts.iloc[offset:offset + interval]
+        clock = int(selected.origin_raw_index.iloc[0])
+        for lookahead in sorted({min(8, len(selected)), min(32, len(selected)), len(selected)}):
+            prefix = selected.iloc[:lookahead]
+            rows.append({"block": block, "clock": clock, "block_steps": len(selected),
+                         "phase_at_decision": phases[clock], "lookahead": lookahead,
+                         "selected_action": decisions[block]["selected_action"],
+                         "mae": prefix.mae.mean(), "mse": prefix.mse.mean()})
+    return pd.DataFrame(rows)
 
 
 def switch_policy(controlled, policy) -> None:
@@ -79,6 +82,8 @@ def run_segment(replay, stream, values: np.ndarray, start: int, steps: int, inte
                 record["predicted_gains"] = json.dumps(scores, allow_nan=False)
             decisions.append(record)
         reporter.add(branch.step(stream.dataset, index))
+        if (index - start + 1) % 2048 == 0:
+            print(f"{controller}: {index - start + 1}/{steps} test origins", flush=True)
     # Score all emitted forecasts. Terminal feedback never trains or emits forecasts.
     reporter.add(branch.finish(stream.dataset))
     summary = reporter.close(branch.method, perf_counter() - began)
@@ -90,53 +95,130 @@ def run_segment(replay, stream, values: np.ndarray, start: int, steps: int, inte
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment1", type=Path, default=Path("runs/policy-exp1-onenet-etth2-h24"))
     parser.add_argument("--runs", type=Path, default=DEFAULT_RUNS)
     parser.add_argument("--annotations", type=Path, default=DEFAULT_ANNOTATIONS)
-    parser.add_argument("--steps", type=int, default=512)
-    parser.add_argument("--segments", type=int, default=3)
-    parser.add_argument("--start-clocks", type=int, nargs="+", help="raw, zero-based decision clocks")
+    parser.add_argument("--dataset", default="ETTh2")
+    parser.add_argument("--method", choices=["onenet", "fsnet"], default="onenet")
+    parser.add_argument("--horizon", type=int, default=24)
+    parser.add_argument("--train-seeds", type=int, nargs="+", default=[0, 1])
+    parser.add_argument("--test-seed", type=int, default=2)
+    boundary = parser.add_mutually_exclusive_group()
+    boundary.add_argument("--test-start", type=int, help="first test forecast origin, raw zero-based row")
+    boundary.add_argument("--test-start-fraction", type=float, default=.6, help="default: floor(0.6 * raw row count)")
+    parser.add_argument("--steps", type=int, help="default: every remaining prediction origin")
+    parser.add_argument("--decision-interval", type=int, choices=[8, 32, 128], default=128)
+    parser.add_argument("--max-depth", type=int, default=2)
+    parser.add_argument("--min-samples-leaf", type=int, default=4)
+    parser.add_argument("--prefix-rows", type=int, help="override only when original run manifest is absent")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--plan-only", action="store_true", help="validate segments without importing torch")
-    parser.add_argument("--output", type=Path, default=Path("runs/policy-exp2-onenet-etth2-h24"))
+    parser.add_argument("--plan-only", action="store_true", help="fit and audit the historical selector without importing torch")
+    parser.add_argument("--output", type=Path, default=Path("runs/policy-exp2-temporal-onenet-etth2-h24"))
     args = parser.parse_args(argv)
-    bundle = json.loads((args.experiment1 / "selectors.json").read_text(encoding="utf-8"))
-    if bundle["schema"] != 1 or min(args.steps, args.segments, args.threads) <= 0:
-        parser.error("invalid selector schema or non-positive size")
-    interval = bundle["lookahead"]
-    if args.steps % interval:
-        parser.error("steps must be a multiple of the selector training lookahead")
-    dataset, method, horizon, seed = bundle["dataset"], bundle["method"], bundle["horizon"], bundle["test_seed"]
-    job = find_job(args.runs, dataset, method, horizon, seed)
+    if (min(args.horizon, args.max_depth, args.min_samples_leaf, args.threads) <= 0
+            or args.steps is not None and args.steps <= 0
+            or args.prefix_rows is not None and args.prefix_rows <= 0):
+        parser.error("sizes must be positive")
+    if not args.train_seeds or len(args.train_seeds) != len(set(args.train_seeds)):
+        parser.error("training seeds must be nonempty and unique")
+    if not 0 < args.test_start_fraction < 1:
+        parser.error("test-start-fraction must be between zero and one")
+    interval = args.decision_interval
+    dataset, method, horizon, seed = args.dataset, args.method, args.horizon, args.test_seed
+    jobs = {item: find_job(args.runs, dataset, method, horizon, item) for item in sorted(set([*args.train_seeds, seed]))}
+    job = jobs[seed]
     checkpoint_path = job / "initial.pt"
     if not checkpoint_path.exists():
         raise FileNotFoundError(checkpoint_path)
-    values, _, annotation_manifest = numeric_inputs(args.annotations / dataset, bundle["prefix_rows"])
-    if file_sha256(args.annotations / dataset / "labeled_data.csv") != bundle["input_sha256"]:
-        raise ValueError("annotation inputs differ from experiment 1")
-    last_clock = len(values) - horizon - 1
-    if args.start_clocks is None:
-        clocks = choose_segments(bundle["test_clocks"], args.steps, horizon, last_clock, args.segments)
-    else:
-        clocks = sorted(args.start_clocks)
-        if len(clocks) != len(set(clocks)) or any(
-            right < left + args.steps + horizon - 1 for left, right in zip(clocks, clocks[1:])
-        ):
-            parser.error("explicit segments must be unique and have disjoint target ranges")
-    for clock in clocks:
-        if clock < bundle["prefix_rows"] - 1 or clock + args.steps > last_clock + 1:
-            parser.error("segment is outside the available online prediction origins")
-        if bundle["split"] == "seed-time" and clock < bundle["train_target_end_exclusive"]:
-            parser.error("segment overlaps training targets")
+    annotation_dir = args.annotations / dataset
+    annotation_manifest = json.loads((annotation_dir / "manifest.json").read_text(encoding="utf-8"))
+    source_hash = file_sha256(annotation_dir / "labeled_data.csv")
+    prefix = args.prefix_rows or max(annotation_manifest["calibration_rows"], (annotation_manifest["rows"] + 4) // 5)
+    catalogs, context_lengths, verified_prefixes = [], [], []
+    state_frames, outcome_frames = [], []
+    source_audit = []
+    for item, source_job in jobs.items():
+        catalogs.append(json.loads((source_job / "policies.json").read_text(encoding="utf-8")))
+        source_manifest = source_job.parent.parent / "manifest.json"
+        if source_manifest.exists():
+            source_record = json.loads(source_manifest.read_text(encoding="utf-8"))
+            record = next(record for record in source_record["jobs"] if record["dataset"] == dataset and
+                          record["method"] == method and record["horizon"] == horizon and record["seed"] == item)
+            if record["input_sha256"] != source_hash:
+                raise ValueError("annotations differ from source run")
+            verified_prefixes.append(record["prefix_rows"])
+        audit = {"seed": item, "job": str(source_job), "manifest_verified": source_manifest.exists()}
+        if item in args.train_seeds:
+            states = pd.read_csv(source_job / "probe_states.csv")
+            outcomes = pd.read_csv(source_job / "probe_outcomes.csv")
+            for frame in [states, outcomes]:
+                if not (frame.seed.eq(item) & frame.dataset.eq(dataset) & frame.method.eq(method) & frame.horizon.eq(horizon)).all():
+                    raise ValueError("source row identity differs from requested job")
+            context_lengths.extend((states.clock - states["index"] + 1).unique().tolist())
+            state_frames.append(states)
+            outcome_frames.append(outcomes)
+            audit.update(states_sha256=file_sha256(source_job / "probe_states.csv"),
+                         outcomes_sha256=file_sha256(source_job / "probe_outcomes.csv"))
+        source_audit.append(audit)
+    if any(catalog != catalogs[0] for catalog in catalogs[1:]):
+        raise ValueError("source action definitions differ")
+    if len(set(context_lengths)) != 1 or (verified_prefixes and len(set(verified_prefixes)) != 1):
+        raise ValueError("source jobs used inconsistent context lengths or offline prefixes")
+    if verified_prefixes:
+        if args.prefix_rows is not None and prefix != verified_prefixes[0]:
+            raise ValueError("prefix override differs from source run")
+        prefix = verified_prefixes[0]
+    context_length = int(context_lengths[0])
+    values, phases, _ = numeric_inputs(annotation_dir, prefix)
+    clock = args.test_start if args.test_start is not None else int(len(values) * args.test_start_fraction)
+    available_steps = len(values) - horizon - clock
+    steps = available_steps if args.steps is None else args.steps
+    if prefix < context_length + horizon or not prefix <= clock or not 0 < steps <= available_steps:
+        parser.error("test-start must follow the offline prefix and leave complete forecast targets")
+    catalog = catalogs[0]
+    names = [item["name"] for item in catalog]
+    if len(names) != len(set(names)) or "native" not in names:
+        raise ValueError("source catalog must have unique actions and native")
+    names = ["native"] + [name for name in names if name != "native"]
+    catalog = sorted(catalog, key=lambda item: names.index(item["name"]))
+    train, losses, split_audit = historical_training_data(
+        pd.concat(state_frames, ignore_index=True), pd.concat(outcome_frames, ignore_index=True),
+        args.train_seeds, clock, interval, horizon, names, "mae")
+    if (train.clock < prefix - 1).any():
+        raise ValueError("historical online training states precede the offline prefix")
+    train = pd.DataFrame([decision_features(row, values, int(row["clock"])) for row in train.to_dict("records")])
+    gains = (1 - losses.div(losses.native, axis=0)) * 100
+    selectors, rules = {}, []
+    for name, features in [("policy_full", DATA_FEATURES + FEEDBACK_FEATURES + EXPERT_FEATURES[method]),
+                           ("policy_data", DATA_FEATURES)]:
+        selectors[name], text = fit_selector(train, gains, names, features, args.max_depth, args.min_samples_leaf)
+        rules.append(name + "\n" + text)
+    bundle = {"schema": 2, "dataset": dataset, "method": method, "horizon": horizon,
+              "context_length": context_length, "prefix_rows": int(prefix), "input_sha256": source_hash,
+              "train_seeds": args.train_seeds, "test_seed": seed, "test_start": clock,
+              "decision_interval": interval, "metric": "mae", "actions": catalog,
+              "best_fixed": losses.mean().idxmin(), "selectors": selectors,
+              "training_positions": train.probe_id.nunique(), "training_states": len(train),
+              "train_target_end_exclusive": int((train.clock + interval + horizon).max()),
+              "selection_rule": "training target_end_exclusive <= test_start"}
     plan = {"status": "planned", "dataset": dataset, "method": method, "horizon": horizon,
-            "test_seed": seed, "split": bundle["split"], "start_clocks": clocks,
-            "steps": args.steps, "decision_interval": interval, "action_count": len(bundle["actions"]),
+            "train_seeds": args.train_seeds, "test_seed": seed, "split": "strict_time",
+            "test_start": clock, "test_origin_end_exclusive": clock + steps,
+            "test_target_end_exclusive": clock + steps + horizon, "prefix_rows": int(prefix),
+            "steps": steps, "decision_interval": interval, "action_count": len(catalog),
+            "training_positions": bundle["training_positions"], "training_states": len(train),
+            "train_target_end_exclusive": bundle["train_target_end_exclusive"],
             "controllers": ["native", "best_fixed", "policy_full", "policy_data"],
-            "input_sha256": bundle["input_sha256"], "selector_sha256": file_sha256(args.experiment1 / "selectors.json"),
+            "input_sha256": source_hash, "source_jobs": source_audit,
             "checkpoint": str(checkpoint_path), "checkpoint_sha256": file_sha256(checkpoint_path),
             "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}}
     args.output.mkdir(parents=True, exist_ok=False)
+    save_json(args.output / "selectors.json", bundle)
+    plan["selector_sha256"] = file_sha256(args.output / "selectors.json")
+    split_audit.to_csv(args.output / "training_split.csv", index=False)
+    train.to_csv(args.output / "training_states.csv", index=False)
+    losses.assign(seed=train.seed, probe_id=train.probe_id).to_csv(args.output / "training_losses.csv", index=False)
+    (args.output / "tree_rules.txt").write_text("\n".join(rules), encoding="utf-8")
     save_json(args.output / "manifest.json", plan)
     print(json.dumps(plan, indent=2), flush=True)
     if args.plan_only:
@@ -174,58 +256,55 @@ def main(argv: list[str] | None = None) -> None:
     restore_rng(initial_rng)
     replay = Replay(ControlledMethod(forecasting_method, actions["native"]), horizon)
     first = stream.prefix_rows - stream.dataset.context_length
-    starts = {clock - stream.dataset.context_length + 1: clock for clock in clocks}
+    start = clock - stream.dataset.context_length + 1
     outcomes, decisions, trajectory_summaries = [], [], []
     plan["status"] = "running"
     save_json(args.output / "manifest.json", plan)
     try:
-        for index in range(first, max(starts) + 1):
-            if index in starts:
-                clock = starts[index]
-                saved_rng = rng_state()
-                frames = {}
-                for controller in plan["controllers"]:
-                    restore_rng(saved_rng)
-                    directory = args.output / f"start_{clock}" / controller
-                    frame, segment_decisions, summary = run_segment(
-                        replay, stream, values, index, args.steps, interval, controller, bundle, actions, directory)
-                    frames[controller] = frame
-                    decisions.extend(dict(item, segment_clock=clock, seed=seed) for item in segment_decisions)
-                    trajectory_summaries.append(dict(summary, controller=controller, segment_clock=clock, seed=seed))
-                    for block in range(args.steps // interval):
-                        selected = frame.iloc[block * interval:(block + 1) * interval]
-                        for lookahead in sorted(set([min(8, interval), min(32, interval), interval])):
-                            prefix = selected.iloc[:lookahead]
-                            outcomes.append({"controller": controller, "seed": seed, "segment_clock": clock,
-                                             "block": block, "clock": clock + block * interval,
-                                             "phase_at_decision": stream.phases[clock + block * interval],
-                                             "lookahead": lookahead, "selected_action": segment_decisions[block]["selected_action"],
-                                             "mae": prefix.mae.mean(), "mse": prefix.mse.mean()})
-                restore_rng(saved_rng)
-                plot_forecasts(frames, args.output / f"start_{clock}_errors", f"{dataset} {method} H={horizon} | start {clock}")
-                pd.DataFrame(decisions).to_csv(args.output / "decisions.csv", index=False)
-                pd.DataFrame(trajectory_summaries).to_csv(args.output / "trajectory_summary.csv", index=False)
-                print(f"segment {clock}: {len(plan['controllers'])} trajectories complete", flush=True)
-            if index < max(starts):
-                replay.step(stream.dataset, index)
+        # Native warmup stops immediately before the first test decision.
+        for index in range(first, start):
+            replay.step(stream.dataset, index)
             if (index - first) % 2048 == 0:
                 print(f"native warmup: raw clock {index + stream.dataset.context_length - 1}", flush=True)
-        result = pd.DataFrame(outcomes)
-        keys = ["seed", "segment_clock", "block", "lookahead"]
+        saved_rng = rng_state()
+        frames = {}
+        for controller in plan["controllers"]:
+            restore_rng(saved_rng)
+            directory = args.output / controller
+            frame, trajectory_decisions, summary = run_segment(
+                replay, stream, values, start, steps, interval, controller, bundle, actions, directory)
+            frames[controller] = frame
+            decisions.extend(dict(item, seed=seed) for item in trajectory_decisions)
+            trajectory_summaries.append(dict(summary, controller=controller, seed=seed))
+            outcomes.append(block_metrics(frame, trajectory_decisions, interval, phases).assign(controller=controller, seed=seed))
+            pd.DataFrame(decisions).to_csv(args.output / "decisions.csv", index=False)
+            pd.DataFrame(trajectory_summaries).to_csv(args.output / "trajectory_summary.csv", index=False)
+            print(f"{controller}: {steps} continuous test origins complete", flush=True)
+        plot_forecasts(frames, args.output / "test_errors", f"{dataset} {method} H={horizon} | start {clock}")
+        result = pd.concat(outcomes, ignore_index=True)
+        keys = ["seed", "block", "lookahead"]
         native = result[result.controller == "native"][keys + ["mae", "mse"]].rename(columns={"mae": "native_mae", "mse": "native_mse"})
         result = result.merge(native, on=keys, validate="many_to_one")
         for metric in ["mae", "mse"]:
             result[f"{metric}_gain_pct"] = 100 * (1 - result[metric] / result[f"native_{metric}"])
         result.to_csv(args.output / "block_outcomes.csv", index=False)
-        summary = result.groupby(["controller", "lookahead"])[["mae", "mse", "native_mae", "native_mse"]].mean().reset_index()
+        local_summary = result.groupby(["controller", "lookahead"]).agg(
+            mae=("mae", "mean"), mse=("mse", "mean"), native_mae=("native_mae", "mean"),
+            native_mse=("native_mse", "mean"), blocks=("block", "count"),
+            mae_win_fraction=("mae_gain_pct", lambda x: (x > 0).mean()),
+            mse_win_fraction=("mse_gain_pct", lambda x: (x > 0).mean())).reset_index()
+        summary = pd.DataFrame(trajectory_summaries)
+        native = summary[summary.controller == "native"].iloc[0]
         for metric in ["mae", "mse"]:
-            summary[f"{metric}_gain_pct"] = 100 * (1 - summary[metric] / summary[f"native_{metric}"])
+            summary[f"{metric}_gain_pct"] = 100 * (1 - summary[metric] / native[metric])
+            local_summary[f"{metric}_gain_pct"] = 100 * (1 - local_summary[metric] / local_summary[f"native_{metric}"])
         summary.to_csv(args.output / "summary.csv", index=False)
+        local_summary.to_csv(args.output / "local_summary.csv", index=False)
         result.groupby(["controller", "lookahead", "phase_at_decision"])[[
             "mae", "mse", "mae_gain_pct", "mse_gain_pct"
         ]].mean().to_csv(args.output / "phase_summary.csv")
         plan["status"] = "complete"
-        print(summary[summary.lookahead == interval].to_string(index=False), flush=True)
+        print(summary.to_string(index=False), flush=True)
     except Exception as error:
         plan.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
