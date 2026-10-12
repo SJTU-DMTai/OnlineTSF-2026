@@ -97,6 +97,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=Path, default=DEFAULT_RUNS)
     parser.add_argument("--annotations", type=Path, default=DEFAULT_ANNOTATIONS)
+    parser.add_argument("--training-data", type=Path,
+                        help="completed collect_policy_training.py output for one training seed")
     parser.add_argument("--dataset", default="ETTh2")
     parser.add_argument("--method", choices=["onenet", "fsnet"], default="onenet")
     parser.add_argument("--horizon", type=int, default=24)
@@ -108,7 +110,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--steps", type=int, help="default: every remaining prediction origin")
     parser.add_argument("--decision-interval", type=int, choices=[8, 32, 128], default=128)
     parser.add_argument("--max-depth", type=int, default=2)
-    parser.add_argument("--min-samples-leaf", type=int, default=4)
+    parser.add_argument("--min-samples-leaf", type=int, default=4,
+                        help="minimum training states per leaf; a split requires at least twice this number")
     parser.add_argument("--prefix-rows", type=int, help="override only when original run manifest is absent")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--threads", type=int, default=1)
@@ -133,6 +136,16 @@ def main(argv: list[str] | None = None) -> None:
     annotation_dir = args.annotations / dataset
     annotation_manifest = json.loads((annotation_dir / "manifest.json").read_text(encoding="utf-8"))
     source_hash = file_sha256(annotation_dir / "labeled_data.csv")
+    collected = None
+    if args.training_data is not None:
+        collected = json.loads((args.training_data / "manifest.json").read_text(encoding="utf-8"))
+        if (collected["status"] != "complete" or args.train_seeds != [collected["seed"]]
+                or any(collected[key] != value for key, value in
+                       [("dataset", dataset), ("method", method), ("horizon", horizon),
+                        ("decision_interval", interval), ("input_sha256", source_hash)])):
+            raise ValueError("collected training data identity, interval or completion status differs")
+        if collected["checkpoint_sha256"] != file_sha256(jobs[collected["seed"]] / "initial.pt"):
+            raise ValueError("collected training data used a different checkpoint")
     prefix = args.prefix_rows or max(annotation_manifest["calibration_rows"], (annotation_manifest["rows"] + 4) // 5)
     catalogs, context_lengths, verified_prefixes = [], [], []
     state_frames, outcome_frames = [], []
@@ -149,19 +162,27 @@ def main(argv: list[str] | None = None) -> None:
             verified_prefixes.append(record["prefix_rows"])
         audit = {"seed": item, "job": str(source_job), "manifest_verified": source_manifest.exists()}
         if item in args.train_seeds:
-            states = pd.read_csv(source_job / "probe_states.csv")
-            outcomes = pd.read_csv(source_job / "probe_outcomes.csv")
+            training_dir = args.training_data if collected is not None else source_job
+            states_hash = file_sha256(training_dir / "probe_states.csv")
+            outcomes_hash = file_sha256(training_dir / "probe_outcomes.csv")
+            if collected is not None and (states_hash != collected["states_sha256"]
+                                          or outcomes_hash != collected["outcomes_sha256"]):
+                raise ValueError("collected training CSV hashes differ from collection manifest")
+            states = pd.read_csv(training_dir / "probe_states.csv")
+            outcomes = pd.read_csv(training_dir / "probe_outcomes.csv")
             for frame in [states, outcomes]:
                 if not (frame.seed.eq(item) & frame.dataset.eq(dataset) & frame.method.eq(method) & frame.horizon.eq(horizon)).all():
                     raise ValueError("source row identity differs from requested job")
             context_lengths.extend((states.clock - states["index"] + 1).unique().tolist())
             state_frames.append(states)
             outcome_frames.append(outcomes)
-            audit.update(states_sha256=file_sha256(source_job / "probe_states.csv"),
-                         outcomes_sha256=file_sha256(source_job / "probe_outcomes.csv"))
+            audit.update(training_directory=str(training_dir), states_sha256=states_hash,
+                         outcomes_sha256=outcomes_hash)
         source_audit.append(audit)
     if any(catalog != catalogs[0] for catalog in catalogs[1:]):
         raise ValueError("source action definitions differ")
+    if collected is not None and collected["actions"] != catalogs[0]:
+        raise ValueError("collected action definitions differ from source run")
     if len(set(context_lengths)) != 1 or (verified_prefixes and len(set(verified_prefixes)) != 1):
         raise ValueError("source jobs used inconsistent context lengths or offline prefixes")
     if verified_prefixes:
@@ -171,6 +192,9 @@ def main(argv: list[str] | None = None) -> None:
     context_length = int(context_lengths[0])
     values, phases, _ = numeric_inputs(annotation_dir, prefix)
     clock = args.test_start if args.test_start is not None else int(len(values) * args.test_start_fraction)
+    if collected is not None and (collected["test_start"] != clock or collected["prefix_rows"] != prefix
+                                  or collected["context_length"] != context_length):
+        raise ValueError("collection and test replay must use the same time boundary, prefix and context length")
     available_steps = len(values) - horizon - clock
     steps = available_steps if args.steps is None else args.steps
     if prefix < context_length + horizon or not prefix <= clock or not 0 < steps <= available_steps:
@@ -186,13 +210,24 @@ def main(argv: list[str] | None = None) -> None:
         args.train_seeds, clock, interval, horizon, names, "mae")
     if (train.clock < prefix - 1).any():
         raise ValueError("historical online training states precede the offline prefix")
+    if len(train) < 2 * args.min_samples_leaf:
+        parser.error(f"only {len(train)} historical training states remain after time isolation; "
+                     f"--min-samples-leaf {args.min_samples_leaf} requires at least "
+                     f"{2 * args.min_samples_leaf} to split. Reduce --min-samples-leaf "
+                     "or collect more historical probes before running the forecasting replay.")
     train = pd.DataFrame([decision_features(row, values, int(row["clock"])) for row in train.to_dict("records")])
     gains = (1 - losses.div(losses.native, axis=0)) * 100
-    selectors, rules = {}, []
+    selectors, rules, diagnostics = {}, [], []
     for name, features in [("policy_full", DATA_FEATURES + FEEDBACK_FEATURES + EXPERT_FEATURES[method]),
                            ("policy_data", DATA_FEATURES)]:
         selectors[name], text = fit_selector(train, gains, names, features, args.max_depth, args.min_samples_leaf)
         rules.append(name + "\n" + text)
+        for action, tree in selectors[name]["trees"].items():
+            diagnostics.append({"controller": name, "action": action, "training_states": len(train),
+                                "nodes": len(tree["value"]), "leaves": tree["left"].count(-1)})
+        split_count = sum(len(tree["value"]) > 1 for tree in selectors[name]["trees"].values())
+        print(f"{name}: {len(train)} historical states; "
+              f"{split_count}/{len(selectors[name]['trees'])} action trees split on features", flush=True)
     bundle = {"schema": 2, "dataset": dataset, "method": method, "horizon": horizon,
               "context_length": context_length, "prefix_rows": int(prefix), "input_sha256": source_hash,
               "train_seeds": args.train_seeds, "test_seed": seed, "test_start": clock,
@@ -218,6 +253,7 @@ def main(argv: list[str] | None = None) -> None:
     split_audit.to_csv(args.output / "training_split.csv", index=False)
     train.to_csv(args.output / "training_states.csv", index=False)
     losses.assign(seed=train.seed, probe_id=train.probe_id).to_csv(args.output / "training_losses.csv", index=False)
+    pd.DataFrame(diagnostics).to_csv(args.output / "selector_diagnostics.csv", index=False)
     (args.output / "tree_rules.txt").write_text("\n".join(rules), encoding="utf-8")
     save_json(args.output / "manifest.json", plan)
     print(json.dumps(plan, indent=2), flush=True)
