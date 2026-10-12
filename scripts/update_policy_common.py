@@ -156,6 +156,12 @@ def save_json(path: Path, record: dict) -> None:
     path.write_text(json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
 
 
+def save_timings(directory: Path, timings: dict) -> None:
+    """Export measured durations in seconds; overlapping totals are not additive."""
+    save_json(directory / "timings.json", timings)
+    pd.DataFrame(timings.items(), columns=["stage", "seconds"]).to_csv(directory / "timings.csv", index=False)
+
+
 def plot_forecasts(frames: dict[str, pd.DataFrame], destination: Path, title: str) -> None:
     """Actual emitted forecast errors, with a short trailing average for readability."""
     import matplotlib

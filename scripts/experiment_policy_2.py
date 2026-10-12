@@ -19,7 +19,7 @@ import pandas as pd
 from update_policy_common import (
     DATA_FEATURES, DEFAULT_ANNOTATIONS, DEFAULT_RUNS, EXPERT_FEATURES, FEEDBACK_FEATURES,
     decision_features, file_sha256, find_job, fit_selector, historical_training_data,
-    numeric_inputs, plot_forecasts, save_json, select_actions,
+    numeric_inputs, plot_forecasts, save_json, save_timings, select_actions,
 )
 
 
@@ -94,6 +94,7 @@ def run_segment(replay, stream, values: np.ndarray, start: int, steps: int, inte
 
 
 def main(argv: list[str] | None = None) -> None:
+    began = perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=Path, default=DEFAULT_RUNS)
     parser.add_argument("--annotations", type=Path, default=DEFAULT_ANNOTATIONS)
@@ -217,10 +218,19 @@ def main(argv: list[str] | None = None) -> None:
                      "or collect more historical probes before running the forecasting replay.")
     train = pd.DataFrame([decision_features(row, values, int(row["clock"])) for row in train.to_dict("records")])
     gains = (1 - losses.div(losses.native, axis=0)) * 100
+    # Load the library before measuring fits, so the first selector does not
+    # absorb sklearn's one-time import cost. This belongs to preparation time.
+    import sklearn.tree
+
+    timings = {"preparation_seconds": perf_counter() - began}
+    if collected is not None:
+        timings.update(collected.get("timings", {}))
     selectors, rules, diagnostics = {}, [], []
     for name, features in [("policy_full", DATA_FEATURES + FEEDBACK_FEATURES + EXPERT_FEATURES[method]),
                            ("policy_data", DATA_FEATURES)]:
+        fit_began = perf_counter()
         selectors[name], text = fit_selector(train, gains, names, features, args.max_depth, args.min_samples_leaf)
+        timings[f"selector_{name}_seconds"] = perf_counter() - fit_began
         rules.append(name + "\n" + text)
         for action, tree in selectors[name]["trees"].items():
             diagnostics.append({"controller": name, "action": action, "training_states": len(train),
@@ -246,7 +256,8 @@ def main(argv: list[str] | None = None) -> None:
             "controllers": ["native", "best_fixed", "policy_full", "policy_data"],
             "input_sha256": source_hash, "source_jobs": source_audit,
             "checkpoint": str(checkpoint_path), "checkpoint_sha256": file_sha256(checkpoint_path),
-            "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}}
+            "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+            "timings": timings}
     args.output.mkdir(parents=True, exist_ok=False)
     save_json(args.output / "selectors.json", bundle)
     plan["selector_sha256"] = file_sha256(args.output / "selectors.json")
@@ -257,10 +268,14 @@ def main(argv: list[str] | None = None) -> None:
     (args.output / "tree_rules.txt").write_text("\n".join(rules), encoding="utf-8")
     save_json(args.output / "manifest.json", plan)
     print(json.dumps(plan, indent=2), flush=True)
+    timings["experiment_wall_seconds"] = perf_counter() - began
+    save_timings(args.output, timings)
+    save_json(args.output / "manifest.json", plan)
     if args.plan_only:
         return
 
     # The forecasting runtime is only loaded on this execution path, on the server.
+    setup_began = perf_counter()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     import torch
     from onlinetsf.update_study.data import load_stream
@@ -297,11 +312,18 @@ def main(argv: list[str] | None = None) -> None:
     plan["status"] = "running"
     save_json(args.output / "manifest.json", plan)
     try:
+        if forecasting_method.device.type == "cuda":
+            torch.cuda.synchronize(forecasting_method.device)
+        timings["runtime_setup_seconds"] = perf_counter() - setup_began
+        warmup_began = perf_counter()
         # Native warmup stops immediately before the first test decision.
         for index in range(first, start):
             replay.step(stream.dataset, index)
             if (index - first) % 2048 == 0:
                 print(f"native warmup: raw clock {index + stream.dataset.context_length - 1}", flush=True)
+        if forecasting_method.device.type == "cuda":
+            torch.cuda.synchronize(forecasting_method.device)
+        timings["warmup_seconds"] = perf_counter() - warmup_began
         saved_rng = rng_state()
         frames = {}
         for controller in plan["controllers"]:
@@ -312,10 +334,13 @@ def main(argv: list[str] | None = None) -> None:
             frames[controller] = frame
             decisions.extend(dict(item, seed=seed) for item in trajectory_decisions)
             trajectory_summaries.append(dict(summary, controller=controller, seed=seed))
+            timings[f"test_{controller}_seconds"] = summary["seconds"]
             outcomes.append(block_metrics(frame, trajectory_decisions, interval, phases).assign(controller=controller, seed=seed))
             pd.DataFrame(decisions).to_csv(args.output / "decisions.csv", index=False)
             pd.DataFrame(trajectory_summaries).to_csv(args.output / "trajectory_summary.csv", index=False)
+            save_timings(args.output, timings)
             print(f"{controller}: {steps} continuous test origins complete", flush=True)
+        postprocessing_began = perf_counter()
         plot_forecasts(frames, args.output / "test_errors", f"{dataset} {method} H={horizon} | start {clock}")
         result = pd.concat(outcomes, ignore_index=True)
         keys = ["seed", "block", "lookahead"]
@@ -340,12 +365,16 @@ def main(argv: list[str] | None = None) -> None:
             "mae", "mse", "mae_gain_pct", "mse_gain_pct"
         ]].mean().to_csv(args.output / "phase_summary.csv")
         plan["status"] = "complete"
+        timings["postprocessing_seconds"] = perf_counter() - postprocessing_began
         print(summary.to_string(index=False), flush=True)
     except Exception as error:
         plan.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
     finally:
+        timings["experiment_wall_seconds"] = perf_counter() - began
+        save_timings(args.output, timings)
         save_json(args.output / "manifest.json", plan)
+        print("Experiment timings (seconds): " + json.dumps(timings), flush=True)
 
 
 if __name__ == "__main__":

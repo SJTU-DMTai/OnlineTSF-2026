@@ -13,11 +13,12 @@ import multiprocessing
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
 
-from update_policy_common import DEFAULT_ANNOTATIONS, DEFAULT_RUNS, file_sha256, find_job, save_json
+from update_policy_common import DEFAULT_ANNOTATIONS, DEFAULT_RUNS, file_sha256, find_job, save_json, save_timings
 
 
 def collect_worker(plan: dict, clocks: list[int], worker: int) -> tuple[list[dict], list[dict]]:
@@ -73,6 +74,7 @@ def collect_worker(plan: dict, clocks: list[int], worker: int) -> tuple[list[dic
 
 
 def main(argv: list[str] | None = None) -> None:
+    began = perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runs", type=Path, default=DEFAULT_RUNS)
     parser.add_argument("--annotations", type=Path, default=DEFAULT_ANNOTATIONS)
@@ -157,12 +159,17 @@ def main(argv: list[str] | None = None) -> None:
         state_frame.to_csv(args.output / "probe_states.csv", index=False)
         outcome_frame.to_csv(args.output / "probe_outcomes.csv", index=False)
         plan.update(status="complete", states_sha256=file_sha256(args.output / "probe_states.csv"),
-                    outcomes_sha256=file_sha256(args.output / "probe_outcomes.csv"))
+                    outcomes_sha256=file_sha256(args.output / "probe_outcomes.csv"),
+                    timings={"collection_branch_seconds_sum": float(outcome_frame.branch_seconds.sum())})
     except Exception as error:
         plan.update(status="failed", error=str(error))
         raise
     finally:
+        timings = plan.setdefault("timings", {})
+        timings["collection_wall_seconds"] = perf_counter() - began
+        save_timings(args.output, timings)
         save_json(args.output / "manifest.json", plan)
+        print("Collection timings (seconds): " + json.dumps(timings), flush=True)
 
 
 if __name__ == "__main__":
