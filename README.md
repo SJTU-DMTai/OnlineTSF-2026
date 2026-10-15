@@ -19,30 +19,43 @@
 
 # Concept Drift
 
+## Drift Detection
+
 | Venue | Paper | Corresp. Author | Key Words | Links |
 | --- | --- | --- | --- | --- |
-| KDD 2026 | **A Framework for Evaluating and Benchmarking Concept Drift Detection Methods** | — | Drift Benchmarking, Semi-Synthetic Drift, Timing-Aware Evaluation, Hyperparameter Selection | [Paper](https://arxiv.org/abs/2606.07789), [Code](https://github.com/vcerqueira/experiments-drift_evaluation) |
-| SDM 2007 | **Learning from Time-Changing Data with Adaptive Windowing** | — | Adaptive Windowing, Online Change Detection, Streaming Statistics | [Paper](https://doi.org/10.1137/1.9781611972771.42) |
 | Biometrika 1954 | **Continuous Inspection Schemes** | E. S. Page (sole author) | Sequential Change Detection, CUSUM, Page-Hinkley | [Paper](https://doi.org/10.1093/biomet/41.1-2.100) |
-| Discovery Science 2007 | **Detecting Concept Drift Using Statistical Testing** | — | Statistical Testing, Error-Rate Drift, Equal-Proportion Test, STEPD | [Paper](https://doi.org/10.1007/978-3-540-75488-6_27) |
-| ICDM 2014 | **Detecting Volatility Shift in Data Streams** | — | Volatility Shift, Block-Based Windowing, SEED, Drift Dynamics | [Paper](https://doi.org/10.1109/ICDM.2014.50) |
-| DMKD 2024 | **Adaptive Bernstein Change Detector for High-Dimensional Data Streams** | Marco Heyden | High-Dimensional Drift, Bernstein Bounds, Subspace Localization, ABCD | [Paper](https://doi.org/10.1007/s10618-023-00999-5), [arXiv](https://arxiv.org/abs/2306.12974), [Code](https://github.com/heymarco/AdaptiveBernsteinChangeDetector) |
-| Machine Learning 2023 | **STUDD: A Student-Teacher Method for Unsupervised Concept Drift Detection** | Vitor Cerqueira | Unsupervised Drift Detection, Student–Teacher Disagreement, Label-Free Monitoring | [Paper](https://doi.org/10.1007/s10994-022-06188-7), [arXiv](https://arxiv.org/abs/2103.00903) |
+| Technometrics 1959 | **Control Chart Tests Based on Geometric Moving Averages** | S. W. Roberts (sole author) | Geometric Moving Average, Statistical Process Control, GMA | [Paper](https://doi.org/10.1080/00401706.1959.10489860) |
 | SBIA 2004 | **Learning with Drift Detection** | — | Error-Rate Monitoring, Statistical Warning, Drift Detection Method, DDM | [Paper](https://doi.org/10.1007/978-3-540-28645-5_29) |
 | KDD Workshop 2006 | **Early Drift Detection Method** | — | Early Drift Detection, Error-Distance Monitoring, Gradual Drift, EDDM | [Paper](https://citeseerx.ist.psu.edu/document?doi=2747577a61c70bc3874380130615e15aff76339e&repid=rep1&type=pdf) |
+| SDM 2007 | **Learning from Time-Changing Data with Adaptive Windowing** | — | Adaptive Windowing, Online Change Detection, Streaming Statistics | [Paper](https://doi.org/10.1137/1.9781611972771.42) |
+| Discovery Science 2007 | **Detecting Concept Drift Using Statistical Testing** | — | Statistical Testing, Error-Rate Drift, Equal-Proportion Test, STEPD | [Paper](https://doi.org/10.1007/978-3-540-75488-6_27) |
 | Pattern Recognition Letters 2012 | **Exponentially Weighted Moving Average Charts for Detecting Concept Drift** | — | EWMA Control Charts, Misclassification Monitoring, ECDD | [Paper](https://arxiv.org/abs/1212.6018) |
-| Technometrics 1959 | **Control Chart Tests Based on Geometric Moving Averages** | S. W. Roberts (sole author) | Geometric Moving Average, Statistical Process Control, GMA | [Paper](https://doi.org/10.1080/00401706.1959.10489860) |
+| ICDM 2014 | **Detecting Volatility Shift in Data Streams** | — | Volatility Shift, Block-Based Windowing, SEED, Drift Dynamics | [Paper](https://doi.org/10.1109/ICDM.2014.50) |
 | IEEE TKDE 2015 | **Online and Non-Parametric Drift Detection Methods Based on Hoeffding’s Bounds** | — | Hoeffding Bounds, Non-Parametric Detection, HDDMA, HDDMW | [Paper](https://doi.org/10.1109/TKDE.2014.2345382) |
 | Expert Systems with Applications 2017 | **RDDM: Reactive drift detection method** | — | Reactive Drift Detection, Recent Evidence, Error-Rate Monitoring, RDDM | [Paper](https://doi.org/10.1016/j.eswa.2017.08.023) |
+| Machine Learning 2023 | **STUDD: A Student-Teacher Method for Unsupervised Concept Drift Detection** | Vitor Cerqueira | Unsupervised Drift Detection, Student–Teacher Disagreement, Label-Free Monitoring | [Paper](https://doi.org/10.1007/s10994-022-06188-7), [arXiv](https://arxiv.org/abs/2103.00903) |
+| DMKD 2024 | **Adaptive Bernstein Change Detector for High-Dimensional Data Streams** | Marco Heyden | High-Dimensional Drift, Bernstein Bounds, Subspace Localization, ABCD | [Paper](https://doi.org/10.1007/s10618-023-00999-5), [arXiv](https://arxiv.org/abs/2306.12974), [Code](https://github.com/heymarco/AdaptiveBernsteinChangeDetector) |
+| arXiv 2024 | **Sequential Change Point Detection in High-dimensional Vector Auto-regressive Models** | — | Sequential Change-Point Detection, High-Dimensional VAR, Transition-Matrix Shift | [Paper](https://arxiv.org/abs/2412.09794), [Code](https://github.com/Helloworld9293/VARcpDetectOnline) |
+
+## Forecast and Adaptation
+
+| Venue | Paper | Corresp. Author | Key Words | Links |
+| --- | --- | --- | --- | --- |
+| ICLR 2022 | **Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift** | — | Distribution Shift, Reversible Normalization, Instance Statistics, RevIN | [Paper](https://openreview.net/forum?id=cGDAkQo1C0p), [Code](https://github.com/ts-kim/RevIN) |
+| Book Chapter 2023 | **Handling Concept Drift in Global Time Series Forecasting** | — | Global Forecasting, AR(3) Simulation, Sudden Drift, Gradual and Incremental Drift | [Paper](https://arxiv.org/abs/2304.01512), [Code](https://github.com/Neal-Liu-Ziyi/Concept_Drift_Handling), [Publication](https://doi.org/10.1007/978-3-031-35879-1_7) |
+| AAAI 2023 | **Dish-TS: A General Paradigm for Alleviating Distribution Shift in Time Series Forecasting** | Pengyang Wang; Yanjie Fu | Intra-Space Shift, Inter-Space Shift, Dual Distribution Learning, Dish-TS | [Paper](https://arxiv.org/abs/2302.14829), [Code](https://github.com/weifantt/Dish-TS) |
 | arXiv 2024 | **Addressing Concept Shift in Online Time Series Forecasting: Detect-then-Adapt** | — | Detect-then-Adapt, Loss-Distribution Monitoring, Delayed Feedback, Historical Data Augmentation | [Paper](https://arxiv.org/abs/2403.14949), [Code](https://github.com/yfzhang114/OneNet) |
 | arXiv 2024 | **Online Test-Time Adaptation of Spatial-Temporal Traffic Flow Forecasting** | Lei Bai; Yu Zhang | Online Test-Time Adaptation, Temporal Drift, Seasonal–Trend Correction, ADCSD | [Paper](https://arxiv.org/abs/2401.04148), [Code](https://github.com/Pengxin-Guo/ADCSD) |
 | KDD 2024 | **Calibration of Time-Series Forecasting: Detecting and Adapting Context-Driven Distribution Shift** | Zhuo Li; Chenghao Liu | Context-Driven Shift, Residual-Based Detection, Contextualized Adaptation, SOLID | [Paper](https://arxiv.org/abs/2310.14838), [Publication](https://doi.org/10.1145/3637528.3671926) |
 | SN Computer Science 2025 | **Dynamic Swarm Intelligence for Time Series Forecasting in the Presence of Concept Drift** | Gustavo H. F. M. Oliveira | Dynamic Swarm Intelligence, Drift Adaptation, Recurring Concepts, SISC | [Paper](https://doi.org/10.1007/s42979-025-04247-z), [Code](https://github.com/GustavoHFMO/SISC) |
-| arXiv 2026 | **When Tomorrow Becomes Today: Self-Evolving Policies for Agentic Time-Series Forecasting** | Zewei Dong; Qiang Xu | Policy Evolution, Delayed Feedback, Expert Trust, Adaptive Forecast Orchestration | [Paper](https://arxiv.org/abs/2609.24862) |
-| Book Chapter 2023 | **Handling Concept Drift in Global Time Series Forecasting** | — | Global Forecasting, AR(3) Simulation, Sudden Drift, Gradual and Incremental Drift | [Paper](https://arxiv.org/abs/2304.01512), [Code](https://github.com/Neal-Liu-Ziyi/Concept_Drift_Handling), [Publication](https://doi.org/10.1007/978-3-031-35879-1_7) |
-| arXiv 2024 | **Sequential Change Point Detection in High-dimensional Vector Auto-regressive Models** | — | Sequential Change-Point Detection, High-Dimensional VAR, Transition-Matrix Shift | [Paper](https://arxiv.org/abs/2412.09794), [Code](https://github.com/Helloworld9293/VARcpDetectOnline) |
-| PVLDB 2025 | **Stress-Testing ML Pipelines with Adversarial Data Corruption** | — | Structured Data Corruption, Adversarial Stress Testing, Constrained Search, SAVAGE | [Paper](https://www.vldb.org/pvldb/vol18/p4668-zhu.pdf), [arXiv](https://arxiv.org/abs/2506.01230), [Code](https://github.com/lodino/savage) |
 | ICML 2025 Workshop (PUT) | **Shift-Aware Test-Time Adaptation and Benchmarking for Time-Series Forecasting** | — | Shift-Aware Test-Time Adaptation, Semi-Synthetic Benchmark, TTFBench, DynaTTA | [Paper](https://openreview.net/forum?id=a399SmgWGl), [Code](https://github.com/shivam-grover/DynaTTA) |
+| arXiv 2026 | **When Tomorrow Becomes Today: Self-Evolving Policies for Agentic Time-Series Forecasting** | Zewei Dong; Qiang Xu | Policy Evolution, Delayed Feedback, Expert Trust, Adaptive Forecast Orchestration | [Paper](https://arxiv.org/abs/2609.24862) |
+
+## Benchmark
+
+| Venue | Paper | Corresp. Author | Key Words | Links |
+| --- | --- | --- | --- | --- |
 | DMKD 2020 | **Challenges in benchmarking stream learning algorithms with real-world data** | Vinicius M. A. Souza | Real-World Drift Benchmarking, Controlled Environmental Changes, Stream Classification, INSECTS | [Paper](https://doi.org/10.1007/s10618-020-00698-5), [arXiv](https://arxiv.org/abs/2005.00113) |
-| ICLR 2022 | **Reversible Instance Normalization for Accurate Time-Series Forecasting against Distribution Shift** | — | Distribution Shift, Reversible Normalization, Instance Statistics, RevIN | [Paper](https://openreview.net/forum?id=cGDAkQo1C0p), [Code](https://github.com/ts-kim/RevIN) |
-| AAAI 2023 | **Dish-TS: A General Paradigm for Alleviating Distribution Shift in Time Series Forecasting** | Pengyang Wang; Yanjie Fu | Intra-Space Shift, Inter-Space Shift, Dual Distribution Learning, Dish-TS | [Paper](https://arxiv.org/abs/2302.14829), [Code](https://github.com/weifantt/Dish-TS) |
+| PVLDB 2025 | **Stress-Testing ML Pipelines with Adversarial Data Corruption** | — | Structured Data Corruption, Adversarial Stress Testing, Constrained Search, SAVAGE | [Paper](https://www.vldb.org/pvldb/vol18/p4668-zhu.pdf), [arXiv](https://arxiv.org/abs/2506.01230), [Code](https://github.com/lodino/savage) |
+| KDD 2026 | **A Framework for Evaluating and Benchmarking Concept Drift Detection Methods** | — | Drift Benchmarking, Semi-Synthetic Drift, Timing-Aware Evaluation, Hyperparameter Selection | [Paper](https://arxiv.org/abs/2606.07789), [Code](https://github.com/vcerqueira/experiments-drift_evaluation) |
+
