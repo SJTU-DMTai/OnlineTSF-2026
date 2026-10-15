@@ -1,25 +1,48 @@
-# Online Forecasting, Model Adaptation, and Configuration Selection Papers
+# Awesome Online Timeseries Forecasting Papers
 
+## Introduction
 
-| Venue        | Paper                                                        | Corresp. Author                | Key Words                                                    | Links                                                        |
-| ------------ | ------------------------------------------------------------ | ------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| ICLR 2023    | **Learning Fast and Slow for Online Time Series Forecasting** | Quang Pham                     | Fast-Slow Adaptation, Associative Memory, Catastrophic Forgetting | [Paper](https://openreview.net/forum?id=q-PbpHD3EOk), [Code](https://github.com/salesforce/fsnet) |
-| NeurIPS 2023 | **OneNet: Enhancing Time Series Forecasting Models under Concept Drift by Online Ensembling** | Qingsong Wen                   | Online Ensembling, Adaptive Weighting, Cross-Variable Modeling | [Paper](https://proceedings.neurips.cc/paper_files/paper/2023/hash/dd6a47bc0aad6f34aa5e77706d90cdc4-Abstract.html), [Code](https://github.com/yfzhang114/OneNet) |
-| ICLR 2025    | **Fast and Slow Streams for Online Time Series Forecasting Without Information Leakage** | Ying-yee Ava Lau               | Fast-Slow Adaptation, Experience Replay, Delayed Feedback, Information Leakage | [Paper](https://proceedings.iclr.cc/paper_files/paper/2025/hash/46e624c244cff669223d488defd4e835-Abstract-Conference.html), [Code](https://github.com/yyalau/iclr2025_dsof) |
-| ICML 2025    | **Lightweight Online Adaption for Time Series Foundation Model Forecasts** | Thomas L. Lee*; William Toner* | Foundation Model Adaptation, Online Ensembling, Lightweight Adaptation | [Paper](https://proceedings.mlr.press/v267/lee25ag.html) |
-| KDD 2025     | **Proactive Model Adaptation Against Concept Drift for Online Time Series Forecasting** | Yanyan Shen                    | Proactive Adaptation, Delayed Feedback, Parameter Adaptation | [Paper](https://arxiv.org/abs/2412.08435), [Code](https://github.com/SJTU-DMTai/OnlineTSF) |
-| IJCAI 2025   | **Learning to Extrapolate and Adjust: Two-Stage Meta-Learning for Concept Drift in Online Time Series Forecasting** | Weiqi Chen                     | Meta-Learning, Drift Decomposition, Latent-Space Adaptation | [Paper](https://www.ijcai.org/proceedings/2025/542), [Code](https://github.com/vc12301/LEAF) |
-| WWW 2026     | **Dynamic Multi-period Experts for Online Time Series Forecasting** | Hwanjo Yu                      | Mixture-of-Experts, Drift Decomposition, Periodic Pattern Retrieval, Uncertainty-Aware Routing | [Paper](https://arxiv.org/abs/2603.09062), [Code](https://github.com/shhong97/DynaME) |
-| ICLR 2026    | **Online Time Series Prediction Using Feature Adjustment**   | Chao Yang                      | Feature Adaptation, Historical Gradients, Delayed Feedback, Lightweight Adaptation | [Paper](https://arxiv.org/abs/2509.03810), [Code](https://github.com/xiannanhuang/ADAPT-Z) |
-| ICLR 2026    | **When to Retrain after Drift: A Data-Only Test of Post-Drift Data Size Sufficiency** | Ren Fujiwara                   | Retraining Decision, Data Sufficiency, Data-Only Detection | [Paper](https://proceedings.iclr.cc/paper_files/paper/2026/hash/d5ff2b092d81618a743c15cf38f8d134-Abstract-Conference.html) |
-| ICML 2025    | **When to retrain a machine learning model**                 | Florence Regol                 | Retraining Decision, Uncertainty-Aware Decision, Cost-Aware Adaptation | [Paper](https://proceedings.mlr.press/v267/regol25a.html) |
-| KDD 2026     | **Online Irregular Multivariate Time Series Forecasting via Uncertainty-Driven Dual-Expert Calibration** | Songhe Feng                    | Dual-Expert Calibration, Uncertainty-Aware Routing, Irregular Sampling, Lightweight Adaptation | [Paper](https://arxiv.org/abs/2605.28603), [Code](https://github.com/HaonanWen/Under-Cali) |
-| IJCAI 2026   | **Beyond Uniform Updates: Drift Pattern Aware Online Time Series Forecasting Under Delayed Feedback** | Xingwang Li                    | Drift-Aware Update, Delayed Feedback, Selective Adaptation, Drift Retrieval | [Paper](https://www.ijcai.org/proceedings/2026/) |
-| arXiv 2026   | **Natural Language Query to Configuration for Retrieval Agents** | Melissa Z. Pan    | Per-Query Configuration, Retrieval Agents, Workload-Specific Features, Per-Configuration Predictors, Cost–Quality Trade-off | [Paper](https://arxiv.org/abs/2605.27361), [HTML](https://arxiv.org/html/2605.27361v1) |
+Online time series forecasting (TSF) predicts future values as observations arrive in sequence. Predictions use only information available at the time; models can be updated once new observations and prediction feedback become available. Changing data patterns make adaptation a central part of the task.
 
-# Concept Drift
+This collection covers two areas. **Adaptive Online Forecasting** includes methods for online adaptation, alongside related work on automated model selection and decision-making. **Concept Drift** covers drift detection, forecasting under distribution shifts, and benchmarks.
 
-## Drift Detection
+## Adaptive Online Forecasting
+
+### Online Forecasting and Adaptation
+
+Methods that adapt model parameters, features, or expert combinations as new observations and feedback arrive.
+
+| Venue | Paper | Corresp. Author | Links |
+| --- | --- | --- | --- |
+| ICLR 2023 | **Learning Fast and Slow for Online Time Series Forecasting** | Quang Pham | [Paper](https://openreview.net/forum?id=q-PbpHD3EOk), [Code](https://github.com/salesforce/fsnet) |
+| NeurIPS 2023 | **OneNet: Enhancing Time Series Forecasting Models under Concept Drift by Online Ensembling** | Qingsong Wen | [Paper](https://proceedings.neurips.cc/paper_files/paper/2023/hash/dd6a47bc0aad6f34aa5e77706d90cdc4-Abstract.html), [Code](https://github.com/yfzhang114/OneNet) |
+| ICLR 2025 | **Fast and Slow Streams for Online Time Series Forecasting Without Information Leakage** | Ying-yee Ava Lau | [Paper](https://proceedings.iclr.cc/paper_files/paper/2025/hash/46e624c244cff669223d488defd4e835-Abstract-Conference.html), [Code](https://github.com/yyalau/iclr2025_dsof) |
+| ICML 2025 | **Lightweight Online Adaption for Time Series Foundation Model Forecasts** | Thomas L. Lee*; William Toner* | [Paper](https://proceedings.mlr.press/v267/lee25ag.html) |
+| KDD 2025 | **Proactive Model Adaptation Against Concept Drift for Online Time Series Forecasting** | Yanyan Shen | [Paper](https://arxiv.org/abs/2412.08435), [Code](https://github.com/SJTU-DMTai/OnlineTSF) |
+| IJCAI 2025 | **Learning to Extrapolate and Adjust: Two-Stage Meta-Learning for Concept Drift in Online Time Series Forecasting** | Weiqi Chen | [Paper](https://www.ijcai.org/proceedings/2025/542), [Code](https://github.com/vc12301/LEAF) |
+| WWW 2026 | **Dynamic Multi-period Experts for Online Time Series Forecasting** | Hwanjo Yu | [Paper](https://arxiv.org/abs/2603.09062), [Code](https://github.com/shhong97/DynaME) |
+| ICLR 2026 | **Online Time Series Prediction Using Feature Adjustment** | Chao Yang | [Paper](https://arxiv.org/abs/2509.03810), [Code](https://github.com/xiannanhuang/ADAPT-Z) |
+| arXiv 2025 | **Continuous Evolution Pool: Taming Recurring Concept Drift in Online Time Series Forecasting (CEP)** | Ming Jin; Shirui Pan | [Paper](https://arxiv.org/html/2506.14790), [Code](https://github.com/ztxtech/cep_ts) |
+| KDD 2026 | **Online Irregular Multivariate Time Series Forecasting via Uncertainty-Driven Dual-Expert Calibration** | Songhe Feng | [Paper](https://arxiv.org/abs/2605.28603), [Code](https://github.com/HaonanWen/Under-Cali) |
+| IJCAI 2026 | **Beyond Uniform Updates: Drift Pattern Aware Online Time Series Forecasting Under Delayed Feedback** | Xingwang Li | [Paper](https://www.ijcai.org/proceedings/2026/) |
+
+### Automated Model Selection and Decision-Making
+
+Methods for deciding when to retrain, selecting models and configurations, and using memory or LLM agents to guide forecasting workflows.
+
+| Venue | Paper | Corresp. Author | Links |
+| --- | --- | --- | --- |
+| ICLR 2026 | **When to Retrain after Drift: A Data-Only Test of Post-Drift Data Size Sufficiency** | Ren Fujiwara | [Paper](https://proceedings.iclr.cc/paper_files/paper/2026/hash/d5ff2b092d81618a743c15cf38f8d134-Abstract-Conference.html) |
+| ICML 2025 | **When to retrain a machine learning model** | Florence Regol | [Paper](https://proceedings.mlr.press/v267/regol25a.html) |
+| KDD 2024 | **AutoXPCR: Automated Multi-Objective Model Selection for Time Series Forecasting** | Raphael Fischer | [Paper](https://arxiv.org/abs/2312.13038), [Code](https://github.com/raphischer/xpcr) |
+| AAAI 2026 | **Neural Architecture and Hyperparameter Selection Through Meta-Learning on Time Series** | Erfan Moeini | [Paper](https://ojs.aaai.org/index.php/AAAI/article/view/39622) |
+| arXiv 2026 | **Natural Language Query to Configuration for Retrieval Agents** | Melissa Z. Pan | [Paper](https://arxiv.org/abs/2605.27361) |
+| ICAIF 2025 | **Structured Agentic Workflows for Financial Time-Series Modelling with LLMs and Reflective Feedback (TS-Agent)** | Anthony K. H. Tung; Lukasz Szpruch; Hao Ni | [Paper](https://arxiv.org/abs/2508.13915) |
+| ICML 2026 | **MemCast: Memory-Driven Time Series Forecasting with Experience-Conditioned Reasoning** | Mingyue Cheng | [Paper](https://arxiv.org/abs/2602.03164), [Code](https://github.com/ustc-time-series/MemCast) |
+
+## Concept Drift
+
+### Drift Detection
 
 | Venue | Paper | Key Words | Links |
 | --- | --- | --- | --- |
@@ -37,7 +60,7 @@
 | DMKD 2024 | **Adaptive Bernstein Change Detector for High-Dimensional Data Streams** | High-Dimensional Drift, Bernstein Bounds, Subspace Localization, ABCD | [Paper](https://doi.org/10.1007/s10618-023-00999-5), [arXiv](https://arxiv.org/abs/2306.12974), [Code](https://github.com/heymarco/AdaptiveBernsteinChangeDetector) |
 | arXiv 2024 | **Sequential Change Point Detection in High-dimensional Vector Auto-regressive Models** | Sequential Change-Point Detection, High-Dimensional VAR, Transition-Matrix Shift | [Paper](https://arxiv.org/abs/2412.09794), [Code](https://github.com/Helloworld9293/VARcpDetectOnline) |
 
-## Forecast and Adaptation
+### Forecast and Adaptation
 
 | Venue | Paper | Key Words | Links |
 | --- | --- | --- | --- |
@@ -51,7 +74,7 @@
 | ICML 2025 Workshop (PUT) | **Shift-Aware Test-Time Adaptation and Benchmarking for Time-Series Forecasting** | Shift-Aware Test-Time Adaptation, Semi-Synthetic Benchmark, TTFBench, DynaTTA | [Paper](https://openreview.net/forum?id=a399SmgWGl), [Code](https://github.com/shivam-grover/DynaTTA) |
 | arXiv 2026 | **When Tomorrow Becomes Today: Self-Evolving Policies for Agentic Time-Series Forecasting** | Policy Evolution, Delayed Feedback, Expert Trust, Adaptive Forecast Orchestration | [Paper](https://arxiv.org/abs/2609.24862) |
 
-## Benchmark
+### Benchmark
 
 | Venue | Paper | Key Words | Links |
 | --- | --- | --- | --- |
