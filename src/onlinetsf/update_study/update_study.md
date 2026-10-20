@@ -41,7 +41,6 @@ OneNet长期权重已按用户确认改为[论文式(2)](https://papers.neurips.
 
 学习率倍率**只调整神经网络优化器**：FSNet优化器，OneNet专家和决策MLP优化器。EGD速率在所有候选中固定，避免把梯度更新频率/LR与公式权重更新混在一起。各组件的基准学习率来自profiles，可用单独的profiles文件设置。倍率只在离线训练完成后施加；所有候选共享同一离线结果。旧实验的OneNet结果使用不同权重更新算法，不能直接当作本轮native结果。
 
-旧 `scripts/drift_experiment_runtime.py` 的FSNet/OneNet跳过梯度路径也已修正为保留上述非梯度更新。
 
 ## 3. 时间与输入约束
 

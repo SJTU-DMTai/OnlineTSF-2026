@@ -19,7 +19,8 @@ import pandas as pd
 from update_policy_common import (
     DATA_FEATURES, DEFAULT_ANNOTATIONS, DEFAULT_RUNS, EXPERT_FEATURES, FEEDBACK_FEATURES,
     decision_features, file_sha256, find_job, fit_selector, historical_training_data,
-    numeric_inputs, plot_forecasts, save_json, save_timings, select_actions,
+    numeric_inputs, plot_forecasts, save_json, save_timings,
+    oracle_decision, score_action, summarize_decisions,
 )
 
 
@@ -49,13 +50,19 @@ def switch_policy(controlled, policy) -> None:
 
 
 def run_segment(replay, stream, values: np.ndarray, start: int, steps: int, interval: int,
-                controller: str, bundle: dict, actions: dict, directory: Path) -> tuple[pd.DataFrame, list[dict], dict]:
+                controller: str, bundle: dict, actions: dict, directory: Path,
+                *, oracle_metric: str | None = None) -> tuple[pd.DataFrame, list[dict], dict]:
     from onlinetsf.update_study.reporting import Reporter
-    from onlinetsf.update_study.runtime import state_features
+    from onlinetsf.update_study.runtime import restore_rng, rng_state, state_features
+    from onlinetsf.selection import select_action
 
     branch = replay.fork(actions["native"])
     reporter = Reporter(directory, stream, start)
     decisions = []
+    oracle_rows, outcomes = [], []
+    update_clocks = set()
+    stream_seconds = update_seconds = decision_seconds = search_seconds = 0.0
+    search_gradient_steps = search_egd_steps = 0
     if branch.method.method.device.type == "cuda":
         import torch
 
@@ -63,16 +70,34 @@ def run_segment(replay, stream, values: np.ndarray, start: int, steps: int, inte
     began = perf_counter()
     for index in range(start, start + steps):
         if (index - start) % interval == 0:
+            decision_began = perf_counter()
             clock = index + stream.dataset.context_length - 1
             features = decision_features(state_features(stream, branch, index), values, clock)
             scores = None
             if controller.startswith("policy_"):
-                selected, predicted = select_actions(bundle["selectors"][controller], pd.DataFrame([features]))
-                action = selected[0]
-                scores = dict(zip(bundle["selectors"][controller]["actions"], predicted[0].tolist()))
+                action, scores = select_action(bundle["selectors"][controller], features)
             else:
                 action = "native" if controller == "native" else bundle["best_fixed"]
+            decision_seconds += perf_counter() - decision_began
+            if oracle_metric is not None and start + steps - index >= interval:
+                saved_rng = rng_state()
+                search_began = perf_counter()
+                local = []
+                try:
+                    for policy in actions.values():
+                        restore_rng(saved_rng)
+                        local.append(score_action(branch, stream, index, interval, policy))
+                finally:
+                    restore_rng(saved_rng)
+                search_seconds += perf_counter() - search_began
+                search_gradient_steps += sum(row["gradient_steps"] for row in local)
+                search_egd_steps += sum(row["egd_steps"] for row in local)
+                block = (index - start) // interval
+                outcomes.extend(dict(block=block, clock=clock, block_steps=interval, **row) for row in local)
+                oracle_rows.append(dict(block=block, clock=clock, **oracle_decision(local, action, oracle_metric)))
+            decision_began = perf_counter()
             switch_policy(branch.method, actions[action])
+            decision_seconds += perf_counter() - decision_began
             record = {"controller": controller, "decision_step": index - start + 1,
                       "clock": clock, "selected_action": action,
                       "phase_at_decision": stream.phases[clock]}
@@ -81,15 +106,42 @@ def run_segment(replay, stream, values: np.ndarray, start: int, steps: int, inte
             if scores is not None:
                 record["predicted_gains"] = json.dumps(scores, allow_nan=False)
             decisions.append(record)
-        reporter.add(branch.step(stream.dataset, index))
+        previous_steps = branch.method.gradient_steps
+        stream_began = perf_counter()
+        records = branch.step(stream.dataset, index)
+        stream_seconds += perf_counter() - stream_began
+        if branch.method.gradient_steps > previous_steps:
+            update_clocks.add(index)
+        update_seconds += sum(row["update"]["seconds"] for row in records if row["update"] is not None)
+        reporter.add(records)
         if (index - start + 1) % 2048 == 0:
             print(f"{controller}: {index - start + 1}/{steps} test origins", flush=True)
     # Score all emitted forecasts. Terminal feedback never trains or emits forecasts.
+    stream_began = perf_counter()
     reporter.add(branch.finish(stream.dataset))
-    summary = reporter.close(branch.method, perf_counter() - began)
+    stream_seconds += perf_counter() - stream_began
+    wall_seconds = perf_counter() - began
+    summary = reporter.close(branch.method, wall_seconds - search_seconds)
+    summary.update(gradient_update_clocks=len(update_clocks), stream_seconds=stream_seconds,
+                   update_seconds=update_seconds, decision_seconds=decision_seconds,
+                   candidate_search_seconds=search_seconds, candidate_gradient_steps=search_gradient_steps,
+                   candidate_egd_steps=search_egd_steps, online_seconds=wall_seconds - search_seconds,
+                   wall_seconds=wall_seconds, candidate_search_role="diagnostic" if oracle_metric is not None else "none")
     forecasts = pd.read_csv(directory / "forecasts.csv")
     if len(forecasts) != steps or not np.array_equal(forecasts.forecast_index, np.arange(start, start + steps)):
         raise RuntimeError("segment did not score each newly emitted forecast exactly once")
+    if oracle_metric is not None:
+        local_frame = pd.DataFrame(oracle_rows)
+        local_frame.to_csv(directory / "oracle_decisions.csv", index=False)
+        pd.DataFrame(outcomes, columns=["block", "clock", "block_steps", "action", "mae", "mse", "forecasts",
+                                      "gradient_steps", "egd_steps", "seconds"]).to_csv(directory / "action_outcomes.csv", index=False)
+        for row in local_frame.itertuples():
+            actual = forecasts.iloc[row.block * interval:(row.block + 1) * interval][oracle_metric].mean()
+            if not np.isclose(actual, row.selected_loss, rtol=1e-7, atol=1e-9):
+                raise RuntimeError("selected Oracle branch differs from the automatic trajectory")
+        local_summary = (summarize_decisions(local_frame, oracle_metric) if not local_frame.empty else
+                         {"metric": oracle_metric, "decisions": 0, "acc": None, "mean_relative_regret": None})
+        save_json(directory / "oracle_summary.json", local_summary)
     return forecasts, decisions, summary
 
 
@@ -101,7 +153,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--training-data", type=Path,
                         help="completed collect_policy_training.py output for one training seed")
     parser.add_argument("--dataset", default="ETTh2")
-    parser.add_argument("--method", choices=["onenet", "fsnet"], default="onenet")
+    parser.add_argument("--method", choices=["onenet", "fsnet", "dsof"], default="onenet")
     parser.add_argument("--horizon", type=int, default=24)
     parser.add_argument("--train-seeds", type=int, nargs="+", default=[0, 1])
     parser.add_argument("--test-seed", type=int, default=2)
@@ -109,17 +161,20 @@ def main(argv: list[str] | None = None) -> None:
     boundary.add_argument("--test-start", type=int, help="first test forecast origin, raw zero-based row")
     boundary.add_argument("--test-start-fraction", type=float, default=.6, help="default: floor(0.6 * raw row count)")
     parser.add_argument("--steps", type=int, help="default: every remaining prediction origin")
-    parser.add_argument("--decision-interval", type=int, choices=[8, 32, 128], default=128)
+    parser.add_argument("--decision-interval", type=int, default=128, help="positive interval matching collected branch length")
     parser.add_argument("--max-depth", type=int, default=2)
     parser.add_argument("--min-samples-leaf", type=int, default=4,
                         help="minimum training states per leaf; a split requires at least twice this number")
     parser.add_argument("--prefix-rows", type=int, help="override only when original run manifest is absent")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--oracle-diagnostics", choices=["none", "policy_full", "policy_data", "both"], default="none",
+                        help="evaluate local Oracle branches during the first automatic run; no later policy replay")
+    parser.add_argument("--oracle-metric", choices=["mae", "mse"], default="mae")
     parser.add_argument("--plan-only", action="store_true", help="fit and audit the historical selector without importing torch")
     parser.add_argument("--output", type=Path, default=Path("runs/policy-exp2-temporal-onenet-etth2-h24"))
     args = parser.parse_args(argv)
-    if (min(args.horizon, args.max_depth, args.min_samples_leaf, args.threads) <= 0
+    if (min(args.horizon, args.max_depth, args.min_samples_leaf, args.threads, args.decision_interval) <= 0
             or args.steps is not None and args.steps <= 0
             or args.prefix_rows is not None and args.prefix_rows <= 0):
         parser.error("sizes must be positive")
@@ -325,16 +380,21 @@ def main(argv: list[str] | None = None) -> None:
             torch.cuda.synchronize(forecasting_method.device)
         timings["warmup_seconds"] = perf_counter() - warmup_began
         saved_rng = rng_state()
+        torch.save({"replay": replay, "rng": saved_rng}, args.output / "evaluation_start.pt")
+        plan["evaluation_start_sha256"] = file_sha256(args.output / "evaluation_start.pt")
         frames = {}
         for controller in plan["controllers"]:
             restore_rng(saved_rng)
             directory = args.output / controller
             frame, trajectory_decisions, summary = run_segment(
-                replay, stream, values, start, steps, interval, controller, bundle, actions, directory)
+                replay, stream, values, start, steps, interval, controller, bundle, actions, directory,
+                oracle_metric=args.oracle_metric if controller.startswith("policy_") and
+                args.oracle_diagnostics in {controller, "both"} else None)
             frames[controller] = frame
             decisions.extend(dict(item, seed=seed) for item in trajectory_decisions)
             trajectory_summaries.append(dict(summary, controller=controller, seed=seed))
             timings[f"test_{controller}_seconds"] = summary["seconds"]
+            timings[f"test_{controller}_candidate_search_seconds"] = summary["candidate_search_seconds"]
             outcomes.append(block_metrics(frame, trajectory_decisions, interval, phases).assign(controller=controller, seed=seed))
             pd.DataFrame(decisions).to_csv(args.output / "decisions.csv", index=False)
             pd.DataFrame(trajectory_summaries).to_csv(args.output / "trajectory_summary.csv", index=False)

@@ -31,7 +31,11 @@ from onlinetsf.drift import ADWINDetector, CapyMOADetector, HDDMWDetector, KSWIN
 
 
 METHODS = ("seed", "adwin", "abcd", "kswin", "hddmw")
-DATASETS = {"ETTh2": "ETTh2.csv", "ETTm1": "ETTm1.csv", "Electricity": "electricity.csv"}
+DATASETS = {
+    "ETTh1": "ETTh1.csv", "ETTh2": "ETTh2.csv",
+    "ETTm1": "ETTm1.csv", "ETTm2": "ETTm2.csv",
+    "Electricity": "electricity.csv", "Traffic": "traffic.csv", "Weather": "weather.csv",
+}
 
 
 def write_csv(path: Path, columns: list[str], rows) -> None:
@@ -317,7 +321,7 @@ def annotate_dataset(dataset: str, source: Path, output: Path, profiles: dict, a
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data")
-    parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=list(DATASETS))
+    parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=["ETTh2", "ETTm1", "Electricity"])
     parser.add_argument("--profiles", type=Path, default=PROJECT_ROOT / "profiles.yaml")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--time-column", default="date")

@@ -354,6 +354,10 @@ class FSNetMethod:
         selected = frozenset(groups) if update_groups is None else update_groups
         if selected - groups.keys():
             raise ValueError("unknown FSNet update group")
+        # Gradient memories require fresh backpropagation. With no selected neural
+        # update, keep them unchanged; prediction still advances formula-only state.
+        if not selected:
+            return None
         self.model.eval()
         context = feedback.context.unsqueeze(0).to(self.device)
         target = feedback.target.unsqueeze(0).to(self.device)

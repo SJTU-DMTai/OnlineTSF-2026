@@ -32,8 +32,11 @@ from .methods import (
     OneNetMethod,
     UnderCaliMethod,
 )
+from .adaptation import ControlledMethod, Policy
 
 __all__ = [
+    "ControlledMethod",
+    "Policy",
     "ADWINDetector",
     "AdaptiveConv1d",
     "DLinearForecastBackbone",

@@ -54,7 +54,7 @@ class Reporter:
                 clock = update["available_at"] + length - 1
                 update.update(feedback_raw_index=clock, feedback_phase=self.stream.phases[clock])
                 self.update_writer.writerow(update)
-            if record["index"] < self.first_origin:
+            if "index" not in record or record["index"] < self.first_origin:
                 continue
             raw = record["index"] + length
             self.forecast_writer.writerow({"forecast_index": record["index"], "origin_raw_index": raw - 1,

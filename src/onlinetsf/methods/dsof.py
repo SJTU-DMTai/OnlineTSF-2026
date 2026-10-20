@@ -85,6 +85,7 @@ class DSOFMethod:
         self.discount = discount
         self._complete_count = 0
         self._partial: dict[int, tuple[Tensor, Tensor]] = {}
+        self.last_gradient_steps = 0
 
     def predict(self, context: Tensor) -> Tensor:
         self.model.eval()
@@ -104,32 +105,40 @@ class DSOFMethod:
         self.student_optimizer.state.clear()
         self.online_optimizer.state.clear()
 
-    def _supervised_update(self, context: Tensor, target: Tensor) -> float:
+    def _supervised_update(self, context: Tensor, target: Tensor,
+                           groups: frozenset[str] = frozenset({"teacher", "student"})) -> float:
         self.model.train()
-        teacher_prediction = self.model.teacher(context)
+        with torch.set_grad_enabled("teacher" in groups):
+            teacher_prediction = self.model.teacher(context)
         final_prediction = teacher_prediction.detach() + self.model.residual(context, teacher_prediction)
         teacher_loss = (teacher_prediction - target).square().mean()
         student_loss = (final_prediction - target).square().mean()
         self.teacher_optimizer.zero_grad(set_to_none=True)
         self.student_optimizer.zero_grad(set_to_none=True)
-        teacher_loss.backward()
-        student_loss.backward()
-        self.teacher_optimizer.step()
-        self.student_optimizer.step()
+        if "teacher" in groups:
+            teacher_loss.backward()
+            self.teacher_optimizer.step()
+            self.last_gradient_steps += 1
+        if "student" in groups:
+            student_loss.backward()
+            self.student_optimizer.step()
+            self.last_gradient_steps += 1
         return student_loss.detach().item()
 
-    def _replay_update(self) -> float | None:
+    def _replay_update(self, groups: frozenset[str] = frozenset({"teacher", "student"})) -> float | None:
         if len(self.replay) < self.replay_batch_size:
             return None
         self._complete_count += 1
         if (self._complete_count - 1) % self.replay_frequency:
+            return None
+        if not groups & {"teacher", "student"}:
             return None
         losses: list[float] = []
         for _ in range(self.replay_epochs):
             indices = torch.randperm(len(self.replay))[:self.replay_batch_size].tolist()
             context = torch.stack([self.replay[index][0] for index in indices]).to(self.device)
             target = torch.stack([self.replay[index][1] for index in indices]).to(self.device)
-            losses.append(self._supervised_update(context, target))
+            losses.append(self._supervised_update(context, target, groups))
         return sum(losses) / len(losses)
 
     def _fast_update(self, feedback: MethodFeedback) -> float:
@@ -147,9 +156,14 @@ class DSOFMethod:
         self.online_optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.online_optimizer.step()
+        self.last_gradient_steps += 1
         return loss.detach().item()
 
-    def on_feedback(self, feedback: MethodFeedback) -> float | None:
+    def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None) -> float | None:
+        groups = frozenset({"teacher", "student", "online"}) if update_groups is None else update_groups
+        if groups - {"teacher", "student", "online"}:
+            raise ValueError("unknown DSOF update group")
+        self.last_gradient_steps = 0
         # Flush scores final forecasts after replay; it has no new observed context.
         if feedback.current_context is None:
             return None
@@ -165,9 +179,13 @@ class DSOFMethod:
         if observed.all():
             self.replay.append((feedback.context.detach().clone(), values.detach().clone()))
             del self._partial[feedback.index]
-            replay_loss = self._replay_update()
+            replay_loss = self._replay_update(groups)
             if replay_loss is not None:
                 losses.append(replay_loss)
-        if feedback.observed_mask[0].all():
+        if "online" in groups and feedback.observed_mask[0].all():
             losses.append(self._fast_update(feedback))
+        # A frozen interval may have skipped earlier coordinates. The
+        # last coordinate still retires that incomplete window's bookkeeping.
+        if feedback.observed_mask[-1].all():
+            self._partial.pop(feedback.index, None)
         return sum(losses) / len(losses) if losses else None

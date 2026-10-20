@@ -15,29 +15,22 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-from ..forecasting import TCNForecastBackbone, TimeTCNForecastBackbone
-from ..methods import FSNetMethod, FSNetTCN, OneNetEnsemble, OneNetMethod
+from ..factory import build_backbone, build_method as build_online_method
+from ..methods import DSOFMethod, FSNetMethod, OneNetMethod
 from .data import load_stream, select_probes
 from .reporting import Reporter, write_csv
 from .runtime import ControlledMethod, Policy, Replay, policies, restore_rng, rng_state, state_features
 
 
 def build_method(name: str, dataset, profile: dict, device: str):
-    dimensions = dict(context_length=dataset.context_length, num_features=dataset.num_features,
-                      horizon=dataset.horizon, num_targets=dataset.num_targets)
-    model_options = profile["forecasting"]["parameters"]
-    options = dict(profile["method"])
-    options.pop("name")
-    if name == "fsnet":
-        return FSNetMethod(FSNetTCN(**dimensions, **model_options), device=device, **options)
-    hidden = options.pop("decision_hidden", 32)
-    dropout = options.pop("decision_dropout", 0.1)
-    model = OneNetEnsemble(
-        TimeTCNForecastBackbone(**dimensions, target_indices=dataset.target_indices, **model_options),
-        TCNForecastBackbone(**dimensions, **model_options), horizon=dataset.horizon,
-        num_targets=dataset.num_targets, decision_hidden=hidden, decision_dropout=dropout,
-    )
-    return OneNetMethod(model, device=device, **options)
+    if profile["method"]["name"] != name:
+        raise ValueError("profile method differs from requested method")
+    forecasting = dict(profile["forecasting"])
+    forecasting.setdefault("backbone", {"fsnet": "fsnet_tcn", "onenet": "onenet_tcn", "dsof": "dlinear"}[name])
+    config = {"data": {"context_length": dataset.context_length, "horizon": dataset.horizon},
+              "forecasting": forecasting, "method": profile["method"], "online": {"device": device}}
+    model = build_backbone(config, dataset.num_features, dataset.num_targets, dataset.target_indices)
+    return build_online_method(config, model)
 
 
 def train_prefix(method, dataset, prefix_rows: int, epochs: int, batch_size: int) -> None:
@@ -47,7 +40,7 @@ def train_prefix(method, dataset, prefix_rows: int, epochs: int, batch_size: int
     method.model.train()
     for _ in range(epochs):
         for context, target in loader:
-            if isinstance(method, OneNetMethod):
+            if isinstance(method, (OneNetMethod, DSOFMethod)):
                 method.train_batch(context, target)
             else:
                 method.optimizer.zero_grad(set_to_none=True)
@@ -55,7 +48,7 @@ def train_prefix(method, dataset, prefix_rows: int, epochs: int, batch_size: int
                 loss.backward()
                 method.model.record_gradients()
                 method.optimizer.step()
-    if isinstance(method, OneNetMethod):
+    if isinstance(method, (OneNetMethod, DSOFMethod)):
         method.reset_online_state()
 
 
@@ -75,7 +68,7 @@ def run_branch(replay: Replay, stream, probe: dict, policy: Policy, directory: P
     for index in range(start, start + steps):
         records = branch.step(stream.dataset, index)
         reporter.add(records)
-        scored.extend(record for record in records if record["index"] >= start)
+        scored.extend(record for record in records if record.get("index", -1) >= start)
     tail = branch.finish(stream.dataset)
     reporter.add(tail)
     scored.extend(record for record in tail if record["index"] >= start)
@@ -164,7 +157,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--annotations", type=Path, default=Path("runs/real-drift-electricity-5pct-20261010"))
     parser.add_argument("--datasets", nargs="+", default=["ETTh2", "ETTm1", "Electricity"])
-    parser.add_argument("--methods", nargs="+", choices=["fsnet", "onenet"], default=["fsnet", "onenet"])
+    parser.add_argument("--methods", nargs="+", choices=["fsnet", "onenet", "dsof"], default=["fsnet", "onenet", "dsof"])
     parser.add_argument("--horizons", nargs="+", type=int, default=[1, 24])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
     parser.add_argument("--profiles", type=Path, default=Path("profiles.yaml"))
@@ -247,7 +240,8 @@ def main(argv: list[str] | None = None) -> None:
                             job["status"] = "running"
                             manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
                             job_began = perf_counter()
-                            run_job(args, stream, name, seed, profiles[name], output / dataset_name / f"{name}_h{horizon}_seed{seed}", probes)
+                            profile = profiles["dlinear_dsof" if name == "dsof" else name]
+                            run_job(args, stream, name, seed, profile, output / dataset_name / f"{name}_h{horizon}_seed{seed}", probes)
                             job["seconds"] = perf_counter() - job_began
                             job["status"] = "complete"
         if not args.plan_only:

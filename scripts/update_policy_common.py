@@ -6,9 +6,11 @@ selection only requires NumPy/pandas and the saved tree arrays.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -21,10 +23,12 @@ FEEDBACK_FEATURES = ["mae_32", "error_ratio"]
 EXPERT_FEATURES = {
     "onenet": ["expert_relative_gap", "combined_time_weight"],
     "fsnet": ["gradient_memory_norm", "memory_interactions"],
+    "dsof": ["replay_fill_fraction", "replay_updates_due"],
 }
 BASIC_ACTIONS = {
     "onenet": ["native", "every1_lr0.3", "every4_lr0.3", "only_variable+decision"],
     "fsnet": ["native", "every1_lr0.3", "every4_lr0.3", "only_base+adapter"],
+    "dsof": ["native", "every1_lr0.3", "every4_lr0.3", "only_student+online"],
 }
 
 
@@ -170,7 +174,7 @@ def plot_forecasts(frames: dict[str, pd.DataFrame], destination: Path, title: st
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
-    colors = ["#285B86", "#D27735", "#399A80", "#9666A4"]
+    colors = ["#285B86", "#D27735", "#399A80", "#9666A4", "#9B7045", "#BD455C"]
     for ax, metric in zip(axes, ["mae", "mse"]):
         for (name, frame), color in zip(frames.items(), colors):
             ax.plot(np.arange(1, len(frame) + 1), frame[metric].rolling(32, min_periods=1).mean(),
@@ -184,3 +188,71 @@ def plot_forecasts(frames: dict[str, pd.DataFrame], destination: Path, title: st
     fig.savefig(destination.with_suffix(".png"), dpi=170)
     fig.savefig(destination.with_suffix(".pdf"))
     plt.close(fig)
+
+
+def oracle_decision(outcomes: list[dict], selected: str, metric: str) -> dict:
+    """Score a choice against the best fixed action over this local window.
+
+    ACC accepts all numerically tied optima (rtol=1e-7, atol=1e-10).
+    Relative regret is (selected - optimum) / optimum, not a percentage.
+    """
+    losses = np.array([row[metric] for row in outcomes], dtype=float)
+    if not np.isfinite(losses).all() or (losses < 0).any():
+        raise ValueError("oracle losses must be finite and nonnegative")
+    best = float(losses.min())
+    if best == 0:
+        raise ValueError("relative regret is undefined for a zero optimal loss")
+    names = [row["action"] for row in outcomes]
+    chosen = float(losses[names.index(selected)])
+    optimal = np.isclose(losses, best, rtol=1e-7, atol=1e-10)
+    relative = (chosen - best) / best
+    return {"metric": metric, "selected_action": selected,
+            "oracle_action": names[int(losses.argmin())],
+            "optimal_actions": json.dumps([name for name, match in zip(names, optimal) if match]),
+            "selected_loss": chosen, "oracle_loss": best,
+            "native_loss_same_state": float(losses[names.index("native")]),
+            "correct": bool(optimal[names.index(selected)]),
+            "relative_regret": relative, "relative_regret_pct": relative * 100,
+            "within_1pct": bool(chosen <= best * 1.01 + 1e-12)}
+
+
+def summarize_decisions(decisions: pd.DataFrame, metric: str) -> dict:
+    """Each full decision interval has equal weight in these metrics."""
+    return {"metric": metric, "decisions": len(decisions),
+            "correct_decisions": int(decisions.correct.sum()), "acc": float(decisions.correct.mean()),
+            "acc_pct": float(decisions.correct.mean() * 100),
+            "mean_relative_regret": float(decisions.relative_regret.mean()),
+            "mean_relative_regret_pct": float(decisions.relative_regret.mean() * 100),
+            "median_relative_regret_pct": float(decisions.relative_regret.median() * 100),
+            "within_1pct_decisions": int(decisions.within_1pct.sum()),
+            "within_1pct_fraction": float(decisions.within_1pct.mean()),
+            "within_1pct_pct": float(decisions.within_1pct.mean() * 100),
+            "mean_selected_loss": float(decisions.selected_loss.mean()),
+            "mean_oracle_loss_same_states": float(decisions.oracle_loss.mean()),
+            "mean_native_loss_same_states": float(decisions.native_loss_same_state.mean())}
+
+
+def score_action(replay, stream, index: int, steps: int, policy) -> dict:
+    """Preserve unchanged-policy cadence and score only newly emitted forecasts."""
+    began = perf_counter()
+    branch = copy.deepcopy(replay)
+    before_gradient, before_egd = branch.method.gradient_steps, branch.method.egd_steps
+    branch.method.switch_policy(policy)
+    count, absolute, squared = 0, 0., 0.
+    for current in range(index, index + steps):
+        for record in branch.step(stream.dataset, current):
+            if record.get("index", -1) >= index:
+                count += 1
+                absolute += record["mae"]
+                squared += record["mse"]
+    # Mature terminal predictions without applying future gradient updates.
+    for record in branch.finish(stream.dataset):
+        if record["index"] >= index:
+            count += 1
+            absolute += record["mae"]
+            squared += record["mse"]
+    if count != steps:
+        raise RuntimeError(f"{policy.name}: scored {count} forecasts, expected {steps}")
+    return {"action": policy.name, "mae": absolute / steps, "mse": squared / steps,
+            "forecasts": count, "gradient_steps": branch.method.gradient_steps - before_gradient,
+            "egd_steps": branch.method.egd_steps - before_egd, "seconds": perf_counter() - began}

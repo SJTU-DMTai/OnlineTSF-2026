@@ -4,44 +4,11 @@ from __future__ import annotations
 
 import copy
 from collections import deque
-from dataclasses import dataclass
-from itertools import combinations
-from time import perf_counter
 
 import torch
 
-from ..methods import FSNetMethod, OneNetMethod
+from ..adaptation import ControlledMethod, Policy, policies
 from ..online import MethodFeedback
-
-
-@dataclass(frozen=True)
-class Policy:
-    name: str
-    mode: str = "native"
-    period: int = 1
-    lr_scale: float = 1.0
-    groups: frozenset[str] | None = None
-
-
-def policies(method: str, lr_scales: list[float], suite: str) -> list[Policy]:
-    result = [Policy("native")]
-    if suite in {"when", "both"}:
-        result.extend([Policy("frozen", mode="frozen"), Policy("no_grad", mode="no_grad")])
-        for period in (1, 4, 16):
-            for scale in lr_scales:
-                if period == 1 and scale == 1.0:
-                    continue
-                result.append(Policy(f"every{period}_lr{scale:g}", period=period, lr_scale=scale))
-    if suite in {"what", "both"}:
-        names = ("base", "adapter", "head") if method == "fsnet" else ("time", "variable", "decision")
-        for size in range(3):
-            for subset in combinations(names, size):
-                if not subset:
-                    if not any(item.name == "no_grad" for item in result):
-                        result.append(Policy("no_grad", mode="no_grad"))
-                else:
-                    result.append(Policy("only_" + "+".join(subset), groups=frozenset(subset)))
-    return result
 
 
 def rng_state() -> tuple:
@@ -52,70 +19,6 @@ def restore_rng(state: tuple) -> None:
     torch.set_rng_state(state[0])
     if state[1] is not None:
         torch.cuda.set_rng_state_all(state[1])
-
-
-class ControlledMethod:
-    """Select optimizer updates while preserving the method's other state transitions."""
-
-    def __init__(self, method: FSNetMethod | OneNetMethod, policy: Policy):
-        self.method = method
-        self.opportunities = 0
-        self.gradient_steps = 0
-        self.egd_steps = 0
-        self.last_update: dict | None = None
-        self.last_gradient_at: int | None = None
-        self.recent_update_flags: deque[int] = deque(maxlen=128)
-        self.base_rates = {name: [group["lr"] for group in optimizer.param_groups]
-                           for name, optimizer in vars(method).items() if isinstance(optimizer, torch.optim.Optimizer)}
-        self.base_weight_rate = method.weight_learning_rate if isinstance(method, OneNetMethod) else None
-        self.set_policy(policy)
-
-    def set_policy(self, policy: Policy) -> None:
-        self.policy = policy
-        self.opportunities = self.gradient_steps = self.egd_steps = 0
-        for name, rates in self.base_rates.items():
-            for group, rate in zip(getattr(self.method, name).param_groups, rates, strict=True):
-                group["lr"] = rate * policy.lr_scale
-        if isinstance(self.method, OneNetMethod):
-            # Timing/LR ablations change neural training; retain EGD at the same rate.
-            self.method.weight_learning_rate = self.base_weight_rate
-
-    def predict(self, context: torch.Tensor) -> torch.Tensor:
-        if self.policy.mode == "frozen" and isinstance(self.method, FSNetMethod):
-            self.method.model.eval()
-            with torch.no_grad():
-                return self.method.model(context.unsqueeze(0).to(self.method.device), advance_state=False).squeeze(0)
-        return self.method.predict(context)
-
-    def on_feedback(self, feedback: MethodFeedback, *, training: bool = True) -> None:
-        self.last_update = None
-        if not training or self.policy.mode == "frozen":
-            if isinstance(self.method, OneNetMethod):
-                self.method._pending_predictions.popleft()
-            return
-        selected = self.policy.mode != "no_grad" and self.opportunities % self.policy.period == 0
-        self.opportunities += 1
-        groups = self.policy.groups if selected else frozenset()
-        if groups is None:
-            groups = frozenset({"base", "adapter", "head"} if isinstance(self.method, FSNetMethod)
-                               else {"time", "variable", "decision"})
-        self.recent_update_flags.append(int(bool(groups)))
-        if groups:
-            self.last_gradient_at = feedback.available_at
-        if self.method.device.type == "cuda":
-            torch.cuda.synchronize(self.method.device)
-        began = perf_counter()
-        loss = self.method.on_feedback(feedback, update_groups=groups)
-        if self.method.device.type == "cuda":
-            torch.cuda.synchronize(self.method.device)
-        self.gradient_steps += self.method.n_inner * (int(bool(groups)) if isinstance(self.method, FSNetMethod)
-                               else int(bool(groups & {"time", "variable"})) + int("decision" in groups))
-        if isinstance(self.method, OneNetMethod):
-            self.egd_steps += self.method.n_inner
-        self.last_update = {"forecast_index": feedback.index, "available_at": feedback.available_at,
-                            "groups": "+".join(sorted(groups)), "gradient_steps": self.gradient_steps,
-                            "egd_steps": self.egd_steps, "adaptation_loss": loss,
-                            "seconds": perf_counter() - began}
 
 
 class Replay:
@@ -136,6 +39,20 @@ class Replay:
 
     def receive(self, dataset, index: int, *, training: bool) -> list[dict]:
         records = []
+        if self.method.adapter.incremental and training:
+            # Deliver exactly the newly observed coordinate of every outstanding
+            # forecast, in emission order (the same order as OnlineExecutor).
+            for origin, prediction in self.pending:
+                step = index - origin - 1
+                if 0 <= step < self.horizon:
+                    context, target = dataset[origin]
+                    mask = torch.zeros_like(target, dtype=torch.bool)
+                    mask[step] = True
+                    feedback = MethodFeedback(origin, index, context, target.masked_fill(~mask, float("nan")),
+                                              mask, prediction, dataset[index][0])
+                    self.method.on_feedback(feedback)
+                    if self.method.last_update is not None:
+                        records.append({"update": self.method.last_update})
         while self.pending and self.pending[0][0] + self.horizon <= index:
             origin, prediction = self.pending.popleft()
             context, target = dataset[origin]
@@ -145,15 +62,16 @@ class Replay:
             feedback = MethodFeedback(origin, origin + self.horizon, context, target,
                                       torch.ones_like(target, dtype=torch.bool), prediction,
                                       dataset[index][0] if training else None)
-            expert_errors = None
-            if isinstance(self.method.method, OneNetMethod):
-                time, variable = self.method.method._pending_predictions[0]
-                expert_errors = ((time - target).abs().mean().item(), (variable - target).abs().mean().item())
-            self.method.on_feedback(feedback, training=training)
+            expert_errors = self.method.adapter.expert_errors(target)
+            if not self.method.adapter.incremental:
+                self.method.on_feedback(feedback, training=training)
+            elif not training:
+                self.method.adapter.discard(feedback)
             records.append({"index": origin, "available_at": origin + self.horizon,
                             "mae": error.abs().mean().item(), "mse": error.square().mean().item(),
                             "error": error, "prediction": prediction, "target": target,
-                            "expert_errors": expert_errors, "update": self.method.last_update})
+                            "expert_errors": expert_errors,
+                            "update": None if self.method.adapter.incremental else self.method.last_update})
         return records
 
     def step(self, dataset, index: int) -> list[dict]:
@@ -213,19 +131,8 @@ def state_features(stream, replay: Replay, index: int) -> dict:
     else:
         features["current_feedback_mae"] = None
         features["feedback_age"] = None
-    method = replay.method.method
-    if isinstance(method, OneNetMethod):
-        features["long_time_weight"] = method.model.weights(include_short_term=False).mean().item()
-        features["combined_time_weight"] = method.model.weights().mean().item()
-        if method._pending_predictions:
-            time, variable = method._pending_predictions[0]
-            features["expert_disagreement"] = (time - variable).abs().mean().item()
-            if replay.pending[0][0] + replay.horizon <= index:
-                _, target = dataset[replay.pending[0][0]]
-                features["time_expert_mae"] = (time - target).abs().mean().item()
-                features["variable_expert_mae"] = (variable - target).abs().mean().item()
-    else:
-        layers = [module for module in method.model.modules() if hasattr(module, "gradient_ema")]
-        features["gradient_memory_norm"] = sum(module.gradient_ema.norm().item() for module in layers) / len(layers)
-        features["memory_interactions"] = sum(module.memory_interactions.item() for module in layers)
+    target = None
+    if replay.pending and replay.pending[0][0] + replay.horizon <= index:
+        _, target = dataset[replay.pending[0][0]]
+    features.update(replay.method.adapter.features(target))
     return features
