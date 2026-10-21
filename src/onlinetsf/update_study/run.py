@@ -1,4 +1,4 @@
-"""Run independent full-stream controls and capped same-state diagnostic forks."""
+"""Prepare offline checkpoints, or explicitly run full-stream/branch diagnostics."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 import platform
-from dataclasses import asdict
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -17,9 +17,14 @@ from torch.utils.data import DataLoader, Subset
 
 from ..factory import build_backbone, build_method as build_online_method
 from ..methods import DSOFMethod, FSNetMethod, OneNetMethod
+from ..decision.config import DecisionConfig, FEATURE_SCHEMA_VERSION
+from ..decision.actions import policies
 from .data import load_stream, select_probes
 from .reporting import Reporter, write_csv
-from .runtime import ControlledMethod, Policy, Replay, policies, restore_rng, rng_state, state_features
+from .runtime import ControlledMethod, Policy, Replay, restore_rng, rng_state, state_features
+
+
+STUDY_METHODS = {"onenet": OneNetMethod, "fsnet": FSNetMethod, "dsof": DSOFMethod}
 
 
 def build_method(name: str, dataset, profile: dict, device: str):
@@ -52,38 +57,49 @@ def train_prefix(method, dataset, prefix_rows: int, epochs: int, batch_size: int
         method.reset_online_state()
 
 
-def policy_record(policy: Policy) -> dict:
-    record = asdict(policy)
-    record["groups"] = sorted(policy.groups) if policy.groups is not None else "all"
-    return record
-
-
 def run_branch(replay: Replay, stream, probe: dict, policy: Policy, directory: Path,
-               steps: int, lookaheads: list[int], save_predictions: bool = False) -> list[dict]:
+               steps: int, lookaheads: list[int], save_predictions: bool = False,
+               *, save_logs: bool = True) -> list[dict]:
     began = perf_counter()
     branch = replay.fork(policy)
     start = probe["index"]
-    reporter = Reporter(directory, stream, start, save_predictions)
+    reporter = Reporter(directory, stream, start, save_predictions) if save_logs else None
     scored = []
+    update_seconds = 0.0
+    update_clocks = set()
+    previous_gradient = 0
     for index in range(start, start + steps):
         records = branch.step(stream.dataset, index)
-        reporter.add(records)
-        scored.extend(record for record in records if record.get("index", -1) >= start)
+        if reporter is not None:
+            reporter.add(records)
+        for record in records:
+            if record["update"] is not None:
+                update = record["update"]
+                update_seconds += update["seconds"]
+                if update["gradient_steps"] > previous_gradient:
+                    update_clocks.add(update["available_at"])
+                previous_gradient = update["gradient_steps"]
+            if record.get("index", -1) >= start:
+                scored.append((record["mae"], record["mse"]))
     tail = branch.finish(stream.dataset)
-    reporter.add(tail)
-    scored.extend(record for record in tail if record["index"] >= start)
-    summary = reporter.close(branch.method, perf_counter() - began)
-    write_csv(directory / "summary.csv", [summary])
+    if reporter is not None:
+        reporter.add(tail)
+    scored.extend((record["mae"], record["mse"]) for record in tail if record["index"] >= start)
+    seconds = perf_counter() - began
+    if reporter is not None:
+        summary = reporter.close(branch.method, seconds)
+        write_csv(directory / "summary.csv", [summary])
     result = []
     for lookahead in lookaheads:
         selected = scored[:lookahead]
         if len(selected) != lookahead:
             raise RuntimeError("probe did not receive its complete evaluation horizon")
         result.append({"policy": policy.name, "lookahead": lookahead,
-                       "mae": sum(record["mae"] for record in selected) / lookahead,
-                       "mse": sum(record["mse"] for record in selected) / lookahead,
-                       "branch_gradient_steps": summary["gradient_steps"], "branch_egd_steps": summary["egd_steps"],
-                       "branch_seconds": summary["seconds"]})
+                       "mae": sum(record[0] for record in selected) / lookahead,
+                       "mse": sum(record[1] for record in selected) / lookahead,
+                       "branch_gradient_steps": branch.method.gradient_steps, "branch_egd_steps": branch.method.egd_steps,
+                       "branch_seconds": seconds, "branch_update_seconds": update_seconds,
+                       "branch_gradient_update_clocks": len(update_clocks)})
     return result
 
 
@@ -99,11 +115,13 @@ def run_job(args, stream, name: str, seed: int, profile: dict, directory: Path, 
     if method.device.type == "cuda":
         torch.cuda.synchronize(method.device)
     offline_seconds = perf_counter() - began
-    initial = Replay(ControlledMethod(method, Policy("native")), dataset.horizon)
     initial_rng = rng_state()
     torch.save({"method": method, "rng": initial_rng, "prefix_rows": stream.prefix_rows}, directory / "initial.pt")
-    variants = policies(name, args.lr_scales, args.suite)
-    (directory / "policies.json").write_text(json.dumps([policy_record(item) for item in variants], indent=2), encoding="utf-8")
+    variants = policies(STUDY_METHODS[name].update_group_names, args.decision, args.suite)
+    (directory / "policies.json").write_text(json.dumps([item.to_dict() for item in variants], indent=2), encoding="utf-8")
+    if args.scope == "prepare":
+        return
+    initial = Replay(ControlledMethod(method, Policy("native")), dataset.horizon, args.decision)
     metadata = {"dataset": stream.manifest["dataset"], "method": name, "horizon": dataset.horizon, "seed": seed}
     summaries, outcomes, states = [], [], []
     # Native history is replayed once; every fork shares its exact pre-feedback state.
@@ -119,6 +137,7 @@ def run_job(args, stream, name: str, seed: int, profile: dict, directory: Path, 
             probe_id = f"{probe['kind']}_{probe['clock']}"
             features = state_features(stream, replay, index)
             states.append(dict(metadata, probe_id=probe_id, **probe, **features))
+            states[-1]["steps_since_gradient"] = replay.method.gradient_age(index)
             saved_rng = rng_state()
             branch_began = perf_counter()
             for policy in variants:
@@ -138,7 +157,7 @@ def run_job(args, stream, name: str, seed: int, profile: dict, directory: Path, 
     summaries.append(dict(metadata, policy="native", offline_seconds=offline_seconds, **summary))
     write_csv(directory / "summary.csv", summaries)
     if args.scope in {"full", "both"} and args.suite in {"when", "both"}:
-        for policy in policies(name, args.lr_scales, "when")[1:]:
+        for policy in policies(STUDY_METHODS[name].update_group_names, args.decision, "when")[1:]:
             restore_rng(initial_rng)
             replay = initial.fork(policy)
             reporter = Reporter(directory / policy.name, stream, start, args.save_predictions)
@@ -165,8 +184,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--prefix-rows", type=int, help="default/minimum: max(calibration rows, ceil(20%% of raw rows))")
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr-scales", nargs="+", type=float, default=[0.3, 1.0, 3.0])
-    parser.add_argument("--scope", choices=["branches", "full", "both"], default="both")
+    parser.add_argument("--lr-scales", nargs="+", type=float, help="override decision configuration learning-rate scales")
+    parser.add_argument("--decision-config", type=Path, help="shared decision YAML (defaults to built-in configuration)")
+    parser.add_argument("--scope", choices=["prepare", "branches", "full", "both"], default="prepare",
+                        help="prepare only trains/saves the offline model and action catalog; other scopes run diagnostics")
     parser.add_argument("--suite", choices=["when", "what", "both"], default="both")
     parser.add_argument("--max-probes", type=int, default=12)
     parser.add_argument("--max-events", type=int, default=8)
@@ -182,6 +203,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--save-predictions", action="store_true", help="also persist exact forecast/target tensors in bounded chunks")
     args = parser.parse_args(argv)
+    args.decision = DecisionConfig.load(args.decision_config) if args.decision_config else DecisionConfig()
+    if args.lr_scales is not None:
+        args.decision = replace(args.decision, lr_scales=tuple(args.lr_scales))
+    args.lr_scales = list(args.decision.lr_scales)
     positive = [args.context_length, args.epochs, args.batch_size, args.probe_separation, args.branch_steps,
                 args.threads, *args.horizons, *args.lookaheads]
     if any(value <= 0 for value in positive) or args.max_probes < 0 or args.max_events < 0 or args.probe_offset < 0:
@@ -204,8 +229,10 @@ def main(argv: list[str] | None = None) -> None:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = args.output or Path("runs") / f"update-study-{stamp}"
     output.mkdir(parents=True, exist_ok=False)
-    manifest = {"arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+    manifest = {"arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items() if key != "decision"},
                 "python": platform.python_version(), "torch": torch.__version__, "profiles": profiles,
+                "decision_config": args.decision.to_dict(), "data_feature_precision": "float64",
+                "feature_schema_version": FEATURE_SCHEMA_VERSION,
                 "label_use": "posthoc_sampling_and_analysis_only", "status": "planning" if args.plan_only else "running", "jobs": []}
     manifest_path = output / "manifest.json"
     try:
@@ -215,17 +242,24 @@ def main(argv: list[str] | None = None) -> None:
                 stream = load_stream(args.annotations / dataset_name, args.context_length, horizon, args.prefix_rows)
                 start = stream.prefix_rows - args.context_length
                 stop = len(stream.dataset) if args.max_steps is None else min(len(stream.dataset), start + args.max_steps)
-                probes = select_probes(stream, start, stop, max_probes=args.max_probes, max_events=args.max_events,
-                                       separation=args.probe_separation, branch_steps=args.branch_steps,
-                                       offset=args.probe_offset, seed=args.probe_seed)
-                if args.scope == "full":
-                    probes = []
+                probes = []
+                if args.scope in {"branches", "both"}:
+                    probes = select_probes(stream, start, stop, max_probes=args.max_probes, max_events=args.max_events,
+                                           separation=args.probe_separation, branch_steps=args.branch_steps,
+                                           offset=args.probe_offset, seed=args.probe_seed)
                 for name in args.methods:
                     for seed in args.seeds:
-                        full_count = len(policies(name, args.lr_scales, "when")) if args.scope in {"full", "both"} and args.suite in {"when", "both"} else 1
-                        branch_count = len(policies(name, args.lr_scales, args.suite))
+                        full_count = 1
+                        if args.scope == "prepare":
+                            full_count = 0
+                        elif args.scope in {"full", "both"} and args.suite in {"when", "both"}:
+                            full_count = len(policies(STUDY_METHODS[name].update_group_names, args.decision, "when"))
+                        branch_count = len(policies(STUDY_METHODS[name].update_group_names, args.decision, args.suite))
                         job = {"dataset": dataset_name, "method": name, "horizon": horizon, "seed": seed,
                                "online_origins": stop - start, "prefix_rows": stream.prefix_rows,
+                               "context_length": stream.dataset.context_length,
+                               "update_groups": list(STUDY_METHODS[name].update_group_names),
+                               "method_features": list(STUDY_METHODS[name].adaptation_feature_names),
                                "prefix_fraction": stream.prefix_rows / len(stream.phases),
                                "calibration_rows": stream.manifest["calibration_rows"], "probes": probes,
                                "source": str(stream.source.resolve()), "feature_columns": stream.dataset.feature_names,
@@ -244,7 +278,7 @@ def main(argv: list[str] | None = None) -> None:
                             run_job(args, stream, name, seed, profile, output / dataset_name / f"{name}_h{horizon}_seed{seed}", probes)
                             job["seconds"] = perf_counter() - job_began
                             job["status"] = "complete"
-        if not args.plan_only:
+        if not args.plan_only and args.scope != "prepare":
             from .analyze import analyze
             analysis_began = perf_counter()
             analyze(output)

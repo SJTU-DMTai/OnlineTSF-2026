@@ -93,6 +93,10 @@ class OneNetEnsemble(nn.Module):
 class OneNetMethod:
     """Train both OneNet experts and its long- and short-term ensemble weights."""
 
+    update_group_names = ("time", "variable", "decision")
+    incremental_feedback = False
+    adaptation_feature_names = ("expert_relative_gap", "combined_time_weight")
+
     def __init__(
         self,
         model: OneNetEnsemble,
@@ -119,6 +123,7 @@ class OneNetMethod:
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.model.to(self.device)
         self.n_inner = n_inner
+        self.last_gradient_steps = self.last_egd_steps = 0
         expert_parameters = list(model.cross_time.parameters()) + list(
             model.cross_variable.parameters()
         )
@@ -131,7 +136,11 @@ class OneNetMethod:
         # Scalar feedback delays preserve emission order, so a FIFO retains exact expert forecasts.
         self._pending_predictions: deque[tuple[Tensor, Tensor]] = deque()
 
-    def predict(self, context: Tensor) -> Tensor:
+    @property
+    def update_optimizers(self) -> tuple[Optimizer, ...]:
+        return self.expert_optimizer, self.decision_optimizer
+
+    def predict(self, context: Tensor, *, advance_state: bool = True) -> Tensor:
         self.model.eval()
         with torch.no_grad():
             cross_time, cross_variable = self.model.expert_predictions(
@@ -145,6 +154,26 @@ class OneNetMethod:
             )
         )
         return prediction.squeeze(0)
+
+    def discard_feedback(self, feedback: MethodFeedback) -> None:
+        self._pending_predictions.popleft()
+
+    def expert_errors(self, target) -> tuple[float, float] | None:
+        if not self._pending_predictions:
+            return None
+        time, variable = self._pending_predictions[0]
+        return (time - target).abs().mean().item(), (variable - target).abs().mean().item()
+
+    def adaptation_features(self, target=None, *, current_context=None) -> dict:
+        result = {"long_time_weight": self.model.weights(include_short_term=False).mean().item(),
+                  "combined_time_weight": self.model.weights().mean().item(),
+                  "expert_disagreement": None, "time_expert_mae": None, "variable_expert_mae": None}
+        if self._pending_predictions:
+            time, variable = self._pending_predictions[0]
+            result["expert_disagreement"] = (time - variable).abs().mean().item()
+            if target is not None:
+                result["time_expert_mae"], result["variable_expert_mae"] = self.expert_errors(target)
+        return result
 
     def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None) -> float | None:
         """EGD and bias refresh remain active even when neural parameters stay fixed."""
@@ -162,6 +191,7 @@ class OneNetMethod:
         target = feedback.target.unsqueeze(0).to(self.device)
         context = feedback.context.unsqueeze(0).to(self.device)
         adaptation_loss = self.loss_fn(feedback.prediction, feedback.target).detach().item()
+        self.last_gradient_steps = self.last_egd_steps = 0
         for _ in range(self.n_inner):
             self._update(context, target, cross_time, cross_variable, groups)
         return adaptation_loss if groups else None
@@ -206,6 +236,7 @@ class OneNetMethod:
                 losses.append(self.loss_fn(self.model.cross_variable(context), target))
             sum(losses).backward()
             self.expert_optimizer.step()
+            self.last_gradient_steps += 1
         self._update_ensemble(emitted_cross_time, emitted_cross_variable, target, train_decision="decision" in groups)
 
     def _update_ensemble(
@@ -225,6 +256,7 @@ class OneNetMethod:
                 short_prediction = short_weight.unsqueeze(1) * cross_time + (1.0 - short_weight.unsqueeze(1)) * cross_variable
                 self.loss_fn(short_prediction, target).backward()
                 self.decision_optimizer.step()
+                self.last_gradient_steps += 1
         self.model.short_bias.copy_(bias.detach().mean(dim=0))
 
         # Paper Eq. (2), with per-target horizon-mean squared error as expert loss.
@@ -233,3 +265,4 @@ class OneNetMethod:
             time_loss = (cross_time - target).square().mean(dim=(0, 1))
             variable_loss = (cross_variable - target).square().mean(dim=(0, 1))
             self.model.long_logits.add_(self.weight_learning_rate * (variable_loss - time_loss))
+            self.last_egd_steps += 1

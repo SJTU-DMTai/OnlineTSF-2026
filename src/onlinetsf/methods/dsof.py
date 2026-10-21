@@ -50,6 +50,12 @@ class DSOFModel(nn.Module):
 class DSOFMethod:
     """Replay complete windows, then adapt the student from one-step TD labels."""
 
+    # Student replay and fast TD share parameters but use separate optimizers.
+    update_group_names = ("teacher", "student", "online")
+    incremental_feedback = True
+    adaptation_feature_names = ("teacher_fast_error_ratio", "student_correction_gain")
+    last_egd_steps = 0
+
     def __init__(
         self,
         model: DSOFModel,
@@ -86,11 +92,77 @@ class DSOFMethod:
         self._complete_count = 0
         self._partial: dict[int, tuple[Tensor, Tensor]] = {}
         self.last_gradient_steps = 0
+        self._feature_window, self._error_window = 32, 128
+        self._teacher_one_step_errors: deque[float] = deque(maxlen=128)
+        self._correction_errors: deque[tuple[float, float]] = deque(maxlen=32)
+        self._pending_teacher_predictions: deque[Tensor] = deque()
+        self._diagnostic_partial: dict[int, tuple[Tensor, float, float, int]] = {}
+        self._latest_teacher_prediction: Tensor | None = None
+        self._latest_first_step_observed = False
 
-    def predict(self, context: Tensor) -> Tensor:
+    @property
+    def update_optimizers(self) -> tuple[torch.optim.Optimizer, ...]:
+        return self.teacher_optimizer, self.student_optimizer, self.online_optimizer
+
+    def predict(self, context: Tensor, *, advance_state: bool = True) -> Tensor:
         self.model.eval()
         with torch.no_grad():
-            return self.model(context.unsqueeze(0).to(self.device)).squeeze(0)
+            values = context.unsqueeze(0).to(self.device)
+            teacher = self.model.teacher(values)
+            prediction = teacher + self.model.residual(values, teacher)
+        cached = teacher.squeeze(0).detach().cpu().clone()
+        self._pending_teacher_predictions.append(cached)
+        self._latest_teacher_prediction = cached
+        self._latest_first_step_observed = False
+        return prediction.squeeze(0)
+
+    def discard_feedback(self, feedback: MethodFeedback) -> None:
+        self._record_forecast_feedback(feedback)
+        self._partial.pop(feedback.index, None)
+
+    def expert_errors(self, target) -> None:
+        return None
+
+    def configure_feature_history(self, feature_window: int, error_window: int) -> None:
+        self._feature_window, self._error_window = feature_window, error_window
+        self._teacher_one_step_errors = deque(self._teacher_one_step_errors, maxlen=error_window)
+        self._correction_errors = deque(self._correction_errors, maxlen=feature_window)
+
+    def adaptation_features(self, target=None, *, current_context=None) -> dict:
+        errors = list(self._teacher_one_step_errors)
+        # At a pre-feedback decision the latest observation is already available,
+        # even when older origins' partial feedback is delivered first.
+        if current_context is not None and self._latest_teacher_prediction is not None and not self._latest_first_step_observed:
+            actual = current_context[-1, self.model.target_indices].detach().cpu()
+            errors.append((self._latest_teacher_prediction[0] - actual).abs().mean().item())
+        short, long = errors[-self._feature_window:], errors[-self._error_window:]
+        ratio = ((sum(short) / len(short)) / max(sum(long) / len(long), 1e-10) if short and long else None)
+        pairs = self._correction_errors
+        gain = None
+        if pairs:
+            teacher_mae = sum(teacher for teacher, _ in pairs) / len(pairs)
+            final_mae = sum(final for _, final in pairs) / len(pairs)
+            gain = (teacher_mae - final_mae) / (teacher_mae + 1e-10)
+        return {"teacher_fast_error_ratio": ratio, "student_correction_gain": gain}
+
+    def _record_forecast_feedback(self, feedback: MethodFeedback) -> None:
+        """Score immutable issued forecasts, including frozen and terminal labels."""
+        record = self._diagnostic_partial.pop(feedback.index, None)
+        if record is None:
+            record = self._pending_teacher_predictions.popleft(), 0.0, 0.0, 0
+        teacher, teacher_sum, final_sum, count = record
+        mask = feedback.observed_mask
+        teacher_sum += (teacher - feedback.target)[mask].abs().sum().item()
+        final_sum += (feedback.prediction - feedback.target)[mask].abs().sum().item()
+        count += int(mask.sum())
+        if mask[0].all():
+            self._teacher_one_step_errors.append((teacher[0] - feedback.target[0]).abs().mean().item())
+            if teacher is self._latest_teacher_prediction:
+                self._latest_first_step_observed = True
+        if count == feedback.target.numel():
+            self._correction_errors.append((teacher_sum / count, final_sum / count))
+        else:
+            self._diagnostic_partial[feedback.index] = teacher, teacher_sum, final_sum, count
 
     def train_batch(self, context: Tensor, target: Tensor) -> float:
         """Supervise the teacher and residual student during initial training."""
@@ -101,6 +173,12 @@ class DSOFMethod:
         self.replay.clear()
         self._partial.clear()
         self._complete_count = 0
+        self._teacher_one_step_errors.clear()
+        self._correction_errors.clear()
+        self._pending_teacher_predictions.clear()
+        self._diagnostic_partial.clear()
+        self._latest_teacher_prediction = None
+        self._latest_first_step_observed = False
         self.teacher_optimizer.state.clear()
         self.student_optimizer.state.clear()
         self.online_optimizer.state.clear()
@@ -164,6 +242,7 @@ class DSOFMethod:
         if groups - {"teacher", "student", "online"}:
             raise ValueError("unknown DSOF update group")
         self.last_gradient_steps = 0
+        self._record_forecast_feedback(feedback)
         # Flush scores final forecasts after replay; it has no new observed context.
         if feedback.current_context is None:
             return None

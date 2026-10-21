@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 
 import torch
@@ -91,6 +92,7 @@ class AdaptiveConv1d(nn.Module):
         self.register_buffer("adaptation_ema_initialized", torch.tensor(False))
         self.register_buffer("memory_trigger", torch.tensor(False))
         self.register_buffer("memory_interactions", torch.tensor(0, dtype=torch.long))
+        self.last_gradient_alignment: float | None = None
 
     def _adaptation(self, advance_state: bool) -> tuple[Tensor, Tensor, Tensor]:
         chunks = self.gradient_ema.view(self.n_chunks, -1)
@@ -172,7 +174,10 @@ class AdaptiveConv1d(nn.Module):
                 dim=0,
                 eps=1e-6,
             )
-            if similarity.item() < -self.memory_threshold:
+            alignment = similarity.item()
+            valid = (self.fast_gradient_ema.square().sum() > 1e-12) & (self.gradient_ema.square().sum() > 1e-12)
+            self.last_gradient_alignment = alignment if valid.item() else None
+            if alignment < -self.memory_threshold:
                 self.memory_trigger.fill_(True)
         self.gradient_ema.mul_(self.gradient_decay).add_(
             gradient, alpha=1.0 - self.gradient_decay
@@ -303,6 +308,10 @@ class FSNetTCN(ForecastBackbone):
 class FSNetMethod:
     """Own FSNet prediction and official-style online feedback updates."""
 
+    update_group_names = ("base", "adapter", "head")
+    incremental_feedback = False
+    adaptation_feature_names = ("gradient_alignment", "recent_memory_trigger_rate")
+
     def __init__(
         self,
         model: FSNetTCN,
@@ -323,14 +332,35 @@ class FSNetMethod:
         self.optimizer = optimizer or AdamW(model.parameters(), lr=learning_rate)
         self.loss_fn = loss_fn or nn.MSELoss()
         self.n_inner = n_inner
+        self.last_gradient_steps = self.last_egd_steps = 0
+        self._gradient_alignment: float | None = None
+        self._memory_trigger_rates: deque[float] = deque(maxlen=32)
 
-    def predict(self, context: Tensor) -> Tensor:
+    @property
+    def update_optimizers(self) -> tuple[Optimizer, ...]:
+        return (self.optimizer,)
+
+    def predict(self, context: Tensor, *, advance_state: bool = True) -> Tensor:
         """Forecast one context using the current adapter and memory state."""
 
         self.model.eval()
         with torch.no_grad():
-            prediction = self.model(context.unsqueeze(0).to(self.device), advance_state=True)
+            prediction = self.model(context.unsqueeze(0).to(self.device), advance_state=advance_state)
         return prediction.squeeze(0)
+
+    def discard_feedback(self, feedback: MethodFeedback) -> None:
+        pass
+
+    def expert_errors(self, target) -> None:
+        return None
+
+    def configure_feature_history(self, feature_window: int, error_window: int) -> None:
+        self._memory_trigger_rates = deque(self._memory_trigger_rates, maxlen=feature_window)
+
+    def adaptation_features(self, target=None, *, current_context=None) -> dict:
+        rates = self._memory_trigger_rates
+        return {"gradient_alignment": self._gradient_alignment,
+                "recent_memory_trigger_rate": sum(rates) / len(rates) if rates else None}
 
     def parameter_groups(self) -> dict[str, list[nn.Parameter]]:
         """Disjoint base, gradient-adapter, and prediction-head parameters."""
@@ -350,6 +380,7 @@ class FSNetMethod:
 
         if not feedback.observed_mask.all():
             raise ValueError("FSNetMethod requires complete-horizon feedback")
+        self.last_gradient_steps = self.last_egd_steps = 0
         groups = self.parameter_groups()
         selected = frozenset(groups) if update_groups is None else update_groups
         if selected - groups.keys():
@@ -362,6 +393,7 @@ class FSNetMethod:
         context = feedback.context.unsqueeze(0).to(self.device)
         target = feedback.target.unsqueeze(0).to(self.device)
         losses: list[float] = []
+        layers = [module for module in self.model.modules() if isinstance(module, AdaptiveConv1d)]
         for inner_step in range(self.n_inner):
             self.optimizer.zero_grad(set_to_none=True)
             prediction = self.model(context, advance_state=inner_step > 0)
@@ -371,11 +403,17 @@ class FSNetMethod:
             loss.backward()
             # Memory observes real gradients even when base parameters stay fixed.
             self.model.record_gradients()
+            valid = [layer for layer in layers if layer.last_gradient_alignment is not None]
+            if valid:
+                self._gradient_alignment = sum(layer.last_gradient_alignment for layer in valid) / len(valid)
+                self._memory_trigger_rates.append(sum(layer.last_gradient_alignment < -layer.memory_threshold
+                                                      for layer in valid) / len(valid))
             for name, parameters in groups.items():
                 if name not in selected:
                     for parameter in parameters:
                         parameter.grad = None
             if selected:
                 self.optimizer.step()
+                self.last_gradient_steps += 1
             losses.append(loss.detach().item())
         return sum(losses) / len(losses) if selected else None

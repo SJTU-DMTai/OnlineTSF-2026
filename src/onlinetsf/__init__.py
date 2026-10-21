@@ -1,68 +1,47 @@
-# -*- coding: utf-8 -*-
-"""Minimal components for online time-series forecasting experiments."""
+"""Online forecasting components, imported on first use."""
 
-from .data import SlidingWindowDataset, load_benchmark_dataset
-from .drift import ADWINDetector, KSWINDetector, PageHinkleyDetector
-from .forecasting import (
-    DLinearForecastBackbone,
-    LinearForecastBackbone,
-    LSTMForecastBackbone,
-    PatchTSTForecastBackbone,
-    TCNForecastBackbone,
-    TimeTCNForecastBackbone,
-)
-from .online import (
-    FeedbackEvent,
-    ForecastEmission,
-    MethodFeedback,
-    OnlineExecutor,
-    OnlineMethod,
-    OnlineMetrics,
-    OnlineRun,
-    OnlineStep,
-)
-from .methods import (
-    AdaptiveConv1d,
-    DSOFMethod,
-    DSOFModel,
-    FSNetMethod,
-    FSNetTCN,
-    OGDMethod,
-    OneNetEnsemble,
-    OneNetMethod,
-    UnderCaliMethod,
-)
-from .adaptation import ControlledMethod, Policy
+from importlib import import_module
 
-__all__ = [
-    "ControlledMethod",
-    "Policy",
-    "ADWINDetector",
-    "AdaptiveConv1d",
-    "DLinearForecastBackbone",
-    "DSOFMethod",
-    "DSOFModel",
-    "FSNetMethod",
-    "FSNetTCN",
-    "KSWINDetector",
-    "LinearForecastBackbone",
-    "LSTMForecastBackbone",
-    "PatchTSTForecastBackbone",
-    "TCNForecastBackbone",
-    "TimeTCNForecastBackbone",
-    "PageHinkleyDetector",
-    "FeedbackEvent",
-    "ForecastEmission",
-    "MethodFeedback",
-    "OnlineExecutor",
-    "OnlineMethod",
-    "OGDMethod",
-    "OneNetEnsemble",
-    "OneNetMethod",
-    "UnderCaliMethod",
-    "OnlineMetrics",
-    "OnlineRun",
-    "OnlineStep",
-    "SlidingWindowDataset",
-    "load_benchmark_dataset",
-]
+
+_EXPORTS = {
+    'SlidingWindowDataset': '.data',
+    'load_benchmark_dataset': '.data',
+    'ADWINDetector': '.drift',
+    'KSWINDetector': '.drift',
+    'PageHinkleyDetector': '.drift',
+    'DLinearForecastBackbone': '.forecasting',
+    'LinearForecastBackbone': '.forecasting',
+    'LSTMForecastBackbone': '.forecasting',
+    'PatchTSTForecastBackbone': '.forecasting',
+    'TCNForecastBackbone': '.forecasting',
+    'TimeTCNForecastBackbone': '.forecasting',
+    'FeedbackEvent': '.online',
+    'ForecastEmission': '.online',
+    'MethodFeedback': '.online',
+    'OnlineExecutor': '.online',
+    'OnlineMethod': '.online',
+    'OnlineMetrics': '.online',
+    'OnlineRun': '.online',
+    'OnlineStep': '.online',
+    'AdaptiveConv1d': '.methods',
+    'DSOFMethod': '.methods',
+    'DSOFModel': '.methods',
+    'FSNetMethod': '.methods',
+    'FSNetTCN': '.methods',
+    'OGDMethod': '.methods',
+    'OneNetEnsemble': '.methods',
+    'OneNetMethod': '.methods',
+    'UnderCaliMethod': '.methods',
+    'ControlledMethod': '.decision.control',
+    'Policy': '.decision.actions',
+    'AdaptiveMethod': '.decision.runtime',
+}
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    value = getattr(import_module(_EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value

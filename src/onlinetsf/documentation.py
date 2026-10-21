@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
@@ -43,6 +44,15 @@ def write_experiment_documents(
     stride = data.get("stride", 1)
     context_length = data["context_length"]
     horizon = data["horizon"]
+    if run.decisions:
+        with (directory / "decisions.jsonl").open("w", encoding="utf-8") as handle:
+            for decision in run.decisions:
+                handle.write(json.dumps(decision, ensure_ascii=False, allow_nan=False) + "\n")
+        costs = {name: getattr(run.metrics, name) for name in (
+            "gradient_steps", "formula_steps", "gradient_update_clocks", "decision_count",
+            "decision_seconds", "update_seconds", "online_evaluation_seconds",
+        )}
+        (directory / "decision_costs.json").write_text(json.dumps(costs, indent=2), encoding="utf-8")
     with (directory / "config.txt").open("w", encoding="utf-8", newline="\n") as handle:
         yaml.safe_dump(config, handle, sort_keys=False)
 

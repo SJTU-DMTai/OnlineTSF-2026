@@ -18,6 +18,11 @@ LossFunction = Callable[[Tensor, Tensor], Tensor]
 class OGDMethod:
     """Adapt a standard PyTorch forecaster only when feedback is available."""
 
+    update_group_names = ("model",)
+    incremental_feedback = True
+    adaptation_feature_names = ()
+    last_egd_steps = 0
+
     def __init__(
         self,
         model: nn.Module,
@@ -36,6 +41,7 @@ class OGDMethod:
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.update_steps = update_steps
+        self.last_gradient_steps = 0
         self.device = torch.device(device) if device is not None else self._model_device()
         self.model.to(self.device)
 
@@ -48,13 +54,32 @@ class OGDMethod:
             return buffer.device
         return torch.device("cpu")
 
-    def predict(self, context: Tensor) -> Tensor:
+    @property
+    def update_optimizers(self) -> tuple[Optimizer, ...]:
+        return (self.optimizer,) if self.optimizer is not None else ()
+
+    def predict(self, context: Tensor, *, advance_state: bool = True) -> Tensor:
         self.model.eval()
         with torch.no_grad():
             prediction = self.model(context.unsqueeze(0).to(self.device))
         return prediction.squeeze(0)
 
-    def on_feedback(self, feedback: MethodFeedback) -> float | None:
+    def discard_feedback(self, feedback: MethodFeedback) -> None:
+        pass
+
+    def expert_errors(self, target) -> None:
+        return None
+
+    def adaptation_features(self, target=None, *, current_context=None) -> dict:
+        return {}
+
+    def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None) -> float | None:
+        self.last_gradient_steps = 0
+        if update_groups is not None:
+            if update_groups - {"model"}:
+                raise ValueError("unknown OGD update group")
+            if not update_groups:
+                return None
         if self.optimizer is None or self.loss_fn is None:
             return None
 
@@ -71,5 +96,6 @@ class OGDMethod:
                 raise ValueError("loss_fn must return a scalar tensor")
             loss.backward()
             self.optimizer.step()
+            self.last_gradient_steps += 1
             losses.append(loss.detach().item())
         return sum(losses) / len(losses)

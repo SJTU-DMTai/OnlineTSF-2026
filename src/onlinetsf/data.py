@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
@@ -50,6 +51,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         feature_names: Sequence[str] | None = None,
         time_features: Tensor | None = None,
         stride: int = 1,
+        keep_decision_inputs: bool = False,
     ) -> None:
         if values.ndim != 2:
             raise ValueError("values must have shape [time, features]")
@@ -60,6 +62,9 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
 
         # A sliding sample contains visible history (context) followed by its future target.
         self.values = values.to(dtype=torch.float32)
+        # Retain raw CSV precision before conversion for the prediction model.
+        self.decision_values = (np.array(values.detach().cpu().numpy(), dtype=np.float64, order="F", copy=True)
+                                if keep_decision_inputs else None)
         self.time_features = time_features
         self.context_length = context_length
         self.horizon = horizon
@@ -116,6 +121,11 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         if train_windows == 0:
             return
         train_end = (train_windows - 1) * self.stride + self.context_length + self.horizon
+        if self.decision_values is not None:
+            prefix = self.decision_values[:train_end]
+            scale = prefix.std(axis=0)
+            scale[scale < 1e-6] = 1.0
+            self.decision_values = (self.decision_values - prefix.mean(axis=0)) / scale
         training = self.values[:train_end]
         mean = training.mean(dim=0)
         std = training.std(dim=0, unbiased=False)
@@ -134,6 +144,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
         feature_columns: Sequence[str] | None = None,
         include_time_features: bool = False,
         stride: int = 1,
+        keep_decision_inputs: bool = False,
     ) -> "SlidingWindowDataset":
         """Load numeric columns from a benchmark-style CSV file.
 
@@ -190,7 +201,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
                 dtype=torch.float32,
             )
         return cls(
-            torch.tensor(rows, dtype=torch.float32),
+            torch.tensor(rows, dtype=torch.float64 if keep_decision_inputs else torch.float32),
             context_length=context_length,
             horizon=horizon,
             target_indices=target_indices,
@@ -198,6 +209,7 @@ class SlidingWindowDataset(Dataset[tuple[Tensor, Tensor]]):
             feature_names=columns,
             time_features=time_features,
             stride=stride,
+            keep_decision_inputs=keep_decision_inputs,
         )
 
 
@@ -212,6 +224,7 @@ def load_benchmark_dataset(
     target_columns: Sequence[str] | None = None,
     feature_columns: Sequence[str] | None = None,
     include_time_features: bool = False,
+    keep_decision_inputs: bool = False,
 ) -> SlidingWindowDataset:
     """Load datasets."""
 
@@ -233,4 +246,5 @@ def load_benchmark_dataset(
             and (spec.time_column if time_column is None else time_column) == "date"
         ),
         stride=stride,
+        keep_decision_inputs=keep_decision_inputs,
     )

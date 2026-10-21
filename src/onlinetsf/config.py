@@ -99,6 +99,8 @@ def load_config(
         if key not in data:
             raise ValueError(f"config.data.{key} is required")
     data_path = Path(data["path"])
+    if "include_time_features" in data and not isinstance(data["include_time_features"], bool):
+        raise ValueError("config.data.include_time_features must be a boolean")
     if not data_path.is_absolute():
         data["path"] = str((source.parent / data_path).resolve())
 
@@ -239,6 +241,26 @@ def load_config(
         raise ValueError("dsof requires online.feedback_delay: [1, ..., horizon]")
     if method_name in {"fsnet", "onenet", "under_cali"} and isinstance(feedback_delay, list):
         raise ValueError(f"{method_name} requires a scalar complete-feedback delay")
+
+    decision = config.get("decision")
+    if decision is not None:
+        if not isinstance(decision, dict) or not isinstance(decision.get("selector"), str):
+            raise ValueError("config.decision requires a selector artifact path")
+        decision = dict(decision)
+        artifact = Path(decision["selector"])
+        decision["selector"] = str((source.parent / artifact).resolve()) if not artifact.is_absolute() else str(artifact)
+        decision.setdefault("controller", "policy_full")
+        if decision["controller"] not in {"policy_full", "policy_data", "native", "best_fixed"}:
+            raise ValueError("unknown config.decision.controller")
+        if method_name == "under_cali":
+            raise ValueError("under_cali has not implemented decision update capabilities")
+        if data.get("stride", 1) != 1:
+            raise ValueError("adaptive decisions require data.stride: 1")
+        if isinstance(feedback_delay, int) and feedback_delay < data["horizon"]:
+            raise ValueError("adaptive complete feedback must wait for the whole forecast horizon")
+        if isinstance(feedback_delay, list) and feedback_delay != list(range(1, data["horizon"] + 1)):
+            raise ValueError("adaptive partial feedback requires delays [1, ..., horizon]")
+        config["decision"] = decision
 
     detector_name = drift.get("name")
     if detector_name not in DRIFT_DETECTORS:

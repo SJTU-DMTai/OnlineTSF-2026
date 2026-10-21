@@ -8,6 +8,7 @@ import csv
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -20,6 +21,9 @@ from time import perf_counter
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+if __name__ == "__main__":
+    print(f"Starting drift labeling (PID={os.getpid()}): loading Python dependencies", flush=True)
 
 import numpy as np
 import yaml
@@ -46,7 +50,7 @@ def write_csv(path: Path, columns: list[str], rows) -> None:
 
 
 def load_csv(path: Path, time_column: str, max_rows: int | None):
-    """Read unchanged source text and a finite numeric matrix with regular timestamps."""
+    """Preserve row order and infer the nominal period despite duplicate times or gaps."""
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         columns = reader.fieldnames
@@ -67,9 +71,15 @@ def load_csv(path: Path, time_column: str, max_rows: int | None):
         raise ValueError(f"{path}: numeric data contains missing or non-finite values")
     dates = [datetime.fromisoformat(row[time_column]) for row in rows]
     deltas = np.asarray([(right - left).total_seconds() for left, right in zip(dates, dates[1:])])
-    if deltas[0] <= 0 or not np.all(deltas == deltas[0]):
-        raise ValueError(f"{path}: timestamps must be strictly increasing and regularly sampled")
-    return columns, features, rows, values, float(deltas[0])
+    if np.any(deltas < 0) or not np.any(deltas > 0):
+        raise ValueError(f"{path}: timestamps must be nondecreasing with at least one positive interval")
+    periods, counts = np.unique(deltas[deltas > 0], return_counts=True)
+    period_seconds = float(periods[counts.argmax()])
+    irregular = int(np.count_nonzero(deltas != period_seconds))
+    if irregular:
+        print(f"{path}: ignoring {irregular} timestamp discontinuities; preserving all rows; "
+              f"nominal period={period_seconds:g}s", flush=True)
+    return columns, features, rows, values, period_seconds
 
 
 def detect_features(name: str, standardized: np.ndarray, parameters: dict, calibration_rows: int,
@@ -78,7 +88,8 @@ def detect_features(name: str, standardized: np.ndarray, parameters: dict, calib
     began = perf_counter()
     if name != "abcd" and workers > 1:
         chunks = np.array_split(standardized, min(workers, standardized.shape[1]), axis=1)
-        with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+        # The dependency checks start a JVM; Linux workers must not fork that JVM.
+        with ProcessPoolExecutor(max_workers=len(chunks), mp_context=multiprocessing.get_context("spawn")) as pool:
             futures = [pool.submit(detect_features, name, chunk, parameters, calibration_rows, 1, False)
                        for chunk in chunks]
             results = []
@@ -290,6 +301,7 @@ def annotate_dataset(dataset: str, source: Path, output: Path, profiles: dict, a
         "source_input": "numeric_observations_only_no_forecasts_or_forecast_residuals",
         "feature_columns": features, "time_column": args.time_column, "rows": len(rows),
         "max_rows": args.max_rows, "sample_period_seconds": period_seconds,
+        "time_axis_policy": "original_row_order_with_modal_positive_timestamp_interval",
         "calibration_rows": calibration_rows, "evaluated_rows": evaluated,
         "normalization": {"formula": "sigmoid((value-prefix_mean)/prefix_std)",
                           "mean": mean.tolist(), "scale": scale.tolist(),
@@ -363,8 +375,11 @@ def main():
     with args.profiles.open("r", encoding="utf-8") as handle:
         profiles = yaml.safe_load(handle)
     # Check dependencies before starting long scalar-detector runs or writing output.
+    print("Initializing SEED / Java", flush=True)
     CapyMOADetector("seed", **profiles["detectors"]["seed"].get("parameters", {}))
+    print("Initializing ABCD", flush=True)
     CapyMOADetector("abcd", **profiles["detectors"]["abcd"].get("parameters", {}))
+    print("Detectors ready; reading datasets", flush=True)
     output = args.output or PROJECT_ROOT / "runs" / datetime.now(timezone.utc).strftime("real-drift-labels-%Y%m%dT%H%M%SZ")
     output.mkdir(parents=True, exist_ok=False)
     summaries = []

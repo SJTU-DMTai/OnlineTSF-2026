@@ -31,7 +31,7 @@ def load_stream(directory: Path, context_length: int, horizon: int, prefix_rows:
         raise ValueError("manifest feature_columns must contain original measurements only")
     dataset = SlidingWindowDataset.from_csv(
         source, context_length, horizon, time_column=manifest["time_column"],
-        feature_columns=features, target_columns=features, include_time_features=False,
+        feature_columns=features, target_columns=features, include_time_features=False, keep_decision_inputs=True,
     )
     phases = []
     with source.open(encoding="utf-8", newline="") as handle:

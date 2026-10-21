@@ -1,0 +1,19 @@
+# Shared configuration for historical collection, fitting and online inference.
+interval: 128
+data_features: [channel_shift_fraction, volatility_ratio, autocorrelation_shift]
+feedback_features: [mae_32, error_ratio, residual_bias_ratio]
+# null selects diagnostics declared by the current online method; [] disables them.
+method_features: null
+feature_window: 32
+error_window: 128
+
+# 17 actions for a method with three update groups, including native.
+periods: [1, 4, 16]
+lr_scales: [0.3, 1.0, 3.0]
+modes: [frozen, no_grad]
+# null enumerates proper subsets; [] disables partial updates.
+# A method-specific list, e.g. [[base], [adapter, head]], selects explicit subsets.
+group_subsets: null
+
+max_depth: 2
+min_samples_leaf: 4

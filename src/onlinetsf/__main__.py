@@ -106,9 +106,10 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         time_column=data.get("time_column"),
         target_columns=data.get("target_columns"),
         feature_columns=data.get("feature_columns"),
-        include_time_features=config["forecasting"]["backbone"] in {
+        include_time_features=data.get("include_time_features", config["forecasting"]["backbone"] in {
             "tcn", "fsnet_tcn", "onenet_tcn"
-        },
+        }),
+        keep_decision_inputs=config.get("decision") is not None,
     )
     train_windows = int(len(dataset) * config["offline"]["train_ratio"])
     dataset.standardize(train_windows)
@@ -117,6 +118,12 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
     data["num_features"] = dataset.num_features
     model = build_backbone(config, dataset.num_features, dataset.num_targets, dataset.target_indices)
     method = build_method(config, model)
+    decision = config.get("decision")
+    adaptive = None
+    if decision is not None:
+        from .decision.runtime import AdaptiveMethod
+
+        adaptive = AdaptiveMethod.from_file(method, decision["selector"], decision.get("controller", "policy_full"))
     setup_seconds = perf_counter() - experiment_started
     offline_started = perf_counter()
     offline_stop = _run_offline_training(dataset, method, config["offline"])
@@ -124,6 +131,8 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         method.pretrain_uncertainty(dataset, offline_stop, config["offline"]["batch_size"])
     offline_training_seconds = perf_counter() - offline_started
     online = config["online"]
+    if adaptive is not None:
+        method = adaptive
     executor = OnlineExecutor(
         method,
         feedback_delay=online["feedback_delay"],
@@ -139,9 +148,7 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
     if offline_stop:
         online_start += (data["horizon"] - 1) // data.get("stride", 1)
     run = executor.run_dataset(
-        dataset,
-        start=max(online_start, online.get("start", 0)),
-        stop=online.get("stop"),
+        dataset, start=max(online_start, online.get("start", 0)), stop=online.get("stop"),
     )
     online_evaluation_seconds = perf_counter() - online_started
     metrics = replace(
@@ -151,6 +158,10 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         online_evaluation_seconds=online_evaluation_seconds,
         total_seconds=perf_counter() - experiment_started,
     )
+    if decision is not None:
+        metrics = replace(metrics, gradient_steps=method.gradient_steps, formula_steps=method.egd_steps,
+                          gradient_update_clocks=method.gradient_update_clocks, decision_count=method.decision_count,
+                          decision_seconds=method.decision_seconds, update_seconds=method.update_seconds)
     return replace(run, metrics=metrics)
 
 

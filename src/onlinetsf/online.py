@@ -86,6 +86,12 @@ class OnlineMetrics:
     online_evaluation_seconds: float | None = None
     drift_detection_seconds: float | None = None
     total_seconds: float | None = None
+    gradient_steps: int | None = None
+    formula_steps: int | None = None
+    gradient_update_clocks: int | None = None
+    decision_count: int | None = None
+    decision_seconds: float | None = None
+    update_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +100,7 @@ class OnlineRun:
 
     metrics: OnlineMetrics
     events: tuple[FeedbackEvent, ...]
+    decisions: tuple[dict, ...] = ()
 
 
 @dataclass
@@ -182,7 +189,7 @@ class OnlineExecutor:
             mean_adaptation_loss=mean_adaptation_loss,
         )
 
-    def step(self, index: int, context: Tensor, target: Tensor) -> OnlineStep:
+    def step(self, index: int, context: Tensor, target: Tensor, *, decision_context=None) -> OnlineStep:
         """Deliver due labels, forecast, then schedule this forecast's labels."""
 
         if self._last_index is not None and index <= self._last_index:
@@ -190,6 +197,8 @@ class OnlineExecutor:
         if context.ndim != 2 or target.ndim != 2:
             raise ValueError("context and target must have shapes [time, features]")
 
+        if hasattr(self.method, "on_observation"):
+            self.method.on_observation(index, context if decision_context is None else decision_context)
         feedback = list(self._deliver_through(index, context))
         prediction = self.method.predict(context.detach().clone()).detach().to(device="cpu").clone()
         if prediction.shape != target.shape:
@@ -235,12 +244,22 @@ class OnlineExecutor:
             raise ValueError("start and stop must select a valid dataset slice")
 
         first_event = len(self._events)
+        decisions = []
+        decision_values = getattr(dataset, "decision_values", None)
         for index in range(start, stop):
             context, target = dataset[index]
-            self.step(index, context, target)
+            if decision_values is None:
+                self.step(index, context, target)
+            else:
+                raw_start = index * dataset.stride
+                self.step(index, context, target,
+                          decision_context=decision_values[raw_start:raw_start + dataset.context_length])
+            decision = getattr(self.method, "last_decision", None)
+            if decision is not None:
+                decisions.append(decision)
         if flush:
             self.flush()
-        return OnlineRun(metrics=self.metrics, events=tuple(self._events[first_event:]))
+        return OnlineRun(metrics=self.metrics, events=tuple(self._events[first_event:]), decisions=tuple(decisions))
 
     def state_dict(self) -> dict[str, Any]:
         """Return scheduling, metrics, and pending feedback for checkpointing."""
