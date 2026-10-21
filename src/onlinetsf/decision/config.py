@@ -26,11 +26,14 @@ class DecisionConfig:
     modes: tuple[str, ...] = ("frozen", "no_grad")
     # None enumerates proper, nonempty subsets of the method's update groups.
     group_subsets: tuple[tuple[str, ...], ...] | None = None
-    max_depth: int = 2
-    min_samples_leaf: int = 4
+    data_max_depth: int = 2
+    data_min_samples_leaf: int = 4
+    full_max_depth: int = 2
+    full_min_samples_leaf: int = 8
 
     def __post_init__(self) -> None:
-        for name in ("interval", "feature_window", "error_window", "max_depth", "min_samples_leaf"):
+        for name in ("interval", "feature_window", "error_window", "data_max_depth",
+                     "data_min_samples_leaf", "full_max_depth", "full_min_samples_leaf"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"decision.{name} must be a positive integer")
@@ -50,6 +53,12 @@ class DecisionConfig:
     @classmethod
     def from_dict(cls, record: dict) -> DecisionConfig:
         values = dict(record)
+        # Preserve the training settings of existing collected data and saved selectors.
+        for name in ("max_depth", "min_samples_leaf"):
+            if name in values:
+                shared = values.pop(name)
+                for policy in ("data", "full"):
+                    values.setdefault(f"{policy}_{name}", shared)
         for name in ("data_features", "feedback_features", "method_features", "periods", "lr_scales", "modes"):
             if name in values and values[name] is not None:
                 values[name] = tuple(values[name])
@@ -76,3 +85,7 @@ class DecisionConfig:
         if not full or not self.data_features:
             raise ValueError("policy_full and policy_data must each have at least one feature")
         return {"policy_full": full, "policy_data": list(self.data_features)}
+
+    def tree_parameters(self, controller: str) -> dict[str, int]:
+        policy = {"policy_full": "full", "policy_data": "data"}[controller]
+        return {name: getattr(self, f"{policy}_{name}") for name in ("max_depth", "min_samples_leaf")}

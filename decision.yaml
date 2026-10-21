@@ -15,5 +15,8 @@ modes: [frozen, no_grad]
 # A method-specific list, e.g. [[base], [adapter, head]], selects explicit subsets.
 group_subsets: null
 
-max_depth: 2
-min_samples_leaf: 4
+# Independent selector trees; min_samples_leaf counts training states per leaf.
+data_max_depth: 2
+data_min_samples_leaf: 4
+full_max_depth: 2
+full_min_samples_leaf: 4

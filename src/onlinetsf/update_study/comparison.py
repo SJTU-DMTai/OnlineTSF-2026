@@ -3,12 +3,15 @@
 Frozen never adapts after offline training. Oracle uses future labels to choose
 one action per block, so it is a hindsight reference, not a deployable policy or
 an exact global optimum. Search costs and executed-update costs are separate.
+With --reuse-comparison, frozen and greedy Oracle are also read from a completed
+comparison with matching inputs, actions, metric and test-start state.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from time import perf_counter
 
@@ -18,32 +21,8 @@ import pandas as pd
 from ..decision.config import DecisionConfig, FEATURE_SCHEMA_VERSION
 from .policy_support import (
     DEFAULT_ANNOTATIONS, DEFAULT_RUNS, file_sha256, find_job,
-    plot_forecasts, save_json, score_action, oracle_decision, summarize_decisions,
+    load_existing_results, plot_forecasts, save_json, score_action, oracle_decision, summarize_decisions,
 )
-
-
-def load_existing_results(experiment: Path, controller: str, start: int, steps: int) -> tuple[pd.DataFrame, dict]:
-    """Read measured experiment-2 results without executing any forecasting method."""
-    forecasts = pd.read_csv(experiment / controller / "forecasts.csv")
-    if len(forecasts) != steps or not np.array_equal(forecasts.forecast_index, np.arange(start, start + steps)):
-        raise ValueError(f"{controller}: saved forecasts do not cover the test interval")
-    summaries = pd.read_csv(experiment / "trajectory_summary.csv")
-    selected = summaries[summaries.controller == controller]
-    if len(selected) != 1:
-        raise ValueError(f"expected one saved summary for {controller}")
-    summary = selected.iloc[0].to_dict()
-    for metric in ["mae", "mse"]:
-        if not np.isclose(summary[metric], forecasts[metric].mean(), rtol=1e-7, atol=1e-9):
-            raise ValueError(f"{controller}: saved summary and forecasts disagree")
-    updates = pd.read_csv(experiment / controller / "updates.csv")
-    update_clocks = 0
-    if not updates.empty:
-        increments = updates.gradient_steps.diff().fillna(updates.gradient_steps.iloc[0])
-        update_clocks = updates.loc[increments > 0, "available_at"].nunique()
-    summary.update(gradient_update_clocks=int(update_clocks), update_seconds=float(updates.seconds.sum()),
-                   result_source="experiment2_saved", executed_in_comparison=False)
-    summary.pop("seconds")
-    return forecasts, summary
 
 
 def run_comparison(replay, stream, start: int, steps: int, interval: int,
@@ -131,6 +110,8 @@ def main(argv: list[str] | None = None) -> None:
     began = perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment", type=Path, required=True, help="completed experiment-2 directory")
+    parser.add_argument("--reuse-comparison", type=Path,
+                        help="completed stage-4 directory; reuse frozen and greedy Oracle without model execution")
     parser.add_argument("--runs", type=Path, default=DEFAULT_RUNS)
     parser.add_argument("--annotations", type=Path, default=DEFAULT_ANNOTATIONS)
     parser.add_argument("--controller", choices=["policy_full", "policy_data"], default="policy_full",
@@ -199,6 +180,36 @@ def main(argv: list[str] | None = None) -> None:
             "controllers": ["frozen", "native", "best_fixed", "policy_full", "policy_data", "oracle_greedy"],
             "timing_definition": "existing trajectory costs read from experiment 2; only frozen and Oracle are executed",
             "search_definition": "oracle_greedy search is included in its online_seconds; candidate costs separate"}
+    if args.reuse_comparison is not None:
+        previous = json.loads((args.reuse_comparison / "manifest.json").read_text(encoding="utf-8"))
+        if previous["status"] != "complete":
+            raise ValueError("reused comparison must be complete")
+        for key in ("dataset", "method", "horizon", "seed", "metric", "test_start", "test_steps",
+                    "decision_interval", "checkpoint_sha256", "input_sha256", "actions"):
+            if previous[key] != plan[key]:
+                raise ValueError(f"reused comparison differs on {key}")
+        previous_experiment = Path(manifest["reused_experiment"] if "reused_experiment" in manifest else previous["experiment"])
+        previous_bundle_path = previous_experiment / "selectors.json"
+        previous_bundle = json.loads(previous_bundle_path.read_text(encoding="utf-8"))
+        previous_manifest = json.loads((previous_experiment / "manifest.json").read_text(encoding="utf-8"))
+        if (previous_manifest["status"] != "complete"
+                or file_sha256(previous_bundle_path) != previous["selector_sha256"]
+                or previous_manifest["evaluation_start_sha256"] != manifest["evaluation_start_sha256"]
+                or file_sha256(args.experiment / "evaluation_start.pt") != manifest["evaluation_start_sha256"]):
+            raise ValueError("reused comparison has a different selector source or test-start state")
+        for key in ("actions", "context_length", "prefix_rows", "update_groups"):
+            if previous_bundle[key] != bundle[key]:
+                raise ValueError(f"reused comparison differs on {key}")
+        previous_config = DecisionConfig.from_dict(previous_bundle["decision_config"]).to_dict()
+        current_config = DecisionConfig.from_dict(bundle["decision_config"]).to_dict()
+        for key, value in current_config.items():
+            if key not in {"data_max_depth", "data_min_samples_leaf", "full_max_depth", "full_min_samples_leaf"}:
+                if previous_config[key] != value:
+                    raise ValueError(f"reused comparison differs on decision.{key}")
+        plan.update(reused_comparison=str(args.reuse_comparison.resolve()),
+                    reused_controllers=["frozen", "oracle_greedy"],
+                    timing_definition="all trajectory costs retain their original measurements; no models are executed",
+                    oracle_initialization_source="comparison_saved", oracle_initialization_seconds=0.0)
     args.output.mkdir(parents=True, exist_ok=False)
     save_json(args.output / "manifest.json", plan)
     print(json.dumps(plan, indent=2), flush=True)
@@ -208,27 +219,6 @@ def main(argv: list[str] | None = None) -> None:
     plan["status"] = "running"
     save_json(args.output / "manifest.json", plan)
     try:
-        # Forecasting imports are deliberately deferred: local plan/tests need no torch.
-        import torch
-        from onlinetsf.update_study.data import load_stream
-        from onlinetsf.update_study.runtime import ControlledMethod, Policy, Replay, load_replay, move_method, restore_rng
-
-        torch.set_num_threads(args.threads)
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-        stream = load_stream(annotation_dir, bundle["context_length"], horizon, bundle["prefix_rows"])
-        actions = {item["name"]: Policy.from_dict(item) for item in bundle["actions"]}
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        if checkpoint["prefix_rows"] != bundle["prefix_rows"]:
-            raise ValueError("checkpoint prefix differs from saved selector")
-        forecasting_method = checkpoint["method"]
-        initial_rng = (checkpoint["rng"][0].cpu(),
-                       [item.cpu() for item in checkpoint["rng"][1]] if checkpoint["rng"][1] is not None else None)
-        if initial_rng[1] is not None and torch.cuda.is_available() and len(initial_rng[1]) != torch.cuda.device_count():
-            raise ValueError("match the source visible GPU count, normally CUDA_VISIBLE_DEVICES=1")
-        move_method(forecasting_method, args.device)
-        initial = Replay(ControlledMethod(forecasting_method, actions["native"]), horizon,
-                         DecisionConfig.from_dict(bundle["decision_config"]))
         frames, summaries = {}, []
         statistics_began = perf_counter()
         for controller in ["native", "best_fixed", "policy_full", "policy_data"]:
@@ -251,27 +241,70 @@ def main(argv: list[str] | None = None) -> None:
                              {"metric": args.metric, "decisions": 0, "acc": None, "mean_relative_regret": None})
             local.to_csv(args.output / "oracle_decisions.csv", index=False)
             save_json(args.output / "oracle_summary.json", local_summary)
-        restore_rng(initial_rng)
-        forecasts, summary = run_comparison(initial, stream, start, steps, interval, "frozen", actions,
-                                             args.metric, args.output / "frozen")
-        if summary["gradient_steps"] or summary["egd_steps"]:
-            raise RuntimeError("frozen baseline performed an update")
-        frames["frozen"] = forecasts
-        summaries.append(summary)
-        initialization_began = perf_counter()
-        cache_path = args.experiment / "evaluation_start.pt"
-        if file_sha256(cache_path) != manifest["evaluation_start_sha256"]:
-            raise ValueError("saved test-start state differs from experiment 2")
-        oracle_start, saved_rng = load_replay(cache_path, args.device)
-        if oracle_start.last_index != start - 1 or oracle_start.horizon != horizon:
-            raise ValueError("saved state does not immediately precede testing")
-        restore_rng(saved_rng)
-        plan["oracle_initialization_source"] = "experiment2_saved_state"
-        plan["oracle_initialization_seconds"] = perf_counter() - initialization_began
-        forecasts, summary = run_comparison(oracle_start, stream, start, steps, interval, "oracle_greedy", actions,
-                                             args.metric, args.output / "oracle_greedy")
-        frames["oracle_greedy"] = forecasts
-        summaries.append(summary)
+        if args.reuse_comparison is not None:
+            for controller in ("frozen", "oracle_greedy"):
+                directory = args.reuse_comparison / controller
+                forecasts = pd.read_csv(directory / "forecasts.csv")
+                summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+                if (len(forecasts) != steps
+                        or not np.array_equal(forecasts.forecast_index, np.arange(start, start + steps))):
+                    raise ValueError(f"{controller}: reused forecasts do not cover the test interval")
+                if summary["controller"] != controller or any(
+                    not np.isclose(summary[loss], forecasts[loss].mean(), rtol=1e-7, atol=1e-9)
+                    for loss in ("mae", "mse")
+                ):
+                    raise ValueError(f"{controller}: reused summary and forecasts disagree")
+                if controller == "frozen" and (summary["gradient_steps"] or summary["egd_steps"]):
+                    raise ValueError("reused frozen baseline performed an update")
+                summary.update(result_source="comparison_saved", executed_in_comparison=False)
+                shutil.copytree(directory, args.output / controller)
+                save_json(args.output / controller / "summary.json", summary)
+                frames[controller] = forecasts
+                summaries.append(summary)
+                print(f"{controller}: reused saved baseline; no model execution", flush=True)
+        else:
+            # Forecasting imports are deferred; reuse needs no forecasting runtime.
+            import torch
+            from onlinetsf.update_study.data import load_stream
+            from onlinetsf.update_study.runtime import ControlledMethod, Policy, Replay, load_replay, move_method, restore_rng
+
+            torch.set_num_threads(args.threads)
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            stream = load_stream(annotation_dir, bundle["context_length"], horizon, bundle["prefix_rows"])
+            actions = {item["name"]: Policy.from_dict(item) for item in bundle["actions"]}
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            if checkpoint["prefix_rows"] != bundle["prefix_rows"]:
+                raise ValueError("checkpoint prefix differs from saved selector")
+            forecasting_method = checkpoint["method"]
+            initial_rng = (checkpoint["rng"][0].cpu(),
+                           [item.cpu() for item in checkpoint["rng"][1]] if checkpoint["rng"][1] is not None else None)
+            if initial_rng[1] is not None and torch.cuda.is_available() and len(initial_rng[1]) != torch.cuda.device_count():
+                raise ValueError("match the source visible GPU count, normally CUDA_VISIBLE_DEVICES=1")
+            move_method(forecasting_method, args.device)
+            initial = Replay(ControlledMethod(forecasting_method, actions["native"]), horizon,
+                             DecisionConfig.from_dict(bundle["decision_config"]))
+            restore_rng(initial_rng)
+            forecasts, summary = run_comparison(initial, stream, start, steps, interval, "frozen", actions,
+                                                 args.metric, args.output / "frozen")
+            if summary["gradient_steps"] or summary["egd_steps"]:
+                raise RuntimeError("frozen baseline performed an update")
+            frames["frozen"] = forecasts
+            summaries.append(summary)
+            initialization_began = perf_counter()
+            cache_path = args.experiment / "evaluation_start.pt"
+            if file_sha256(cache_path) != manifest["evaluation_start_sha256"]:
+                raise ValueError("saved test-start state differs from experiment 2")
+            oracle_start, saved_rng = load_replay(cache_path, args.device)
+            if oracle_start.last_index != start - 1 or oracle_start.horizon != horizon:
+                raise ValueError("saved state does not immediately precede testing")
+            restore_rng(saved_rng)
+            plan["oracle_initialization_source"] = "experiment2_saved_state"
+            plan["oracle_initialization_seconds"] = perf_counter() - initialization_began
+            forecasts, summary = run_comparison(oracle_start, stream, start, steps, interval, "oracle_greedy", actions,
+                                                 args.metric, args.output / "oracle_greedy")
+            frames["oracle_greedy"] = forecasts
+            summaries.append(summary)
         comparison = pd.DataFrame(summaries)
         native = comparison[comparison.controller == "native"].iloc[0]
         frozen = comparison[comparison.controller == "frozen"].iloc[0]

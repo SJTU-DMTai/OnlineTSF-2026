@@ -3,6 +3,8 @@
 Standalone experiment 2: no experiment-1 output is required. Plan mode fits
 selectors from existing CSV results without importing torch. Actual causal replay
 runs on the server, reusing initial.pt and preserving state throughout testing.
+With --reuse-experiment, only Full is fitted and replayed; all other controllers
+and their measured costs are retained from the completed source experiment.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import pandas as pd
 
 from .policy_support import (
     DEFAULT_ANNOTATIONS, DEFAULT_RUNS, file_sha256, find_job,
-    plot_forecasts, save_json, save_timings,
+    load_existing_results, plot_forecasts, save_json, save_timings,
     oracle_decision, score_action, summarize_decisions,
 )
 
@@ -144,6 +146,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--annotations", type=Path, default=DEFAULT_ANNOTATIONS)
     parser.add_argument("--training-data", type=Path,
                         help="completed collect_policy_training.py output for one training seed")
+    parser.add_argument("--reuse-experiment", type=Path,
+                        help="completed stage-3 directory; rerun only Full and reuse the other trajectories")
     parser.add_argument("--dataset", default="ETTh2")
     parser.add_argument("--method", choices=["onenet", "fsnet", "dsof"], default="onenet")
     parser.add_argument("--horizon", type=int, default=24)
@@ -154,9 +158,10 @@ def main(argv: list[str] | None = None) -> None:
     boundary.add_argument("--test-start-fraction", type=float, default=.6, help="default: floor(0.6 * raw row count)")
     parser.add_argument("--steps", type=int, help="default: every remaining prediction origin")
     parser.add_argument("--decision-interval", type=int, help="positive interval matching collected branch length")
-    parser.add_argument("--max-depth", type=int)
-    parser.add_argument("--min-samples-leaf", type=int,
-                        help="minimum training states per leaf; a split requires at least twice this number")
+    for policy in ("data", "full"):
+        parser.add_argument(f"--{policy}-max-depth", type=int)
+        parser.add_argument(f"--{policy}-min-samples-leaf", type=int,
+                            help="minimum training states per leaf; a split requires at least twice this number")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--oracle-diagnostics", choices=["none", "policy_full", "policy_data", "both"], default="none",
@@ -173,13 +178,20 @@ def main(argv: list[str] | None = None) -> None:
         source_manifest = json.loads((args.runs / "manifest.json").read_text(encoding="utf-8"))
         decision = DecisionConfig.from_dict(source_manifest["decision_config"])
     args.decision_interval = decision.interval if args.decision_interval is None else args.decision_interval
-    args.max_depth = decision.max_depth if args.max_depth is None else args.max_depth
-    args.min_samples_leaf = decision.min_samples_leaf if args.min_samples_leaf is None else args.min_samples_leaf
+    tree_overrides = {}
+    for policy in ("data", "full"):
+        for parameter in ("max_depth", "min_samples_leaf"):
+            key = f"{policy}_{parameter}"
+            value = getattr(args, key)
+            value = getattr(decision, key) if value is None else value
+            if value <= 0:
+                parser.error(f"--{key.replace('_', '-')} must be positive")
+            setattr(args, key, value)
+            tree_overrides[key] = value
     from dataclasses import replace
 
-    decision = replace(decision, interval=args.decision_interval, max_depth=args.max_depth,
-                       min_samples_leaf=args.min_samples_leaf)
-    if (min(args.horizon, args.max_depth, args.min_samples_leaf, args.threads, args.decision_interval) <= 0
+    decision = replace(decision, interval=args.decision_interval, **tree_overrides)
+    if (min(args.horizon, args.threads, args.decision_interval) <= 0
             or args.steps is not None and args.steps <= 0):
         parser.error("sizes must be positive")
     if not args.train_seeds or len(args.train_seeds) != len(set(args.train_seeds)):
@@ -270,13 +282,52 @@ def main(argv: list[str] | None = None) -> None:
         args.train_seeds, clock, interval, horizon, names, "mae")
     if (train.clock < prefix - 1).any():
         raise ValueError("historical online training states precede the offline prefix")
-    if len(train) < 2 * args.min_samples_leaf:
-        parser.error(f"only {len(train)} historical training states remain after time isolation; "
-                     f"--min-samples-leaf {args.min_samples_leaf} requires at least "
-                     f"{2 * args.min_samples_leaf} to split. Reduce --min-samples-leaf "
-                     "or collect more historical probes before running the forecasting replay.")
     capabilities = collected if collected is not None else record
     feature_sets = decision.feature_sets(capabilities["method_features"])
+    reused_manifest = reused_bundle = None
+    if args.reuse_experiment is not None:
+        reused_manifest = json.loads((args.reuse_experiment / "manifest.json").read_text(encoding="utf-8"))
+        reused_path = args.reuse_experiment / "selectors.json"
+        reused_bundle = json.loads(reused_path.read_text(encoding="utf-8"))
+        if (reused_manifest["status"] != "complete" or reused_bundle["schema_version"] != FEATURE_SCHEMA_VERSION
+                or file_sha256(reused_path) != reused_manifest["selector_sha256"]):
+            raise ValueError("reused experiment must be complete with its original saved selectors")
+        expected = {"dataset": dataset, "method": method, "horizon": horizon, "train_seeds": args.train_seeds,
+                    "test_seed": seed, "test_start": clock, "steps": steps, "prefix_rows": int(prefix),
+                    "decision_interval": interval, "input_sha256": source_hash,
+                    "checkpoint_sha256": file_sha256(checkpoint_path)}
+        for key, value in expected.items():
+            if reused_manifest[key] != value:
+                raise ValueError(f"reused experiment differs on {key}")
+        for key, value in {"actions": catalog, "context_length": context_length,
+                           "best_fixed": losses.mean().idxmin()}.items():
+            if reused_bundle[key] != value:
+                raise ValueError(f"reused experiment differs on {key}")
+        old_config = DecisionConfig.from_dict(reused_bundle["decision_config"]).to_dict()
+        for key, value in decision.to_dict().items():
+            if key not in {"full_max_depth", "full_min_samples_leaf"} and old_config[key] != value:
+                raise ValueError(f"Full-only reuse cannot change decision.{key}")
+        old_sources = {item["seed"]: (item["states_sha256"], item["outcomes_sha256"])
+                       for item in reused_manifest["source_jobs"] if "states_sha256" in item}
+        new_sources = {item["seed"]: (item["states_sha256"], item["outcomes_sha256"])
+                       for item in source_audit if "states_sha256" in item}
+        if old_sources != new_sources:
+            raise ValueError("reused experiment used different historical training data")
+        for name, features in feature_sets.items():
+            if reused_bundle["selectors"][name]["features"] != features:
+                raise ValueError(f"reused experiment differs on {name} features")
+        if (args.oracle_diagnostics in {"policy_data", "both"}
+                and not (args.reuse_experiment / "policy_data/action_outcomes.csv").exists()):
+            raise ValueError("Full-only reuse cannot add Data diagnostics; use --oracle-diagnostics policy_full or none")
+    for name in feature_sets:
+        if reused_bundle is not None and name == "policy_data":
+            continue
+        leaf_size = decision.tree_parameters(name)["min_samples_leaf"]
+        if len(train) < 2 * leaf_size:
+            option = f"--{name.removeprefix('policy_')}-min-samples-leaf"
+            parser.error(f"{name}: only {len(train)} historical training states remain after time isolation; "
+                         f"{option} {leaf_size} requires at least {2 * leaf_size} to split. "
+                         f"Reduce {option} or collect more historical probes before running the forecasting replay.")
     missing = set(feature_sets["policy_full"]) - set(train.columns)
     if missing:
         raise ValueError(f"training states lack configured features: {sorted(missing)}; collect them first")
@@ -290,15 +341,23 @@ def main(argv: list[str] | None = None) -> None:
         timings.update(collected.get("timings", {}))
     selectors, rules, diagnostics = {}, [], []
     for name, features in feature_sets.items():
-        fit_began = perf_counter()
-        selectors[name], text = fit_selector(train, gains, names, features, args.max_depth, args.min_samples_leaf)
-        timings[f"selector_{name}_seconds"] = perf_counter() - fit_began
+        parameters = decision.tree_parameters(name)
+        if reused_bundle is not None and name == "policy_data":
+            selectors[name] = reused_bundle["selectors"][name]
+            text = f"Reused unchanged from {args.reuse_experiment}; see its tree_rules.txt."
+            timings[f"selector_{name}_seconds"] = reused_manifest["timings"][f"selector_{name}_seconds"]
+        else:
+            fit_began = perf_counter()
+            selectors[name], text = fit_selector(train, gains, names, features, **parameters)
+            timings[f"selector_{name}_seconds"] = perf_counter() - fit_began
         rules.append(name + "\n" + text)
         for action, tree in selectors[name]["trees"].items():
             diagnostics.append({"controller": name, "action": action, "training_states": len(train),
+                                **parameters,
                                 "nodes": len(tree["value"]), "leaves": tree["left"].count(-1)})
         split_count = sum(len(tree["value"]) > 1 for tree in selectors[name]["trees"].values())
-        print(f"{name}: {len(train)} historical states; "
+        print(f"{name}: max_depth={parameters['max_depth']}, min_samples_leaf={parameters['min_samples_leaf']}; "
+              f"{len(train)} historical states; "
               f"{split_count}/{len(selectors[name]['trees'])} action trees split on features", flush=True)
     bundle = {"schema_version": FEATURE_SCHEMA_VERSION, "data_feature_precision": "float64", "decision_config": decision.to_dict(),
               "update_groups": capabilities["update_groups"], "dataset": dataset, "method": method, "horizon": horizon,
@@ -321,6 +380,13 @@ def main(argv: list[str] | None = None) -> None:
             "checkpoint": str(checkpoint_path), "checkpoint_sha256": file_sha256(checkpoint_path),
             "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
             "timings": timings}
+    plan["executed_controllers"] = ["policy_full"] if reused_bundle is not None else plan["controllers"]
+    plan["reused_controllers"] = ["native", "best_fixed", "policy_data"] if reused_bundle is not None else []
+    if reused_manifest is not None:
+        plan["reused_experiment"] = str(args.reuse_experiment.resolve())
+        plan["reused_selector_sha256"] = reused_manifest["selector_sha256"]
+        plan["timing_definition"] = ("reused controller and Data-fit costs retain original measurements; "
+                                     "experiment_wall_seconds measures only this invocation")
     args.output.mkdir(parents=True, exist_ok=False)
     save_json(args.output / "selectors.json", bundle)
     plan["selector_sha256"] = file_sha256(args.output / "selectors.json")
@@ -351,11 +417,12 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("forecast feature columns changed")
     actions = {item["name"]: Policy.from_dict(item) for item in bundle["actions"]}
     start = clock - stream.dataset.context_length + 1
-    reuse_history = collected is not None and collected["seed"] == seed
+    reuse_history = reused_manifest is not None or collected is not None and collected["seed"] == seed
     if reuse_history:
-        history_path = args.training_data / "evaluation_start.pt"
-        if file_sha256(history_path) != collected["evaluation_start_sha256"]:
-            raise ValueError("collected test-start state hash differs")
+        history_source = reused_manifest if reused_manifest is not None else collected
+        history_path = (args.reuse_experiment if reused_manifest is not None else args.training_data) / "evaluation_start.pt"
+        if file_sha256(history_path) != history_source["evaluation_start_sha256"]:
+            raise ValueError("saved test-start state hash differs")
         replay, saved_rng = load_replay(history_path, args.device)
         if replay.last_index != start - 1 or replay.horizon != horizon or replay.method.policy != actions["native"]:
             raise ValueError("collected state is not the native state immediately before testing")
@@ -387,7 +454,8 @@ def main(argv: list[str] | None = None) -> None:
         timings["runtime_setup_seconds"] = perf_counter() - setup_began
         if reuse_history:
             timings["warmup_seconds"] = 0.0
-            plan["evaluation_start_source"] = "collection_saved_state"
+            plan["evaluation_start_source"] = ("experiment_saved_state" if reused_manifest is not None else
+                                                "collection_saved_state")
             shutil.copyfile(history_path, args.output / "evaluation_start.pt")
         else:
             warmup_began = perf_counter()
@@ -404,13 +472,28 @@ def main(argv: list[str] | None = None) -> None:
             torch.save({"replay": replay, "rng": saved_rng}, args.output / "evaluation_start.pt")
         plan["evaluation_start_sha256"] = file_sha256(args.output / "evaluation_start.pt")
         frames = {}
+        if reused_manifest is not None:
+            reused_decisions = pd.read_csv(args.reuse_experiment / "decisions.csv")
+            reused_summaries = pd.read_csv(args.reuse_experiment / "trajectory_summary.csv")
         for controller in plan["controllers"]:
             restore_rng(saved_rng)
             directory = args.output / controller
-            frame, trajectory_decisions, summary = run_segment(
-                replay, stream, start, steps, interval, controller, bundle, actions, directory,
-                oracle_metric=args.oracle_metric if controller.startswith("policy_") and
-                args.oracle_diagnostics in {controller, "both"} else None)
+            reused = controller in plan["reused_controllers"]
+            if reused:
+                frame, _ = load_existing_results(args.reuse_experiment, controller, start, steps)
+                selected = reused_decisions[reused_decisions.controller == controller]
+                if not np.array_equal(selected.clock, np.arange(clock, clock + steps, interval)):
+                    raise ValueError(f"{controller}: reused decisions do not cover the test interval")
+                trajectory_decisions = selected.to_dict("records")
+                summary = reused_summaries[reused_summaries.controller == controller].iloc[0].to_dict()
+                shutil.copytree(args.reuse_experiment / controller, directory)
+            else:
+                frame, trajectory_decisions, summary = run_segment(
+                    replay, stream, start, steps, interval, controller, bundle, actions, directory,
+                    oracle_metric=args.oracle_metric if controller.startswith("policy_") and
+                    args.oracle_diagnostics in {controller, "both"} else None)
+            summary.update(result_source="experiment_saved" if reused else "experiment_measured",
+                           executed_in_experiment=not reused)
             frames[controller] = frame
             decisions.extend(dict(item, seed=seed) for item in trajectory_decisions)
             trajectory_summaries.append(dict(summary, controller=controller, seed=seed))
@@ -420,7 +503,7 @@ def main(argv: list[str] | None = None) -> None:
             pd.DataFrame(decisions).to_csv(args.output / "decisions.csv", index=False)
             pd.DataFrame(trajectory_summaries).to_csv(args.output / "trajectory_summary.csv", index=False)
             save_timings(args.output, timings)
-            print(f"{controller}: {steps} continuous test origins complete", flush=True)
+            print(f"{controller}: {steps} test origins {'reused' if reused else 'complete'}", flush=True)
         postprocessing_began = perf_counter()
         plot_forecasts(frames, args.output / "test_errors", f"{dataset} {method} H={horizon} | start {clock}")
         result = pd.concat(outcomes, ignore_index=True)

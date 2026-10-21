@@ -41,6 +41,30 @@ def save_timings(directory: Path, timings: dict) -> None:
     pd.DataFrame(timings.items(), columns=["stage", "seconds"]).to_csv(directory / "timings.csv", index=False)
 
 
+def load_existing_results(experiment: Path, controller: str, start: int, steps: int) -> tuple[pd.DataFrame, dict]:
+    """Read measured experiment-2 results without executing any forecasting method."""
+    forecasts = pd.read_csv(experiment / controller / "forecasts.csv")
+    if len(forecasts) != steps or not np.array_equal(forecasts.forecast_index, np.arange(start, start + steps)):
+        raise ValueError(f"{controller}: saved forecasts do not cover the test interval")
+    summaries = pd.read_csv(experiment / "trajectory_summary.csv")
+    selected = summaries[summaries.controller == controller]
+    if len(selected) != 1:
+        raise ValueError(f"expected one saved summary for {controller}")
+    summary = selected.iloc[0].to_dict()
+    for metric in ["mae", "mse"]:
+        if not np.isclose(summary[metric], forecasts[metric].mean(), rtol=1e-7, atol=1e-9):
+            raise ValueError(f"{controller}: saved summary and forecasts disagree")
+    updates = pd.read_csv(experiment / controller / "updates.csv")
+    update_clocks = 0
+    if not updates.empty:
+        increments = updates.gradient_steps.diff().fillna(updates.gradient_steps.iloc[0])
+        update_clocks = updates.loc[increments > 0, "available_at"].nunique()
+    summary.update(gradient_update_clocks=int(update_clocks), update_seconds=float(updates.seconds.sum()),
+                   result_source="experiment2_saved", executed_in_comparison=False)
+    summary.pop("seconds")
+    return forecasts, summary
+
+
 def plot_forecasts(frames: dict[str, pd.DataFrame], destination: Path, title: str) -> None:
     """Actual emitted forecast errors, with a short trailing average for readability."""
     import matplotlib
