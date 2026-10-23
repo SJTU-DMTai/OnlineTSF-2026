@@ -148,6 +148,10 @@ def main(argv: list[str] | None = None) -> None:
                         help="completed collect_policy_training.py output for one training seed")
     parser.add_argument("--reuse-experiment", type=Path,
                         help="completed stage-3 directory; rerun only Full and reuse the other trajectories")
+    parser.add_argument("--controllers", nargs="+",
+                        choices=["native", "best_fixed", "policy_full", "policy_data", "frozen"],
+                        default=["native", "best_fixed", "policy_full", "policy_data"],
+                        help="test only these controllers; Native-relative metrics are omitted without native")
     parser.add_argument("--dataset", default="ETTh2")
     parser.add_argument("--method", choices=["onenet", "fsnet", "dsof"], default="onenet")
     parser.add_argument("--horizon", type=int, default=24)
@@ -170,6 +174,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--plan-only", action="store_true", help="fit and audit the historical selector without importing torch")
     parser.add_argument("--output", type=Path, default=Path("runs/policy-exp2-temporal-onenet-etth2-h24"))
     args = parser.parse_args(argv)
+    if len(args.controllers) != len(set(args.controllers)):
+        parser.error("controllers must be unique")
+    if args.reuse_experiment is not None and args.controllers != ["native", "best_fixed", "policy_full", "policy_data"]:
+        parser.error("--reuse-experiment requires the default controllers")
     collected = None
     if args.training_data is not None:
         collected = json.loads((args.training_data / "manifest.json").read_text(encoding="utf-8"))
@@ -375,7 +383,7 @@ def main(argv: list[str] | None = None) -> None:
             "steps": steps, "decision_interval": interval, "action_count": len(catalog),
             "training_positions": bundle["training_positions"], "training_states": len(train),
             "train_target_end_exclusive": bundle["train_target_end_exclusive"],
-            "controllers": ["native", "best_fixed", "policy_full", "policy_data"],
+            "controllers": args.controllers,
             "input_sha256": source_hash, "source_jobs": source_audit,
             "checkpoint": str(checkpoint_path), "checkpoint_sha256": file_sha256(checkpoint_path),
             "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
@@ -507,27 +515,30 @@ def main(argv: list[str] | None = None) -> None:
         postprocessing_began = perf_counter()
         plot_forecasts(frames, args.output / "test_errors", f"{dataset} {method} H={horizon} | start {clock}")
         result = pd.concat(outcomes, ignore_index=True)
-        keys = ["seed", "block", "lookahead"]
-        native = result[result.controller == "native"][keys + ["mae", "mse"]].rename(columns={"mae": "native_mae", "mse": "native_mse"})
-        result = result.merge(native, on=keys, validate="many_to_one")
-        for metric in ["mae", "mse"]:
-            result[f"{metric}_gain_pct"] = 100 * (1 - result[metric] / result[f"native_{metric}"])
-        result.to_csv(args.output / "block_outcomes.csv", index=False)
         local_summary = result.groupby(["controller", "lookahead"]).agg(
-            mae=("mae", "mean"), mse=("mse", "mean"), native_mae=("native_mae", "mean"),
-            native_mse=("native_mse", "mean"), blocks=("block", "count"),
-            mae_win_fraction=("mae_gain_pct", lambda x: (x > 0).mean()),
-            mse_win_fraction=("mse_gain_pct", lambda x: (x > 0).mean())).reset_index()
+            mae=("mae", "mean"), mse=("mse", "mean"), blocks=("block", "count")).reset_index()
         summary = pd.DataFrame(trajectory_summaries)
-        native = summary[summary.controller == "native"].iloc[0]
-        for metric in ["mae", "mse"]:
-            summary[f"{metric}_gain_pct"] = 100 * (1 - summary[metric] / native[metric])
-            local_summary[f"{metric}_gain_pct"] = 100 * (1 - local_summary[metric] / local_summary[f"native_{metric}"])
+        phase_metrics = ["mae", "mse"]
+        if "native" in args.controllers:
+            keys = ["seed", "block", "lookahead"]
+            native = result[result.controller == "native"][keys + ["mae", "mse"]].rename(columns={"mae": "native_mae", "mse": "native_mse"})
+            result = result.merge(native, on=keys, validate="many_to_one")
+            native_summary = summary[summary.controller == "native"].iloc[0]
+            for metric in ["mae", "mse"]:
+                result[f"{metric}_gain_pct"] = 100 * (1 - result[metric] / result[f"native_{metric}"])
+                summary[f"{metric}_gain_pct"] = 100 * (1 - summary[metric] / native_summary[metric])
+            local_summary = result.groupby(["controller", "lookahead"]).agg(
+                mae=("mae", "mean"), mse=("mse", "mean"), native_mae=("native_mae", "mean"),
+                native_mse=("native_mse", "mean"), blocks=("block", "count"),
+                mae_win_fraction=("mae_gain_pct", lambda x: (x > 0).mean()),
+                mse_win_fraction=("mse_gain_pct", lambda x: (x > 0).mean())).reset_index()
+            for metric in ["mae", "mse"]:
+                local_summary[f"{metric}_gain_pct"] = 100 * (1 - local_summary[metric] / local_summary[f"native_{metric}"])
+            phase_metrics.extend(["mae_gain_pct", "mse_gain_pct"])
+        result.to_csv(args.output / "block_outcomes.csv", index=False)
         summary.to_csv(args.output / "summary.csv", index=False)
         local_summary.to_csv(args.output / "local_summary.csv", index=False)
-        result.groupby(["controller", "lookahead", "phase_at_decision"])[[
-            "mae", "mse", "mae_gain_pct", "mse_gain_pct"
-        ]].mean().to_csv(args.output / "phase_summary.csv")
+        result.groupby(["controller", "lookahead", "phase_at_decision"])[phase_metrics].mean().to_csv(args.output / "phase_summary.csv")
         plan["status"] = "complete"
         timings["postprocessing_seconds"] = perf_counter() - postprocessing_began
         print(summary.to_string(index=False), flush=True)

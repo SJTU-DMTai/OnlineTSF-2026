@@ -1,0 +1,16 @@
+START GPU=0 ETTh2/onenet test_start=0.3 positions=128 log=tmp/short-policy-queue-check/result-varied/logs/ETTh2-onenet-0.3.log
+START GPU=0 ETTh2/dsof test_start=0.3 positions=128 log=tmp/short-policy-queue-check/result-varied/logs/ETTh2-dsof-0.3.log
+DONE GPU=0 ETTh2/onenet test_start=0.3
+START GPU=0 ETTm1/onenet test_start=0.3 positions=256 log=tmp/short-policy-queue-check/result-varied/logs/ETTm1-onenet-0.3.log
+DONE GPU=0 ETTh2/dsof test_start=0.3
+START GPU=0 ETTm1/dsof test_start=0.3 positions=256 log=tmp/short-policy-queue-check/result-varied/logs/ETTm1-dsof-0.3.log
+START GPU=0 ETTh2/onenet test_start=0.4 positions=128 log=tmp/short-policy-queue-check/result-varied/logs/ETTh2-onenet-0.4.log
+DONE GPU=0 ETTm1/onenet test_start=0.3
+DONE GPU=0 ETTh2/onenet test_start=0.4
+DONE GPU=0 ETTm1/dsof test_start=0.3
+START GPU=0 ETTh2/dsof test_start=0.4 positions=128 log=tmp/short-policy-queue-check/result-varied/logs/ETTh2-dsof-0.4.log
+START GPU=0 ETTm1/onenet test_start=0.4 positions=256 log=tmp/short-policy-queue-check/result-varied/logs/ETTm1-onenet-0.4.log
+DONE GPU=0 ETTh2/dsof test_start=0.4
+START GPU=0 ETTm1/dsof test_start=0.4 positions=256 log=tmp/short-policy-queue-check/result-varied/logs/ETTm1-dsof-0.4.log
+DONE GPU=0 ETTm1/onenet test_start=0.4
+DONE GPU=0 ETTm1/dsof test_start=0.4

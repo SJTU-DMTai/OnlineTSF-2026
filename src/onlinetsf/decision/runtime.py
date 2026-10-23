@@ -35,9 +35,11 @@ class DecisionEngine:
             raise ValueError("selector artifact and online method have different update capabilities")
         self.controller = controller
         self.selector = bundle["selectors"].get(controller)
-        if self.selector is None and controller not in {"native", "best_fixed"}:
+        if self.selector is None and controller not in {"native", "best_fixed", "frozen"}:
             raise ValueError(f"unknown decision controller: {controller}")
-        self.fixed = "native" if controller == "native" else bundle["best_fixed"]
+        self.fixed = controller if controller in {"native", "frozen"} else bundle["best_fixed"]
+        if controller == "frozen" and self.actions.get("frozen") != Policy("frozen", mode="frozen"):
+            raise ValueError("frozen controller requires the frozen action in the catalog")
         self.feature_names = self.selector["features"] if self.selector is not None else []
         if self.selector is not None and self.selector["actions"] != list(self.actions):
             raise ValueError("selector and action catalog ordering differ")
