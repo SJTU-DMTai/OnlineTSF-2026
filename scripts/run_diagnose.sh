@@ -51,7 +51,7 @@ for batch in main fsnet; do
 
       echo "START GPU=$gpu $dataset/$method"
 
-      CUDA_VISIBLE_DEVICES="$gpu" python -u -m onlinetsf.decision diagnose \
+      CUDA_VISIBLE_DEVICES="$gpu" python -u -m onlinetsf.decision_previous diagnose \
         --experiment "$RUN_ROOT/$dataset/$method/experiment" \
         --annotations "$annotations" \
         --controller "$CONTROLLER" \

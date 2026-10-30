@@ -4,7 +4,7 @@
 from .dsof import DSOFMethod, DSOFModel
 from .fsnet import AdaptiveConv1d, FSNetMethod, FSNetTCN
 from .ogd import OGDMethod
-from .onenet import OneNetEnsemble, OneNetMethod
+from .onenet import OneNetEnsemble, OneNetMethod, OneNetTCN
 from .under_cali import UnderCaliMethod
 
 __all__ = [
@@ -16,5 +16,6 @@ __all__ = [
     "OGDMethod",
     "OneNetEnsemble",
     "OneNetMethod",
+    "OneNetTCN",
     "UnderCaliMethod",
 ]

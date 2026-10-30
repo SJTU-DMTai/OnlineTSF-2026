@@ -1,4 +1,7 @@
-"""Configurable, method-neutral online adaptation decisions.
+"""Online update-action execution; policy learning is supplied by the caller."""
 
-Training and experiment dependencies are imported only by their entry points.
-"""
+from .actions import UpdateAction
+from .capabilities import UpdateCapabilities, UpdateUnit
+from .runtime import DecisionState, UpdateController
+
+__all__ = ["UpdateAction", "UpdateCapabilities", "UpdateUnit", "DecisionState", "UpdateController"]

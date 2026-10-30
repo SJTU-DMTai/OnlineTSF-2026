@@ -13,17 +13,25 @@ RUN_ROOT="${2:?Usage: bash scripts/run_short_policy.sh OLD_RUN_ROOT NEW_RUN_ROOT
 WORKERS="${WORKERS:-2}"
 MAX_JOBS="${MAX_JOBS:-3}"
 GPU="${GPU:-0}"
+read -r -a datasets <<< "${DATASETS:-ETTh2 ETTm1}"
+read -r -a methods <<< "${METHODS:-onenet dsof}"
 SEED="${SEED:-0}"
 DECISION_CONFIG="${DECISION_CONFIG:-decision.yaml}"
 ETTH2_ANNOTATIONS="${ETTH2_ANNOTATIONS:-data/drift-etth}"
 ETTM1_ANNOTATIONS="${ETTM1_ANNOTATIONS:-data/drift-ettm}"
+WEATHER_ANNOTATIONS="${WEATHER_ANNOTATIONS:-data/drift-weather}"
 ETTH2_POSITIONS="${ETTH2_POSITIONS:-128}"
 ETTM1_POSITIONS="${ETTM1_POSITIONS:-256}"
+WEATHER_POSITIONS="${WEATHER_POSITIONS:-128}"
 mkdir -p "$RUN_ROOT/logs"
 
 # Check all source directories before launching expensive collection jobs.
-for dataset in ETTh2 ETTm1; do
-    for method in onenet dsof; do
+for dataset in "${datasets[@]}"; do
+    case "$dataset" in
+        ETTh2|ETTm1|Weather) ;;
+        *) echo "Unsupported dataset: $dataset" >&2; exit 1 ;;
+    esac
+    for method in "${methods[@]}"; do
         if [[ ! -f "$SOURCE_ROOT/$dataset/$method/source/manifest.json" ]]; then
             echo "Missing source manifest: $SOURCE_ROOT/$dataset/$method/source/manifest.json" >&2
             exit 1
@@ -36,9 +44,12 @@ run_job() {
     if [[ "$dataset" == ETTh2 ]]; then
         positions="$ETTH2_POSITIONS"
         annotations="$ETTH2_ANNOTATIONS"
-    else
+    elif [[ "$dataset" == ETTm1 ]]; then
         positions="$ETTM1_POSITIONS"
         annotations="$ETTM1_ANNOTATIONS"
+    else
+        positions="$WEATHER_POSITIONS"
+        annotations="$WEATHER_ANNOTATIONS"
     fi
     source="$SOURCE_ROOT/$dataset/$method/source"
     job="$RUN_ROOT/test-start-$fraction/$dataset/$method"
@@ -65,14 +76,15 @@ run_job() {
 export -f run_job
 export SOURCE_ROOT RUN_ROOT WORKERS SEED DECISION_CONFIG GPU
 export ETTH2_ANNOTATIONS ETTM1_ANNOTATIONS ETTH2_POSITIONS ETTM1_POSITIONS
+export WEATHER_ANNOTATIONS WEATHER_POSITIONS
 if [[ ! "$MAX_JOBS" =~ ^[1-9][0-9]*$ ]]; then
     echo "MAX_JOBS must be a positive integer" >&2
     exit 1
 fi
 if ! (
     for fraction in 0.3 0.4; do
-        for dataset in ETTh2 ETTm1; do
-            for method in onenet dsof; do
+        for dataset in "${datasets[@]}"; do
+            for method in "${methods[@]}"; do
                 printf '%s %s %s\n' "$fraction" "$dataset" "$method"
             done
         done

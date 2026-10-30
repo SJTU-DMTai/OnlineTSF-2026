@@ -28,6 +28,7 @@ class OGDMethod:
         model: nn.Module,
         *,
         optimizer: Optimizer | None = None,
+        offline_optimizer: Optimizer | None = None,
         loss_fn: LossFunction | None = None,
         update_steps: int = 1,
         device: torch.device | str | None = None,
@@ -39,6 +40,7 @@ class OGDMethod:
 
         self.model = model
         self.optimizer = optimizer
+        self.offline_optimizer = offline_optimizer
         self.loss_fn = loss_fn
         self.update_steps = update_steps
         self.last_gradient_steps = 0
@@ -72,6 +74,15 @@ class OGDMethod:
 
     def adaptation_features(self, target=None, *, current_context=None) -> dict:
         return {}
+
+    def train_batch(self, context: Tensor, target: Tensor) -> float:
+        self.model.train()
+        self.offline_optimizer.zero_grad(set_to_none=True)
+        loss_fn = self.loss_fn or nn.functional.mse_loss
+        loss = loss_fn(self.model(context.to(self.device)), target.to(self.device))
+        loss.backward()
+        self.offline_optimizer.step()
+        return loss.detach().item()
 
     def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None) -> float | None:
         self.last_gradient_steps = 0

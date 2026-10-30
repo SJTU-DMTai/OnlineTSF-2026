@@ -317,19 +317,21 @@ class FSNetMethod:
         model: FSNetTCN,
         *,
         learning_rate: float = 1e-3,
+        offline_learning_rate: float = 1e-3,
         optimizer: Optimizer | None = None,
         loss_fn: LossFunction | None = None,
         n_inner: int = 1,
         device: torch.device | str | None = None,
     ) -> None:
-        if learning_rate <= 0.0:
-            raise ValueError("learning_rate must be positive")
+        if learning_rate <= 0.0 or offline_learning_rate <= 0.0:
+            raise ValueError("learning rates must be positive")
         if n_inner <= 0:
             raise ValueError("n_inner must be positive")
         self.model = model
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.model.to(self.device)
         self.optimizer = optimizer or AdamW(model.parameters(), lr=learning_rate)
+        self.offline_optimizer = AdamW(model.parameters(), lr=offline_learning_rate)
         self.loss_fn = loss_fn or nn.MSELoss()
         self.n_inner = n_inner
         self.last_gradient_steps = self.last_egd_steps = 0
@@ -380,15 +382,41 @@ class FSNetMethod:
 
         if not feedback.observed_mask.all():
             raise ValueError("FSNetMethod requires complete-horizon feedback")
-        self.last_gradient_steps = self.last_egd_steps = 0
-        groups = self.parameter_groups()
-        selected = frozenset(groups) if update_groups is None else update_groups
-        if selected - groups.keys():
+        selected = frozenset(self.update_group_names) if update_groups is None else update_groups
+        if selected - set(self.update_group_names):
             raise ValueError("unknown FSNet update group")
         # Gradient memories require fresh backpropagation. With no selected neural
         # update, keep them unchanged; prediction still advances formula-only state.
         if not selected:
+            self.last_gradient_steps = self.last_egd_steps = 0
             return None
+        return self.update_feedback(feedback, selected, gradient_memory=True)
+
+    def train_batch(self, context: Tensor, target: Tensor) -> float:
+        """Train all modules and advance memory using the offline objective."""
+        self.model.train()
+        self.offline_optimizer.zero_grad(set_to_none=True)
+        loss = self.loss_fn(self.model(context.to(self.device)), target.to(self.device))
+        loss.backward()
+        self.model.record_gradients()
+        self.offline_optimizer.step()
+        self.last_gradient_steps = 1
+        self.last_egd_steps = 0
+        return loss.detach().item()
+
+    def update_feedback(self, feedback: MethodFeedback, selected: frozenset[str], *,
+                        gradient_memory: bool, memory_schedule: Callable[[], bool] | None = None) -> float | None:
+        """Compute real gradients for memory even when no parameters are stepped.
+
+        Memory scheduling is called only on native inner forwards that advance
+        adaptation state. The first feedback forward remains read-only.
+        """
+        if not feedback.observed_mask.all():
+            raise ValueError("FSNetMethod requires complete-horizon feedback")
+        self.last_gradient_steps = self.last_egd_steps = 0
+        if not selected and not gradient_memory:
+            return None
+        groups = self.parameter_groups()
         self.model.eval()
         context = feedback.context.unsqueeze(0).to(self.device)
         target = feedback.target.unsqueeze(0).to(self.device)
@@ -396,18 +424,20 @@ class FSNetMethod:
         layers = [module for module in self.model.modules() if isinstance(module, AdaptiveConv1d)]
         for inner_step in range(self.n_inner):
             self.optimizer.zero_grad(set_to_none=True)
-            prediction = self.model(context, advance_state=inner_step > 0)
+            advance_memory = inner_step > 0 and (memory_schedule is None or memory_schedule())
+            prediction = self.model(context, advance_state=advance_memory)
             loss = self.loss_fn(prediction, target)
             if loss.ndim != 0:
                 raise ValueError("loss_fn must return a scalar tensor")
             loss.backward()
             # Memory observes real gradients even when base parameters stay fixed.
-            self.model.record_gradients()
-            valid = [layer for layer in layers if layer.last_gradient_alignment is not None]
-            if valid:
-                self._gradient_alignment = sum(layer.last_gradient_alignment for layer in valid) / len(valid)
-                self._memory_trigger_rates.append(sum(layer.last_gradient_alignment < -layer.memory_threshold
-                                                      for layer in valid) / len(valid))
+            if gradient_memory:
+                self.model.record_gradients()
+                valid = [layer for layer in layers if layer.last_gradient_alignment is not None]
+                if valid:
+                    self._gradient_alignment = sum(layer.last_gradient_alignment for layer in valid) / len(valid)
+                    self._memory_trigger_rates.append(sum(layer.last_gradient_alignment < -layer.memory_threshold
+                                                          for layer in valid) / len(valid))
             for name, parameters in groups.items():
                 if name not in selected:
                     for parameter in parameters:
@@ -416,4 +446,4 @@ class FSNetMethod:
                 self.optimizer.step()
                 self.last_gradient_steps += 1
             losses.append(loss.detach().item())
-        return sum(losses) / len(losses) if selected else None
+        return sum(losses) / len(losses)

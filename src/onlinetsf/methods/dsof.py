@@ -60,9 +60,11 @@ class DSOFMethod:
         self,
         model: DSOFModel,
         *,
-        learning_rate: float = 1e-3,
-        student_learning_rate: float = 1e-3,
-        online_learning_rate: float = 1e-3,
+        learning_rate: float = 0.00028889418723619334,
+        student_learning_rate: float = 0.00015686974622312612,
+        online_learning_rate: float = 0.00036288062287989935,
+        offline_learning_rate: float = 0.005771621537901884,
+        offline_student_learning_rate: float = 0.001026953060677239,
         replay_buffer_size: int = 300,
         replay_batch_size: int = 32,
         replay_epochs: int = 1,
@@ -70,7 +72,8 @@ class DSOFMethod:
         discount: float = 0.9,
         device: torch.device | str | None = None,
     ) -> None:
-        if min(learning_rate, student_learning_rate, online_learning_rate) <= 0:
+        if min(learning_rate, student_learning_rate, online_learning_rate,
+               offline_learning_rate, offline_student_learning_rate) <= 0:
             raise ValueError("DSOF learning rates must be positive")
         if min(replay_buffer_size, replay_batch_size, replay_epochs, replay_frequency) <= 0:
             raise ValueError("DSOF replay sizes, epochs, and frequency must be positive")
@@ -81,9 +84,16 @@ class DSOFMethod:
         self.model = model
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.model.to(self.device)
-        self.teacher_optimizer = torch.optim.AdamW(model.teacher.parameters(), lr=learning_rate)
-        self.student_optimizer = torch.optim.AdamW(model.student.parameters(), lr=student_learning_rate)
-        self.online_optimizer = torch.optim.AdamW(model.student.parameters(), lr=online_learning_rate)
+        # Official DLinear + MLP / ETTh2 defaults. Each stream owns its moments.
+        self.offline_teacher_optimizer = torch.optim.Adam(
+            model.teacher.parameters(), lr=offline_learning_rate, amsgrad=True
+        )
+        self.offline_student_optimizer = torch.optim.AdamW(
+            model.student.parameters(), lr=offline_student_learning_rate, amsgrad=True
+        )
+        self.teacher_optimizer = torch.optim.AdamW(model.teacher.parameters(), lr=learning_rate, amsgrad=True)
+        self.student_optimizer = torch.optim.AdamW(model.student.parameters(), lr=student_learning_rate, amsgrad=True)
+        self.online_optimizer = torch.optim.AdamW(model.student.parameters(), lr=online_learning_rate, amsgrad=True)
         self.replay: deque[tuple[Tensor, Tensor]] = deque(maxlen=replay_buffer_size)
         self.replay_batch_size = replay_batch_size
         self.replay_epochs = replay_epochs
@@ -166,7 +176,7 @@ class DSOFMethod:
 
     def train_batch(self, context: Tensor, target: Tensor) -> float:
         """Supervise the teacher and residual student during initial training."""
-        return self._supervised_update(context.to(self.device), target.to(self.device))
+        return self._supervised_update(context.to(self.device), target.to(self.device), offline=True)
 
     def reset_online_state(self) -> None:
         """Start the online phase with empty replay and fresh optimizer moments."""
@@ -184,22 +194,25 @@ class DSOFMethod:
         self.online_optimizer.state.clear()
 
     def _supervised_update(self, context: Tensor, target: Tensor,
-                           groups: frozenset[str] = frozenset({"teacher", "student"})) -> float:
+                           groups: frozenset[str] = frozenset({"teacher", "student"}),
+                           *, offline: bool = False) -> float:
+        teacher_optimizer = self.offline_teacher_optimizer if offline else self.teacher_optimizer
+        student_optimizer = self.offline_student_optimizer if offline else self.student_optimizer
         self.model.train()
         with torch.set_grad_enabled("teacher" in groups):
             teacher_prediction = self.model.teacher(context)
         final_prediction = teacher_prediction.detach() + self.model.residual(context, teacher_prediction)
         teacher_loss = (teacher_prediction - target).square().mean()
         student_loss = (final_prediction - target).square().mean()
-        self.teacher_optimizer.zero_grad(set_to_none=True)
-        self.student_optimizer.zero_grad(set_to_none=True)
+        teacher_optimizer.zero_grad(set_to_none=True)
+        student_optimizer.zero_grad(set_to_none=True)
         if "teacher" in groups:
             teacher_loss.backward()
-            self.teacher_optimizer.step()
+            teacher_optimizer.step()
             self.last_gradient_steps += 1
         if "student" in groups:
             student_loss.backward()
-            self.student_optimizer.step()
+            student_optimizer.step()
             self.last_gradient_steps += 1
         return student_loss.detach().item()
 

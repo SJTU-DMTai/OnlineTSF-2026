@@ -39,7 +39,7 @@ run_fsnet() {
     local gpu="$1" dataset="$2" positions="$3" annotations="$4"
     local log="$FSNET_ROOT/logs/$dataset-fsnet.log"
     echo "START GPU=$gpu dataset=$dataset method=fsnet log=$log"
-    CUDA_VISIBLE_DEVICES="$gpu" python -u -m onlinetsf.decision \
+    CUDA_VISIBLE_DEVICES="$gpu" python -u -m onlinetsf.decision_previous \
         --annotations "$annotations" --dataset "$dataset" --method fsnet \
         --horizon 24 --seed 0 --profiles profiles.yaml --context-length 96 \
         --epochs 6 --batch-size 32 --positions "$positions" --workers "$WORKERS" \

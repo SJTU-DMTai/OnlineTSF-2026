@@ -117,6 +117,10 @@ def load_config(
     method_name = method.get("name")
     if method_name not in METHODS:
         raise ValueError(f"config.method.name must be one of: {', '.join(sorted(METHODS))}")
+    offline_rate = method.get("offline_learning_rate", 0.005771621537901884 if method_name == "dsof" else 1e-3)
+    if not isinstance(offline_rate, (int, float)) or isinstance(offline_rate, bool) or not math.isfinite(offline_rate) or offline_rate <= 0:
+        raise ValueError("config.method.offline_learning_rate must be finite and positive")
+    method["offline_learning_rate"] = float(offline_rate)
     paired_backbones = {"fsnet": "fsnet_tcn", "onenet": "onenet_tcn"}
     expected_backbone = paired_backbones.get(method_name)
     if expected_backbone is not None and backbone != expected_backbone:
@@ -128,8 +132,11 @@ def load_config(
     if method_name == "dsof":
         if backbone in {"fsnet_tcn", "onenet_tcn"}:
             raise ValueError("dsof requires a standard forecasting backbone")
-        for option in ("learning_rate", "student_learning_rate", "online_learning_rate"):
-            value = method.get(option, 1e-3)
+        for option, default in (("learning_rate", 0.00028889418723619334),
+                                ("student_learning_rate", 0.00015686974622312612),
+                                ("online_learning_rate", 0.00036288062287989935),
+                                ("offline_student_learning_rate", 0.001026953060677239)):
+            value = method.get(option, default)
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"config.method.{option} must be positive for dsof")
             method[option] = float(value)
@@ -159,9 +166,10 @@ def load_config(
             raise ValueError("config.method.n_inner must be a positive integer for fsnet")
         method["n_inner"] = n_inner
     if method_name == "onenet":
-        for option in ("learning_rate", "weight_learning_rate", "decision_learning_rate"):
+        for option in ("learning_rate", "weight_learning_rate", "decision_learning_rate",
+                       "offline_decision_learning_rate", "offline_weight_learning_rate"):
             value = method.get(option, 1e-3)
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0.0:
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"config.method.{option} must be positive for onenet")
             method[option] = float(value)
         decision_hidden = method.get("decision_hidden", 32)
@@ -184,8 +192,8 @@ def load_config(
     if method_name == "under_cali":
         if backbone in {"fsnet_tcn", "onenet_tcn"}:
             raise ValueError("under_cali requires a standard forecasting backbone")
-        for option, default in (("learning_rate", None), ("adapt_lr", 1e-3),
-                                ("uncertainty_lr", 1e-4), ("uncertainty_adapt_lr", 1e-4)):
+        for option, default in (("adapt_lr", 1e-3),
+                                ("uncertainty_lr", 1e-5), ("uncertainty_adapt_lr", 1e-4)):
             value = method.get(option, default)
             if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"config.method.{option} must be positive for under_cali")
@@ -225,8 +233,6 @@ def load_config(
     offline["batch_size"] = offline_batch_size
     if method_name == "under_cali" and offline["train_ratio"] == 0.0:
         raise ValueError("under_cali requires offline.train_ratio > 0")
-    if offline["train_ratio"] > 0.0 and method.get("learning_rate") is None:
-        raise ValueError("config.method.learning_rate is required when offline training is enabled")
 
     if "feedback_delay" not in online:
         raise ValueError("config.online.feedback_delay is required")
@@ -242,16 +248,18 @@ def load_config(
     if method_name in {"fsnet", "onenet", "under_cali"} and isinstance(feedback_delay, list):
         raise ValueError(f"{method_name} requires a scalar complete-feedback delay")
 
-    decision = config.get("decision")
+    if config.get("decision") is not None and config.get("decision_previous") is not None:
+        raise ValueError("choose decision or decision_previous, not both")
+    decision = config.get("decision_previous")
     if decision is not None:
         if not isinstance(decision, dict) or not isinstance(decision.get("selector"), str):
-            raise ValueError("config.decision requires a selector artifact path")
+            raise ValueError("config.decision_previous requires a selector artifact path")
         decision = dict(decision)
         artifact = Path(decision["selector"])
         decision["selector"] = str((source.parent / artifact).resolve()) if not artifact.is_absolute() else str(artifact)
         decision.setdefault("controller", "policy_full")
         if decision["controller"] not in {"policy_full", "policy_data", "native", "best_fixed"}:
-            raise ValueError("unknown config.decision.controller")
+            raise ValueError("unknown config.decision_previous.controller")
         if method_name == "under_cali":
             raise ValueError("under_cali has not implemented decision update capabilities")
         if data.get("stride", 1) != 1:
@@ -260,7 +268,21 @@ def load_config(
             raise ValueError("adaptive complete feedback must wait for the whole forecast horizon")
         if isinstance(feedback_delay, list) and feedback_delay != list(range(1, data["horizon"] + 1)):
             raise ValueError("adaptive partial feedback requires delays [1, ..., horizon]")
-        config["decision"] = decision
+        config["decision_previous"] = decision
+
+    decision = config.get("decision")
+    if decision is not None:
+        from .decision.actions import UpdateAction
+
+        if not isinstance(decision, dict) or set(decision) != {"action"}:
+            raise ValueError("config.decision requires only action")
+        UpdateAction.from_dict(decision["action"])
+        if method_name not in {"onenet", "fsnet", "dsof"}:
+            raise ValueError("update actions support onenet, fsnet and dsof")
+        if data.get("stride", 1) != 1:
+            raise ValueError("update actions require data.stride: 1")
+        if isinstance(feedback_delay, int) and feedback_delay < data["horizon"]:
+            raise ValueError("complete feedback must wait for the whole forecast horizon")
 
     detector_name = drift.get("name")
     if detector_name not in DRIFT_DETECTORS:

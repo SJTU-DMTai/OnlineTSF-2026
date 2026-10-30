@@ -145,6 +145,8 @@ class OnlineExecutor:
             self.feedback_delay = delays
 
         self.method = method
+        if hasattr(method, "validate_feedback_delay"):
+            method.validate_feedback_delay(self.feedback_delay)
         self.keep_predictions = keep_predictions
         self._pending: list[tuple[int, int, _PendingFeedback]] = []
         self._events: list[FeedbackEvent] = []
@@ -368,14 +370,24 @@ class OnlineExecutor:
         return emission_available_at
 
     def _deliver_through(self, index: int, current_context: Tensor | None = None) -> tuple[FeedbackEvent, ...]:
-        feedback: list[FeedbackEvent] = []
+        pending_batch = []
+        method_feedback = []
         while self._pending and self._pending[0][0] <= index:
             _, _, pending = heapq.heappop(self._pending)
-            feedback.append(self._consume_feedback(pending, current_context))
-        return tuple(feedback)
+            pending_batch.append(pending)
+            method_feedback.append(MethodFeedback(
+                index=pending.index, available_at=pending.available_at,
+                context=pending.context.clone(),
+                target=pending.target.masked_fill(~pending.observed_mask, float("nan")),
+                observed_mask=pending.observed_mask.clone(), prediction=pending.prediction.clone(),
+                current_context=current_context.detach().clone() if current_context is not None else None))
+        if method_feedback and hasattr(self.method, "prepare_feedback"):
+            self.method.prepare_feedback(tuple(method_feedback))
+        return tuple(self._consume_feedback(pending, feedback)
+                     for pending, feedback in zip(pending_batch, method_feedback, strict=True))
 
-    def _consume_feedback(self, pending: _PendingFeedback, current_context: Tensor | None) -> FeedbackEvent:
-        observed_target = pending.target.masked_fill(~pending.observed_mask, float("nan"))
+    def _consume_feedback(self, pending: _PendingFeedback, feedback: MethodFeedback) -> FeedbackEvent:
+        observed_target = feedback.target
         error = pending.prediction[pending.observed_mask] - pending.target[pending.observed_mask]
         absolute_error = error.abs()
         squared_error = error.square()
@@ -385,17 +397,7 @@ class OnlineExecutor:
         self._values_scored += observed_values
         self._feedback_received += 1
 
-        adaptation_loss = self.method.on_feedback(
-            MethodFeedback(
-                index=pending.index,
-                available_at=pending.available_at,
-                context=pending.context.clone(),
-                target=observed_target,
-                observed_mask=pending.observed_mask.clone(),
-                prediction=pending.prediction.clone(),
-                current_context=current_context.detach().clone() if current_context is not None else None,
-            )
-        )
+        adaptation_loss = self.method.on_feedback(feedback)
         if adaptation_loss is not None:
             self._adaptation_steps += 1
             self._adaptation_loss_sum += adaptation_loss

@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 from torch.optim import Adam, AdamW, Optimizer
 
 from ..online import MethodFeedback
@@ -16,8 +17,62 @@ from ..online import MethodFeedback
 LossFunction = Callable[[Tensor, Tensor], Tensor]
 
 
+class OneNetConvBlock(nn.Module):
+    """Two same-padded, pre-activation convolutions and a residual projection."""
+
+    def __init__(self, inputs: int, outputs: int, kernel_size: int, dilation: int, *, final: bool) -> None:
+        super().__init__()
+        padding = ((kernel_size - 1) * dilation + 1) // 2
+        self.conv1 = nn.Conv1d(inputs, outputs, kernel_size, padding=padding, dilation=dilation)
+        self.conv2 = nn.Conv1d(outputs, outputs, kernel_size, padding=padding, dilation=dilation)
+        self.projector = nn.Conv1d(inputs, outputs, 1) if inputs != outputs or final else nn.Identity()
+
+    def forward(self, values: Tensor) -> Tensor:
+        length = values.shape[-1]
+        output = self.conv1(F.gelu(values))[..., :length]
+        output = self.conv2(F.gelu(output))[..., :length]
+        return output + self.projector(values)
+
+
+class OneNetTCN(nn.Module):
+    """OneNet branch dimensions and representation dropout from the official encoder."""
+
+    def __init__(self, context_length: int, num_features: int, horizon: int, num_targets: int,
+                 *, cross_time: bool = False, target_indices: tuple[int, ...] = (),
+                 hidden_channels: int = 64, depth: int = 10, representation_channels: int = 320,
+                 kernel_size: int = 3, representation_dropout: float = 0.1) -> None:
+        super().__init__()
+        if min(context_length, num_features, horizon, num_targets, hidden_channels, depth,
+               representation_channels, kernel_size) <= 0:
+            raise ValueError("OneNet dimensions must be positive")
+        if not 0 <= representation_dropout < 1:
+            raise ValueError("representation_dropout must be in [0, 1)")
+        self.context_length, self.horizon, self.num_targets = context_length, horizon, num_targets
+        self.cross_time = cross_time
+        self.register_buffer("target_indices", torch.tensor(target_indices, dtype=torch.long), persistent=False)
+        self.input_projection = nn.Linear(context_length if cross_time else num_features, hidden_channels)
+        channels = [hidden_channels] * depth + [representation_channels]
+        self.blocks = nn.Sequential(*[
+            OneNetConvBlock(channels[index - 1] if index else hidden_channels, output, kernel_size,
+                            2**index, final=index == len(channels) - 1)
+            for index, output in enumerate(channels)
+        ])
+        self.representation_dropout = nn.Dropout(representation_dropout)
+        self.head = nn.Linear(representation_channels, horizon if cross_time else horizon * num_targets)
+
+    def forward(self, context: Tensor) -> Tensor:
+        # The official time branch projects each variable's history, then convolves
+        # over variables; the other branch projects features and convolves over time.
+        values = context.index_select(2, self.target_indices).transpose(1, 2) if self.cross_time else context
+        encoded = self.input_projection(values).transpose(1, 2)
+        encoded = self.representation_dropout(self.blocks(encoded))
+        if self.cross_time:
+            return self.head(encoded.transpose(1, 2)).transpose(1, 2)
+        return self.head(encoded[..., -1]).reshape(context.shape[0], self.horizon, self.num_targets)
+
+
 class OneNetEnsemble(nn.Module):
-    """Combine a variable-independent expert and a cross-variable expert."""
+    """Combine complementary time- and variable-oriented forecasting experts."""
 
     def __init__(
         self,
@@ -104,6 +159,9 @@ class OneNetMethod:
         learning_rate: float = 1e-3,
         weight_learning_rate: float = 1e-3,
         decision_learning_rate: float = 1e-3,
+        offline_learning_rate: float = 1e-3,
+        offline_decision_learning_rate: float = 1e-3,
+        offline_weight_learning_rate: float = 1e-3,
         expert_optimizer: Optimizer | None = None,
         decision_optimizer: Optimizer | None = None,
         loss_fn: LossFunction | None = None,
@@ -114,6 +172,9 @@ class OneNetMethod:
             learning_rate <= 0.0
             or weight_learning_rate <= 0.0
             or decision_learning_rate <= 0.0
+            or offline_learning_rate <= 0.0
+            or offline_decision_learning_rate <= 0.0
+            or offline_weight_learning_rate <= 0.0
         ):
             raise ValueError("OneNet learning rates must be positive")
         if not isinstance(n_inner, int) or isinstance(n_inner, bool) or n_inner <= 0:
@@ -128,6 +189,11 @@ class OneNetMethod:
             model.cross_variable.parameters()
         )
         self.expert_optimizer = expert_optimizer or AdamW(expert_parameters, lr=learning_rate)
+        self.offline_expert_optimizer = AdamW(expert_parameters, lr=offline_learning_rate)
+        self.offline_decision_optimizer = Adam(
+            model.decision.parameters(), lr=offline_decision_learning_rate
+        )
+        self.offline_weight_learning_rate = offline_weight_learning_rate
         self.weight_learning_rate = weight_learning_rate
         self.decision_optimizer = decision_optimizer or Adam(
             model.decision.parameters(), lr=decision_learning_rate
@@ -212,10 +278,13 @@ class OneNetMethod:
         self.model.train()
         cross_time, cross_variable = self.model.expert_predictions(context)
         loss = self.loss_fn(cross_time, target) + self.loss_fn(cross_variable, target)
-        self.expert_optimizer.zero_grad(set_to_none=True)
+        self.offline_expert_optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        self.expert_optimizer.step()
-        self._update_ensemble(cross_time.detach(), cross_variable.detach(), target)
+        self.offline_expert_optimizer.step()
+        self.last_gradient_steps, self.last_egd_steps = 1, 0
+        self._update_ensemble(cross_time.detach(), cross_variable.detach(), target,
+                              decision_optimizer=self.offline_decision_optimizer,
+                              weight_learning_rate=self.offline_weight_learning_rate)
         return loss.detach().item()
 
     def _update(
@@ -225,8 +294,14 @@ class OneNetMethod:
         emitted_cross_time: Tensor,
         emitted_cross_variable: Tensor,
         groups: frozenset[str],
+        *,
+        update_long: bool = True,
+        refresh_short: bool = True,
     ) -> None:
-        self.model.train()
+        # Official online experts run in evaluation mode; only the decision MLP
+        # is trained with dropout. Offline train_batch enables branch dropout.
+        self.model.eval()
+        self.model.decision.train()
         self.expert_optimizer.zero_grad(set_to_none=True)
         if groups & {"time", "variable"}:
             losses = []
@@ -237,7 +312,11 @@ class OneNetMethod:
             sum(losses).backward()
             self.expert_optimizer.step()
             self.last_gradient_steps += 1
-        self._update_ensemble(emitted_cross_time, emitted_cross_variable, target, train_decision="decision" in groups)
+        self._update_ensemble(emitted_cross_time, emitted_cross_variable, target,
+                              decision_optimizer=self.decision_optimizer,
+                              weight_learning_rate=self.weight_learning_rate,
+                              train_decision="decision" in groups,
+                              update_long=update_long, refresh_short=refresh_short)
 
     def _update_ensemble(
         self,
@@ -245,24 +324,31 @@ class OneNetMethod:
         cross_variable: Tensor,
         target: Tensor,
         *,
+        decision_optimizer: Optimizer,
+        weight_learning_rate: float,
         train_decision: bool = True,
+        update_long: bool = True,
+        refresh_short: bool = True,
     ) -> None:
         # The decision network learns a recent correction conditioned on the labeled forecast.
-        self.decision_optimizer.zero_grad(set_to_none=True)
-        with torch.set_grad_enabled(train_decision):
-            bias = self.model.decision_bias(cross_time, cross_variable, target)
-            if train_decision:
-                short_weight = torch.sigmoid(self.model.long_logits.view(1, -1) + bias)
-                short_prediction = short_weight.unsqueeze(1) * cross_time + (1.0 - short_weight.unsqueeze(1)) * cross_variable
-                self.loss_fn(short_prediction, target).backward()
-                self.decision_optimizer.step()
-                self.last_gradient_steps += 1
-        self.model.short_bias.copy_(bias.detach().mean(dim=0))
+        decision_optimizer.zero_grad(set_to_none=True)
+        if train_decision or refresh_short:
+            with torch.set_grad_enabled(train_decision):
+                bias = self.model.decision_bias(cross_time, cross_variable, target)
+                if train_decision:
+                    short_weight = torch.sigmoid(self.model.long_logits.view(1, -1) + bias)
+                    short_prediction = short_weight.unsqueeze(1) * cross_time + (1.0 - short_weight.unsqueeze(1)) * cross_variable
+                    self.loss_fn(short_prediction, target).backward()
+                    decision_optimizer.step()
+                    self.last_gradient_steps += 1
+            if refresh_short:
+                self.model.short_bias.copy_(bias.detach().mean(dim=0))
 
         # Paper Eq. (2), with per-target horizon-mean squared error as expert loss.
         # For two experts, log(w_time / w_variable) has this exact EGD update.
-        with torch.no_grad():
-            time_loss = (cross_time - target).square().mean(dim=(0, 1))
-            variable_loss = (cross_variable - target).square().mean(dim=(0, 1))
-            self.model.long_logits.add_(self.weight_learning_rate * (variable_loss - time_loss))
-            self.last_egd_steps += 1
+        if update_long:
+            with torch.no_grad():
+                time_loss = (cross_time - target).square().mean(dim=(0, 1))
+                variable_loss = (cross_variable - target).square().mean(dim=(0, 1))
+                self.model.long_logits.add_(weight_learning_rate * (variable_loss - time_loss))
+                self.last_egd_steps += 1

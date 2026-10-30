@@ -17,8 +17,8 @@ from torch.utils.data import DataLoader, Subset
 
 from ..factory import build_backbone, build_method as build_online_method
 from ..methods import DSOFMethod, FSNetMethod, OneNetMethod
-from ..decision.config import DecisionConfig, FEATURE_SCHEMA_VERSION
-from ..decision.actions import policies
+from ..decision_previous.config import DecisionConfig, FEATURE_SCHEMA_VERSION
+from ..decision_previous.actions import policies
 from .data import load_stream, select_probes
 from .reporting import Reporter, write_csv
 from .runtime import ControlledMethod, Policy, Replay, restore_rng, rng_state, state_features
@@ -45,14 +45,7 @@ def train_prefix(method, dataset, prefix_rows: int, epochs: int, batch_size: int
     method.model.train()
     for _ in range(epochs):
         for context, target in loader:
-            if isinstance(method, (OneNetMethod, DSOFMethod)):
-                method.train_batch(context, target)
-            else:
-                method.optimizer.zero_grad(set_to_none=True)
-                loss = method.loss_fn(method.model(context.to(method.device)), target.to(method.device))
-                loss.backward()
-                method.model.record_gradients()
-                method.optimizer.step()
+            method.train_batch(context, target)
     if isinstance(method, (OneNetMethod, DSOFMethod)):
         method.reset_online_state()
 

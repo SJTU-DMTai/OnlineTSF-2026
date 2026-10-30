@@ -32,9 +32,9 @@ _EXPORTS = {
     'OneNetEnsemble': '.methods',
     'OneNetMethod': '.methods',
     'UnderCaliMethod': '.methods',
-    'ControlledMethod': '.decision.control',
-    'Policy': '.decision.actions',
-    'AdaptiveMethod': '.decision.runtime',
+    'UpdateAction': '.decision',
+    'UpdateController': '.decision',
+    'DecisionState': '.decision',
 }
 __all__ = list(_EXPORTS)
 

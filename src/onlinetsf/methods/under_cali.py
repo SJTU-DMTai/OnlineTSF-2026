@@ -107,9 +107,9 @@ class UnderCaliMethod:
         horizon: int,
         num_features: int,
         num_targets: int,
-        learning_rate: float,
+        offline_learning_rate: float = 1e-3,
         adapt_lr: float = 1e-3,
-        uncertainty_lr: float = 1e-4,
+        uncertainty_lr: float = 1e-5,
         uncertainty_adapt_lr: float = 1e-4,
         calibrator_hidden_dim: int = 64,
         uncertainty_hidden_dim: int = 128,
@@ -123,7 +123,7 @@ class UnderCaliMethod:
     ) -> None:
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.model = model.to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.offline_optimizer = torch.optim.Adam(self.model.parameters(), lr=offline_learning_rate)
         self.loss_fn = nn.MSELoss()
         self.reliable = CalibrationExpert(
             context_length, horizon, num_features, num_targets, calibrator_hidden_dim
@@ -136,10 +136,12 @@ class UnderCaliMethod:
         ).to(self.device)
         self.reliable_optimizer = torch.optim.Adam(self.reliable.parameters(), lr=adapt_lr)
         self.unreliable_optimizer = torch.optim.Adam(self.unreliable.parameters(), lr=adapt_lr * 0.5)
-        self.uncertainty_optimizer = torch.optim.Adam(
+        self.offline_uncertainty_optimizer = torch.optim.Adam(
             self.uncertainty.parameters(), lr=uncertainty_lr
         )
-        self.uncertainty_adapt_lr = uncertainty_adapt_lr
+        self.uncertainty_optimizer = torch.optim.Adam(
+            self.uncertainty.parameters(), lr=uncertainty_adapt_lr
+        )
         self.uncertainty_epochs = uncertainty_epochs
         self.update_steps = update_steps
         self.allocation_alpha = allocation_alpha
@@ -152,6 +154,18 @@ class UnderCaliMethod:
         self.trigger_variance = 0.0
         self._last_route: tuple[float, bool] | None = None
         self._pending_routes: dict[int, tuple[float, bool]] = {}
+
+    @property
+    def update_optimizers(self) -> tuple[torch.optim.Optimizer, ...]:
+        return self.reliable_optimizer, self.unreliable_optimizer, self.uncertainty_optimizer
+
+    def train_batch(self, context: Tensor, target: Tensor) -> float:
+        self.model.train()
+        self.offline_optimizer.zero_grad(set_to_none=True)
+        loss = self.loss_fn(self.model(context.to(self.device)), target.to(self.device))
+        loss.backward()
+        self.offline_optimizer.step()
+        return loss.detach().item()
 
     def pretrain_uncertainty(
         self, dataset: Sequence[tuple[Tensor, Tensor]], train_size: int, batch_size: int
@@ -184,14 +198,11 @@ class UnderCaliMethod:
                     normalized = ((errors - self.uncertainty.error_min) /
                                   (self.uncertainty.error_max - self.uncertainty.error_min).clamp_min(1e-8))
                     normalized = normalized.clamp(0.0, 1.0)
-                self.uncertainty_optimizer.zero_grad(set_to_none=True)
+                self.offline_uncertainty_optimizer.zero_grad(set_to_none=True)
                 loss = F.l1_loss(self.uncertainty(context, prediction), normalized)
                 loss.backward()
-                self.uncertainty_optimizer.step()
+                self.offline_uncertainty_optimizer.step()
         self.uncertainty.eval()
-        self.uncertainty_optimizer = torch.optim.Adam(
-            self.uncertainty.parameters(), lr=self.uncertainty_adapt_lr
-        )
 
     def predict(self, context: Tensor) -> Tensor:
         self.model.eval()

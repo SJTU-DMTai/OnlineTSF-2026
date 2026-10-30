@@ -10,11 +10,11 @@ from torch import nn
 
 from .forecasting import (
     DLinearForecastBackbone, LinearForecastBackbone, LSTMForecastBackbone,
-    PatchTSTForecastBackbone, TCNForecastBackbone, TimeTCNForecastBackbone,
+    PatchTSTForecastBackbone, TCNForecastBackbone,
 )
 from .methods import (
     DSOFMethod, DSOFModel, FSNetMethod, FSNetTCN, OGDMethod,
-    OneNetEnsemble, OneNetMethod, UnderCaliMethod,
+    OneNetEnsemble, OneNetMethod, OneNetTCN, UnderCaliMethod,
 )
 
 
@@ -40,10 +40,10 @@ def build_backbone(config: dict[str, Any], num_features: int, num_targets: int, 
     elif backbone == "patchtst":
         model = PatchTSTForecastBackbone(**dimensions, target_indices=target_indices, **options)
     elif backbone == "onenet_tcn":
-        cross_time = TimeTCNForecastBackbone(
-            **dimensions, target_indices=target_indices, **options
+        cross_time = OneNetTCN(
+            **dimensions, cross_time=True, target_indices=tuple(target_indices), **options
         )
-        cross_variable = TCNForecastBackbone(**dimensions, **options)
+        cross_variable = OneNetTCN(**dimensions, **options)
         return OneNetEnsemble(
             cross_time,
             cross_variable,
@@ -75,9 +75,11 @@ def build_method(config: dict[str, Any], model: nn.Module):
         assert isinstance(model, DSOFModel)
         return DSOFMethod(
             model,
-            learning_rate=learning_rate,
-            student_learning_rate=method.get("student_learning_rate", 1e-3),
-            online_learning_rate=method.get("online_learning_rate", 1e-3),
+            learning_rate=method.get("learning_rate", 0.00028889418723619334),
+            student_learning_rate=method.get("student_learning_rate", 0.00015686974622312612),
+            online_learning_rate=method.get("online_learning_rate", 0.00036288062287989935),
+            offline_learning_rate=method.get("offline_learning_rate", 0.005771621537901884),
+            offline_student_learning_rate=method.get("offline_student_learning_rate", 0.001026953060677239),
             replay_buffer_size=method.get("replay_buffer_size", 300),
             replay_batch_size=method.get("replay_batch_size", 32),
             replay_epochs=method.get("replay_epochs", 1),
@@ -92,6 +94,9 @@ def build_method(config: dict[str, Any], model: nn.Module):
             learning_rate=learning_rate,
             weight_learning_rate=method.get("weight_learning_rate", 1e-3),
             decision_learning_rate=method.get("decision_learning_rate", 1e-3),
+            offline_learning_rate=method.get("offline_learning_rate", 1e-3),
+            offline_decision_learning_rate=method.get("offline_decision_learning_rate", 1e-3),
+            offline_weight_learning_rate=method.get("offline_weight_learning_rate", 1e-3),
             n_inner=method.get("n_inner", 1),
             device=device,
         )
@@ -100,6 +105,7 @@ def build_method(config: dict[str, Any], model: nn.Module):
         return FSNetMethod(
             model,
             learning_rate=learning_rate,
+            offline_learning_rate=method.get("offline_learning_rate", 1e-3),
             n_inner=method.get("n_inner", 1),
             device=device,
         )
@@ -111,7 +117,7 @@ def build_method(config: dict[str, Any], model: nn.Module):
             horizon=config["data"]["horizon"],
             num_features=config["data"]["num_features"],
             num_targets=len(config["data"]["target_names"]),
-            learning_rate=learning_rate,
+            offline_learning_rate=method.get("offline_learning_rate", 1e-3),
             adapt_lr=method["adapt_lr"],
             uncertainty_lr=method["uncertainty_lr"],
             uncertainty_adapt_lr=method["uncertainty_adapt_lr"],
@@ -126,13 +132,13 @@ def build_method(config: dict[str, Any], model: nn.Module):
             device=device,
         )
 
-    if learning_rate is None:
-        return OGDMethod(model, device=device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    offline_optimizer = torch.optim.Adam(model.parameters(), lr=method.get("offline_learning_rate", 1e-3))
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate) if learning_rate is not None else None
     return OGDMethod(
         model,
         optimizer=optimizer,
-        loss_fn=nn.MSELoss(),
+        offline_optimizer=offline_optimizer,
+        loss_fn=nn.MSELoss() if optimizer is not None else None,
         update_steps=method.get("update_steps", 1),
         device=device,
     )

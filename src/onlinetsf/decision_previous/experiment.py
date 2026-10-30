@@ -16,7 +16,7 @@ from .config import DecisionConfig
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__,
-                                     epilog="To add diagnostics later: python -m onlinetsf.decision diagnose --help")
+                                     epilog="To add diagnostics later: python -m onlinetsf.decision_previous diagnose --help")
     parser.add_argument("--method", choices=["onenet", "fsnet", "dsof"], required=True)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--annotations", type=Path, required=True, help="parent of the labeled dataset directory")

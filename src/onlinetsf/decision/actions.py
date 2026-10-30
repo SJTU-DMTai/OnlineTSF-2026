@@ -1,60 +1,60 @@
-"""Update actions depend on declared capabilities, never on model class names."""
+"""Online update actions: selected units, learning rates, periods and duration."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
-from itertools import combinations
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from collections.abc import Mapping
 
-from .config import DecisionConfig
+
+def positive_integer(value: int, name: str) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
 
 
 @dataclass(frozen=True)
-class Policy:
-    name: str
-    mode: str = "native"
-    period: int = 1
-    lr_scale: float = 1.0
-    groups: frozenset[str] | None = None
+class UpdateAction:
+    """Learning rate multipliers; omitted scales and periods default to 1.
+
+    An empty set of units freezes parameters and adaptation state while
+    preserving the method's necessary prediction and feedback records.
+    """
+
+    units: frozenset[str] = frozenset()
+    learning_rate_scales: Mapping[str, float] = field(default_factory=dict)
+    periods: Mapping[str, int] = field(default_factory=dict)
+    duration: int = 1
 
     def __post_init__(self) -> None:
-        if not self.name or self.mode not in {"native", "no_grad", "frozen"}:
-            raise ValueError("action requires a name and a valid mode")
-        if not isinstance(self.period, int) or isinstance(self.period, bool) or self.period <= 0:
-            raise ValueError("period must be a positive integer")
-        if not math.isfinite(self.lr_scale) or self.lr_scale <= 0:
-            raise ValueError("lr_scale must be finite and positive")
-        if self.mode != "native" and self.groups:
-            raise ValueError("no_grad/frozen cannot select gradient update groups")
+        if isinstance(self.units, str):
+            raise ValueError("units must be a collection of unit names")
+        units = frozenset(self.units)
+        if any(not isinstance(name, str) or not name for name in units):
+            raise ValueError("unit names must be nonempty strings")
+        scales, periods = dict(self.learning_rate_scales), dict(self.periods)
+        positive_integer(self.duration, "duration")
+        for name, scale in scales.items():
+            if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
+                raise ValueError(f"learning rate scale for {name} must be finite and positive")
+        for name, period in periods.items():
+            positive_integer(period, f"period for {name}")
+        if scales.keys() - units or periods.keys() - units:
+            raise ValueError("learning rate scales and periods must refer to selected units")
+        periods = {name: period for name, period in periods.items() if period != 1}
+        object.__setattr__(self, "units", units)
+        object.__setattr__(self, "learning_rate_scales", MappingProxyType(scales))
+        object.__setattr__(self, "periods", MappingProxyType(periods))
 
     def to_dict(self) -> dict:
-        record = asdict(self)
-        record["groups"] = sorted(self.groups) if self.groups is not None else "all"
-        return record
+        return {"units": sorted(self.units),
+                "learning_rate_scales": dict(self.learning_rate_scales), "periods": dict(self.periods),
+                "duration": self.duration}
 
     @classmethod
-    def from_dict(cls, record: dict) -> Policy:
-        return cls(**{**record, "groups": None if record["groups"] == "all" else frozenset(record["groups"])})
+    def from_dict(cls, record: dict) -> UpdateAction:
+        return cls(**record)
 
-
-def policies(groups: tuple[str, ...], config: DecisionConfig, suite: str = "both") -> list[Policy]:
-    result = [Policy("native")]
-    if suite in {"when", "both"}:
-        result.extend(Policy(mode, mode=mode) for mode in config.modes)
-        for period in config.periods:
-            for scale in config.lr_scales:
-                if period != 1 or scale != 1.0:
-                    result.append(Policy(f"every{period}_lr{scale:g}", period=period, lr_scale=scale))
-    if suite in {"what", "both"}:
-        if "no_grad" in config.modes and not any(item.name == "no_grad" for item in result):
-            result.append(Policy("no_grad", mode="no_grad"))
-        subsets = config.group_subsets
-        if subsets is None:
-            subsets = tuple(subset for size in range(1, len(groups)) for subset in combinations(groups, size))
-        for subset in subsets:
-            if not subset or len(subset) != len(set(subset)) or set(subset) - set(groups):
-                raise ValueError(f"invalid action update groups: {subset}; available: {groups}")
-            result.append(Policy("only_" + "+".join(subset), groups=frozenset(subset)))
-    if len({item.name for item in result}) != len(result):
-        raise ValueError("action configuration produces duplicate names")
-    return result
+    def __reduce__(self):
+        # MappingProxyType protects actions from mutation by a policy/caller.
+        return (type(self).from_dict, (self.to_dict(),))

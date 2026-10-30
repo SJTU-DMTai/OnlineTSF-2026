@@ -24,8 +24,8 @@ from .policy_support import (
     oracle_decision, score_action, summarize_decisions,
 )
 
-from ..decision.config import DecisionConfig, FEATURE_SCHEMA_VERSION
-from ..decision.training import fit_selector, historical_training_data
+from ..decision_previous.config import DecisionConfig, FEATURE_SCHEMA_VERSION
+from ..decision_previous.training import fit_selector, historical_training_data
 
 
 def block_metrics(forecasts: pd.DataFrame, decisions: list[dict], interval: int,
@@ -49,7 +49,7 @@ def run_segment(replay, stream, start: int, steps: int, interval: int,
                 *, oracle_metric: str | None = None) -> tuple[pd.DataFrame, list[dict], dict]:
     from onlinetsf.update_study.reporting import Reporter
     from onlinetsf.update_study.runtime import restore_rng, rng_state, state_features
-    from onlinetsf.decision.runtime import DecisionEngine
+    from onlinetsf.decision_previous.runtime import DecisionEngine
 
     branch = replay.fork(actions["native"])
     engine = DecisionEngine(bundle, controller, branch.method.method)

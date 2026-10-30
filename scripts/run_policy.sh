@@ -20,7 +20,7 @@ run_pipeline() {
     local job="$RUN_ROOT/$dataset/$method"
     local log="$RUN_ROOT/logs/$dataset-$method.log"
     echo "START GPU=$gpu dataset=$dataset method=$method log=$log"
-    CUDA_VISIBLE_DEVICES="$gpu" python -u -m onlinetsf.decision \
+    CUDA_VISIBLE_DEVICES="$gpu" python -u -m onlinetsf.decision_previous \
         --annotations "$annotations" --dataset "$dataset" --method "$method" \
         --horizon 24 --seed 0 --profiles profiles.yaml --context-length 96 \
         --epochs 6 --batch-size 32 --positions "$positions" --workers "$WORKERS" \
