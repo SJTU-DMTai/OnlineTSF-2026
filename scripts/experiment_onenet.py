@@ -1,11 +1,10 @@
-"""OneNet action grids on a continuous stream or branches of its native trajectory."""
+"""One-factor OneNet sweeps on a continuous stream or native-trajectory branches."""
 
 from __future__ import annotations
 
 import argparse
 import copy
 import csv
-import itertools
 import json
 import math
 import sys
@@ -34,14 +33,18 @@ COUNTERS = ("gradient_steps", "egd_steps", "gradient_update_clocks", "decision_c
 
 
 def build_actions(scales, periods, duration: int) -> list[dict]:
-    """One common multiplier and period for all applicable selected units.
+    """Vary modules, rate or period separately, holding other factors native.
 
-    Preserve all requested grid points, including equivalent frozen/short-only
-    settings. A state unit without a learning rate never receives a multiplier.
+    Keep the native point in each sweep for independent comparisons. Defaults
+    produce 32 + 7 + 5 records (42 distinct actions, 44 experimental runs).
     """
     capabilities = OneNetAdapter.capabilities
+    full_mask = (1 << len(capabilities.units)) - 1
+    settings = [("modules", mask, 1.0, 1) for mask in range(full_mask + 1)]
+    settings.extend(("learning_rate", full_mask, scale, 1) for scale in scales)
+    settings.extend(("period", full_mask, 1.0, period) for period in periods)
     actions = []
-    for mask, scale, period in itertools.product(range(1 << len(capabilities.units)), scales, periods):
+    for sweep, mask, scale, period in settings:
         selected = [unit for bit, unit in enumerate(capabilities.units) if mask & (1 << bit)]
         action = UpdateAction(
             units={unit.name for unit in selected},
@@ -50,7 +53,7 @@ def build_actions(scales, periods, duration: int) -> list[dict]:
             duration=duration,
         )
         capabilities.validate(action)
-        actions.append({"action_id": f"a{len(actions):04d}", "mask": mask,
+        actions.append({"action_id": f"a{len(actions):04d}", "sweep": sweep, "mask": mask,
                         "units": "+".join(unit.name for unit in selected) or "frozen",
                         "lr_scale": scale, "period": period, "action": action})
     return actions
@@ -276,7 +279,7 @@ def main(argv: list[str] | None = None) -> None:
                     summary_writer.writerow(row)
                     summary_file.flush()
                     manifest["completed_runs"] += 1
-                    print(f"  {item['action_id']} M={item['units']} scale={item['lr_scale']:g} "
+                    print(f"  {item['action_id']} sweep={item['sweep']} M={item['units']} scale={item['lr_scale']:g} "
                           f"p={item['period']} {result['status']} mae={result['mae']} "
                           f"grad={result['gradient_steps']}", flush=True)
                     del branch
