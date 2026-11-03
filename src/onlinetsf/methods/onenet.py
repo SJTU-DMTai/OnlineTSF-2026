@@ -189,10 +189,9 @@ class OneNetMethod:
             model.cross_variable.parameters()
         )
         self.expert_optimizer = expert_optimizer or AdamW(expert_parameters, lr=learning_rate)
-        self.offline_expert_optimizer = AdamW(expert_parameters, lr=offline_learning_rate)
-        self.offline_decision_optimizer = Adam(
-            model.decision.parameters(), lr=offline_decision_learning_rate
-        )
+        self.offline_learning_rate = offline_learning_rate
+        self._initial_offline_learning_rate = offline_learning_rate
+        self.offline_decision_learning_rate = offline_decision_learning_rate
         self.offline_weight_learning_rate = offline_weight_learning_rate
         self.weight_learning_rate = weight_learning_rate
         self.decision_optimizer = decision_optimizer or Adam(
@@ -270,6 +269,14 @@ class OneNetMethod:
         self.model.short_bias.zero_()
         self._pending_predictions.clear()
 
+    def end_offline_epoch(self, epoch: int) -> None:
+        """Apply official type1 decay after the one-based training epoch."""
+        factor = 0.5 ** (epoch - 1)
+        self.offline_learning_rate = self._initial_offline_learning_rate * factor
+        for group in self.expert_optimizer.param_groups:
+            group["lr"] *= factor / group.get("lr_decay_factor", 1.0)
+            group["lr_decay_factor"] = factor
+
     def train_batch(self, context: Tensor, target: Tensor) -> float:
         """Train all OneNet components on one offline mini-batch."""
 
@@ -278,13 +285,23 @@ class OneNetMethod:
         self.model.train()
         cross_time, cross_variable = self.model.expert_predictions(context)
         loss = self.loss_fn(cross_time, target) + self.loss_fn(cross_variable, target)
-        self.offline_expert_optimizer.zero_grad(set_to_none=True)
+        self.expert_optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        self.offline_expert_optimizer.step()
-        self.last_gradient_steps, self.last_egd_steps = 1, 0
-        self._update_ensemble(cross_time.detach(), cross_variable.detach(), target,
-                              decision_optimizer=self.offline_decision_optimizer,
-                              weight_learning_rate=self.offline_weight_learning_rate)
+        # Retain Adam moments across phases; only the learning rates differ.
+        online_rates = []
+        for optimizer, rate in ((self.expert_optimizer, self.offline_learning_rate),
+                                (self.decision_optimizer, self.offline_decision_learning_rate)):
+            for group in optimizer.param_groups:
+                online_rates.append((group, group["lr"]))
+                group["lr"] = rate
+        try:
+            self.expert_optimizer.step()
+            self.last_gradient_steps, self.last_egd_steps = 1, 0
+            self._update_ensemble(cross_time.detach(), cross_variable.detach(), target,
+                                  weight_learning_rate=self.offline_weight_learning_rate)
+        finally:
+            for group, rate in online_rates:
+                group["lr"] = rate
         return loss.detach().item()
 
     def _update(
@@ -313,7 +330,6 @@ class OneNetMethod:
             self.expert_optimizer.step()
             self.last_gradient_steps += 1
         self._update_ensemble(emitted_cross_time, emitted_cross_variable, target,
-                              decision_optimizer=self.decision_optimizer,
                               weight_learning_rate=self.weight_learning_rate,
                               train_decision="decision" in groups,
                               update_long=update_long, refresh_short=refresh_short)
@@ -324,14 +340,13 @@ class OneNetMethod:
         cross_variable: Tensor,
         target: Tensor,
         *,
-        decision_optimizer: Optimizer,
         weight_learning_rate: float,
         train_decision: bool = True,
         update_long: bool = True,
         refresh_short: bool = True,
     ) -> None:
         # The decision network learns a recent correction conditioned on the labeled forecast.
-        decision_optimizer.zero_grad(set_to_none=True)
+        self.decision_optimizer.zero_grad(set_to_none=True)
         if train_decision or refresh_short:
             with torch.set_grad_enabled(train_decision):
                 bias = self.model.decision_bias(cross_time, cross_variable, target)
@@ -339,7 +354,7 @@ class OneNetMethod:
                     short_weight = torch.sigmoid(self.model.long_logits.view(1, -1) + bias)
                     short_prediction = short_weight.unsqueeze(1) * cross_time + (1.0 - short_weight.unsqueeze(1)) * cross_variable
                     self.loss_fn(short_prediction, target).backward()
-                    decision_optimizer.step()
+                    self.decision_optimizer.step()
                     self.last_gradient_steps += 1
             if refresh_short:
                 self.model.short_bias.copy_(bias.detach().mean(dim=0))

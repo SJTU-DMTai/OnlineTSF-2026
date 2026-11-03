@@ -331,7 +331,8 @@ class FSNetMethod:
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.model.to(self.device)
         self.optimizer = optimizer or AdamW(model.parameters(), lr=learning_rate)
-        self.offline_optimizer = AdamW(model.parameters(), lr=offline_learning_rate)
+        self.offline_learning_rate = offline_learning_rate
+        self._initial_offline_learning_rate = offline_learning_rate
         self.loss_fn = loss_fn or nn.MSELoss()
         self.n_inner = n_inner
         self.last_gradient_steps = self.last_egd_steps = 0
@@ -392,14 +393,30 @@ class FSNetMethod:
             return None
         return self.update_feedback(feedback, selected, gradient_memory=True)
 
+    def end_offline_epoch(self, epoch: int) -> None:
+        """Apply official type1 decay after the one-based training epoch."""
+        factor = 0.5 ** (epoch - 1)
+        self.offline_learning_rate = self._initial_offline_learning_rate * factor
+        for group in self.optimizer.param_groups:
+            group["lr"] *= factor / group.get("lr_decay_factor", 1.0)
+            group["lr_decay_factor"] = factor
+
     def train_batch(self, context: Tensor, target: Tensor) -> float:
         """Train all modules and advance memory using the offline objective."""
         self.model.train()
-        self.offline_optimizer.zero_grad(set_to_none=True)
+        self.optimizer.zero_grad(set_to_none=True)
         loss = self.loss_fn(self.model(context.to(self.device)), target.to(self.device))
         loss.backward()
         self.model.record_gradients()
-        self.offline_optimizer.step()
+        # Keep the same AdamW state for online updates, with separate phase rates.
+        online_rates = [group["lr"] for group in self.optimizer.param_groups]
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.offline_learning_rate
+        try:
+            self.optimizer.step()
+        finally:
+            for group, rate in zip(self.optimizer.param_groups, online_rates):
+                group["lr"] = rate
         self.last_gradient_steps = 1
         self.last_egd_steps = 0
         return loss.detach().item()

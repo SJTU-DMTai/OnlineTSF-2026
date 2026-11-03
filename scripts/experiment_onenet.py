@@ -13,6 +13,7 @@ from pathlib import Path
 from time import perf_counter
 
 import torch
+import numpy as np
 import yaml
 from torch.utils.data import DataLoader, Subset
 
@@ -128,14 +129,18 @@ def run_segment(executor: OnlineExecutor, dataset: SlidingWindowDataset, start: 
         writer = None
         if handle is not None:
             writer = csv.DictWriter(handle, fieldnames=(
-                "index", "target_start_row", "mae", "mse", "gradient_steps", "egd_steps",
-                "update_seconds", "online_seconds"))
+                "index", "target_start_row", "mae", "mse", *COUNTERS, "online_seconds",
+                *(f"cumulative_{name}" for name in COUNTERS), "cumulative_online_seconds"))
             writer.writeheader()
+            predictions = np.empty((stop - start, dataset.horizon, dataset.num_targets), dtype=np.float32)
+            targets = np.empty_like(predictions)
         for index in range(start, stop):
             inputs, target = dataset[index]
+            step_before = {name: getattr(controller, name) for name in COUNTERS}
             step_began = perf_counter()
             step = executor.step(index, inputs, target)
-            online_seconds += perf_counter() - step_began
+            step_seconds = perf_counter() - step_began
+            online_seconds += step_seconds
             prediction = step.emission.prediction
             if not torch.isfinite(prediction).all():
                 status, invalid_index = "nonfinite", index
@@ -146,12 +151,20 @@ def run_segment(executor: OnlineExecutor, dataset: SlidingWindowDataset, start: 
             values_scored += error.numel()
             scored_forecasts += 1
             if writer is not None:
+                predictions[scored_forecasts - 1] = prediction.numpy()
+                targets[scored_forecasts - 1] = target.numpy()
                 writer.writerow({"index": index, "target_start_row": index + dataset.context_length,
                                  "mae": error.abs().mean().item(), "mse": error.square().mean().item(),
-                                 "gradient_steps": controller.gradient_steps - before["gradient_steps"],
-                                 "egd_steps": controller.egd_steps - before["egd_steps"],
-                                 "update_seconds": controller.update_seconds - before["update_seconds"],
-                                 "online_seconds": online_seconds})
+                                 **{name: getattr(controller, name) - step_before[name] for name in COUNTERS},
+                                 "online_seconds": step_seconds,
+                                 **{f"cumulative_{name}": getattr(controller, name) - before[name] for name in COUNTERS},
+                                 "cumulative_online_seconds": online_seconds})
+        if writer is not None:
+            indices = np.arange(start, start + scored_forecasts, dtype=np.int64)
+            np.savez_compressed(forecasts_path.with_suffix(".npz"),
+                                prediction=predictions[:scored_forecasts], target=targets[:scored_forecasts],
+                                index=indices, target_start_row=indices + dataset.context_length,
+                                target_names=np.asarray(dataset.target_names))
     synchronize(controller.method.device)
     result = {name: getattr(controller, name) - before[name] for name in COUNTERS}
     result.update(status=status, invalid_index=invalid_index, scored_forecasts=scored_forecasts,
@@ -178,7 +191,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--lr-scales", type=float, nargs="+", default=list(DEFAULT_SCALES))
     parser.add_argument("--periods", type=int, nargs="+", default=list(DEFAULT_PERIODS))
-    parser.add_argument("--save-forecasts", action="store_true", help="also write per-origin errors and cumulative costs")
+    parser.add_argument("--save-forecasts", action=argparse.BooleanOptionalAction, default=True,
+                        help="save per-origin errors/costs (CSV) and predictions/targets (NPZ); enabled by default")
     parser.add_argument("--windows", type=int, default=32, help="number of windows in branches mode (default: 32)")
     args = parser.parse_args(argv)
     mode = args.mode
@@ -209,6 +223,10 @@ def main(argv: list[str] | None = None) -> None:
     dataset = load_benchmark_dataset("ettm1", args.data, args.context_length, args.horizon,
                                      include_time_features=True)
     split, train_windows, bounds = stream_partition(dataset, args.windows if mode == "branches" else 1)
+    training = dataset.values[:split]
+    training_std = training.std(dim=0, unbiased=False)
+    scaler = {"feature_names": list(dataset.feature_names), "mean": training.mean(dim=0).tolist(),
+              "std": torch.where(training_std < 1e-6, torch.ones_like(training_std), training_std).tolist()}
     dataset.standardize(train_windows)
     actions = build_actions(args.lr_scales, args.periods, bounds[-1] - bounds[0])
     model = build_backbone(config, dataset.num_features, dataset.num_targets, dataset.target_indices)
@@ -224,6 +242,12 @@ def main(argv: list[str] | None = None) -> None:
                 "unit_bits": [unit.name for unit in OneNetAdapter.capabilities.units],
                 "actions_per_window": len(actions), "planned_runs": len(actions) * (len(bounds) - 1),
                 "setup_seconds": setup_seconds, "completed_runs": 0,
+                "scaler": scaler, "target_names": list(dataset.target_names),
+                "forecast_records": {"csv_costs": "per clock and cumulative within segment",
+                                     "npz_shape": "[forecast_origin, horizon_step, target_variable]",
+                                     "value_space": "standardized; original = standardized * std + mean",
+                                     "row_indexing": "zero-based data rows excluding CSV header",
+                                     "horizon_indexing": "zero-based; target row = target_start_row + horizon_step"},
                 "scoring": "full horizons of forecasts issued inside each window; standardized targets",
                 "branch_timing": "before boundary feedback; optimizer and pending forecasts inherited; new action phase"}
     manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False), encoding="utf-8")
@@ -237,6 +261,7 @@ def main(argv: list[str] | None = None) -> None:
                 if not math.isfinite(loss):
                     raise FloatingPointError("nonfinite offline training loss")
                 total_loss += loss * len(inputs)
+            method.end_offline_epoch(epoch + 1)
             print(f"offline epoch={epoch + 1}/{args.epochs} loss={total_loss / train_windows:.6g}", flush=True)
         method.reset_online_state()
         synchronize(device)

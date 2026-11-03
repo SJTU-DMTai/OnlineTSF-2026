@@ -40,9 +40,11 @@ def _run_offline_training(
         batch_size=offline["batch_size"],
         shuffle=True,
     )
-    for _ in range(offline["epochs"]):
+    for epoch in range(1, offline["epochs"] + 1):
         for context, target in loader:
             method.train_batch(context, target)
+        if isinstance(method, (OneNetMethod, FSNetMethod, UnderCaliMethod)):
+            method.end_offline_epoch(epoch)
     if isinstance(method, (DSOFMethod, OneNetMethod)):
         method.reset_online_state()
     return train_size
@@ -96,11 +98,6 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
     method = build_method(config, model)
     decision = config.get("decision")
     previous = config.get("decision_previous")
-    adaptive = None
-    if previous is not None:
-        from .decision_previous.runtime import AdaptiveMethod
-
-        adaptive = AdaptiveMethod.from_file(method, previous["selector"], previous.get("controller", "policy_full"))
     setup_seconds = perf_counter() - experiment_started
     offline_started = perf_counter()
     offline_stop = _run_offline_training(dataset, method, config["offline"])
@@ -108,8 +105,10 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         method.pretrain_uncertainty(dataset, offline_stop, config["offline"]["batch_size"])
     offline_training_seconds = perf_counter() - offline_started
     online = config["online"]
-    if adaptive is not None:
-        method = adaptive
+    if previous is not None:
+        from .decision_previous.runtime import AdaptiveMethod
+
+        method = AdaptiveMethod.from_file(method, previous["selector"], previous.get("controller", "policy_full"))
     online_started = perf_counter()
     # The final offline window's target must end before the first evaluated target begins.
     online_start = offline_stop

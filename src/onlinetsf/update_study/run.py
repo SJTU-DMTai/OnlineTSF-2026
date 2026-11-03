@@ -43,9 +43,11 @@ def train_prefix(method, dataset, prefix_rows: int, epochs: int, batch_size: int
     windows = prefix_rows - dataset.context_length - dataset.horizon + 1
     loader = DataLoader(Subset(dataset, range(windows)), batch_size=batch_size, shuffle=True)
     method.model.train()
-    for _ in range(epochs):
+    for epoch in range(1, epochs + 1):
         for context, target in loader:
             method.train_batch(context, target)
+        if isinstance(method, (OneNetMethod, FSNetMethod)):
+            method.end_offline_epoch(epoch)
     if isinstance(method, (OneNetMethod, DSOFMethod)):
         method.reset_online_state()
 

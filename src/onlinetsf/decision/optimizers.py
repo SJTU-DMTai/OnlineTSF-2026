@@ -19,9 +19,9 @@ class OptimizerRates:
                 for name, parameters in split.items():
                     group = {**original, "params": parameters}
                     groups.append(group)
-                    self.bindings.append((name, group, original["lr"]))
+                    self.bindings.append((name, group, original["lr"] / original.get("lr_decay_factor", 1.0)))
             optimizer.param_groups[:] = groups
 
     def apply(self, scales: Mapping[str, float]) -> None:
         for name, group, native in self.bindings:
-            group["lr"] = native * scales.get(name, 1.0)
+            group["lr"] = native * group.get("lr_decay_factor", 1.0) * scales.get(name, 1.0)

@@ -124,6 +124,7 @@ class UnderCaliMethod:
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.model = model.to(self.device)
         self.offline_optimizer = torch.optim.Adam(self.model.parameters(), lr=offline_learning_rate)
+        self._initial_offline_learning_rate = offline_learning_rate
         self.loss_fn = nn.MSELoss()
         self.reliable = CalibrationExpert(
             context_length, horizon, num_features, num_targets, calibrator_hidden_dim
@@ -158,6 +159,12 @@ class UnderCaliMethod:
     @property
     def update_optimizers(self) -> tuple[torch.optim.Optimizer, ...]:
         return self.reliable_optimizer, self.unreliable_optimizer, self.uncertainty_optimizer
+
+    def end_offline_epoch(self, epoch: int) -> None:
+        """Match the official default DelayedStepDecayLR epoch-end step."""
+        rate = self._initial_offline_learning_rate * 0.8 ** max(0, epoch - 2)
+        for group in self.offline_optimizer.param_groups:
+            group["lr"] = rate
 
     def train_batch(self, context: Tensor, target: Tensor) -> float:
         self.model.train()
