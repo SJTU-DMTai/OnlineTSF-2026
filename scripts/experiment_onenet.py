@@ -8,8 +8,11 @@ import csv
 import json
 import math
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
+from multiprocessing import get_context
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import perf_counter
 
 import torch
@@ -31,6 +34,7 @@ DEFAULT_SCALES = (0.1, 0.3, 0.5, 1.0, 2.0, 3.0, 10.0)
 DEFAULT_PERIODS = (1, 2, 4, 8, 16)
 COUNTERS = ("gradient_steps", "egd_steps", "gradient_update_clocks", "decision_count",
             "decision_seconds", "update_seconds")
+_WORKER_DATASET: SlidingWindowDataset
 
 
 def build_actions(scales, periods, duration: int) -> list[dict]:
@@ -175,6 +179,39 @@ def run_segment(executor: OnlineExecutor, dataset: SlidingWindowDataset, start: 
     return result
 
 
+def run_configuration(item: dict, source: UpdateController, scheduler_state: dict, saved_rng: tuple,
+                      dataset: SlidingWindowDataset, start: int, stop: int,
+                      forecasts_path: Path | None) -> dict:
+    restore_rng(saved_rng, source.method.device)
+    synchronize(source.method.device)
+    began = perf_counter()
+    branch = fork_executor(source, scheduler_state, item["action"])
+    synchronize(source.method.device)
+    fork_seconds = perf_counter() - began
+    return {"fork_seconds": fork_seconds,
+            **run_segment(branch, dataset, start, stop, forecasts_path)}
+
+
+def initialize_worker(dataset: SlidingWindowDataset, threads: int, device: torch.device) -> None:
+    global _WORKER_DATASET
+    _WORKER_DATASET = dataset
+    torch.set_num_threads(threads)
+    if device.type == "cuda":
+        torch.cuda.set_device(device.index if device.index is not None else 0)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+
+def run_worker(task: tuple) -> dict:
+    item, checkpoint_path, start, stop, forecasts_path = task
+    # Each load creates independent storage on the original devices and preserves
+    # optimizer parameter references, CPU feedback and CPU/CUDA RNG state tensors.
+    saved = torch.load(checkpoint_path, weights_only=False)
+    source = saved["controller"]
+    return run_configuration(item, source, saved["scheduler"], saved["rng"],
+                             _WORKER_DATASET, start, stop, forecasts_path)
+
+
 def main(argv: list[str] | None = None) -> None:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -189,6 +226,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=1,
+                        help="independent configuration processes sharing the selected device (default: 1)")
     parser.add_argument("--lr-scales", type=float, nargs="+", default=list(DEFAULT_SCALES))
     parser.add_argument("--periods", type=int, nargs="+", default=list(DEFAULT_PERIODS))
     parser.add_argument("--save-forecasts", action=argparse.BooleanOptionalAction, default=True,
@@ -196,8 +235,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--windows", type=int, default=32, help="number of windows in branches mode (default: 32)")
     args = parser.parse_args(argv)
     mode = args.mode
-    if min(args.context_length, args.horizon, args.epochs, args.batch_size, args.threads) <= 0:
-        parser.error("context length, horizon, epochs, batch size and threads must be positive")
+    if min(args.context_length, args.horizon, args.epochs, args.batch_size, args.threads, args.workers) <= 0:
+        parser.error("context length, horizon, epochs, batch size, threads and workers must be positive")
     if (not all(math.isfinite(scale) and scale > 0 for scale in args.lr_scales)
             or len(set(args.lr_scales)) != len(args.lr_scales) or 1.0 not in args.lr_scales):
         parser.error("learning rate scales must be distinct, finite, positive and include 1")
@@ -249,6 +288,8 @@ def main(argv: list[str] | None = None) -> None:
                                      "row_indexing": "zero-based data rows excluding CSV header",
                                      "horizon_indexing": "zero-based; target row = target_start_row + horizon_step"},
                 "scoring": "full horizons of forecasts issued inside each window; standardized targets",
+                "timing_note": ("parallel workers share the device; measured times include resource contention"
+                                if args.workers > 1 else "configurations execute serially"),
                 "branch_timing": "before boundary feedback; optimizer and pending forecasts inherited; new action phase"}
     manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False), encoding="utf-8")
     try:
@@ -272,7 +313,12 @@ def main(argv: list[str] | None = None) -> None:
             json.dump([{**item, "action": item["action"].to_dict()} for item in actions], handle, indent=2)
         manifest["status"] = "running"
         manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False), encoding="utf-8")
-        with (args.output / "summary.csv").open("w", encoding="utf-8", newline="") as summary_file, \
+        with (TemporaryDirectory(prefix=".workers-", dir=args.output) if args.workers > 1
+              else nullcontext(None)) as worker_directory, \
+                (ProcessPoolExecutor(max_workers=args.workers, mp_context=get_context("spawn"),
+                                     initializer=initialize_worker, initargs=(dataset, args.threads, device))
+                 if args.workers > 1 else nullcontext(None)) as pool, \
+                (args.output / "summary.csv").open("w", encoding="utf-8", newline="") as summary_file, \
                 (args.output / "native.csv").open("w", encoding="utf-8", newline="") as native_file:
             summary_writer = native_writer = None
             for window, (start, stop) in enumerate(zip(bounds[:-1], bounds[1:])):
@@ -283,21 +329,27 @@ def main(argv: list[str] | None = None) -> None:
                 details = args.output / "forecasts" / f"window-{window:02d}"
                 if args.save_forecasts:
                     details.mkdir(parents=True)
-                print(f"window={window + 1}/{len(bounds) - 1} origins=[{start},{stop}) actions={len(actions)}", flush=True)
-                for item in actions:
-                    restore_rng(saved_rng, device)
-                    synchronize(device)
-                    fork_began = perf_counter()
-                    branch = fork_executor(native.method, scheduler_state, item["action"])
-                    synchronize(device)
-                    fork_seconds = perf_counter() - fork_began
-                    result = run_segment(branch, dataset, start, stop,
-                                         details / f"{item['action_id']}.csv" if args.save_forecasts else None)
+                print(f"window={window + 1}/{len(bounds) - 1} origins=[{start},{stop}) "
+                      f"actions={len(actions)} workers={args.workers}", flush=True)
+                if pool is None:
+                    results = (run_configuration(item, native.method, scheduler_state, saved_rng,
+                                                 dataset, start, stop,
+                                                 details / f"{item['action_id']}.csv" if args.save_forecasts else None)
+                               for item in actions)
+                else:
+                    checkpoint_path = Path(worker_directory) / "source.pt"
+                    torch.save({"controller": native.method, "scheduler": scheduler_state, "rng": saved_rng},
+                               checkpoint_path)
+                    tasks = [(item, checkpoint_path, start, stop,
+                              details / f"{item['action_id']}.csv" if args.save_forecasts else None)
+                             for item in actions]
+                    results = pool.map(run_worker, tasks)
+                for item, result in zip(actions, results, strict=True):
                     row = {"window": window, "start": start, "stop": stop,
                            "target_start_row": start + args.context_length,
                            "last_target_end_row_exclusive": stop - 1 + args.context_length + args.horizon,
                            **{key: value for key, value in item.items() if key != "action"},
-                           "fork_seconds": fork_seconds, **result}
+                           **result}
                     if summary_writer is None:
                         summary_writer = csv.DictWriter(summary_file, fieldnames=list(row))
                         summary_writer.writeheader()
@@ -307,7 +359,6 @@ def main(argv: list[str] | None = None) -> None:
                     print(f"  {item['action_id']} sweep={item['sweep']} M={item['units']} scale={item['lr_scale']:g} "
                           f"p={item['period']} {result['status']} mae={result['mae']} "
                           f"grad={result['gradient_steps']}", flush=True)
-                    del branch
                 # Candidate branches never become the source of later windows.
                 restore_rng(saved_rng, device)
                 result = run_segment(native, dataset, start, stop,
