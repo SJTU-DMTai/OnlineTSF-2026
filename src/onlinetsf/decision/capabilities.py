@@ -10,6 +10,7 @@ class UpdateUnit:
     name: str
     opportunity: str
     has_learning_rate: bool = False
+    has_batch_period: bool = True
 
 
 @dataclass(frozen=True)
@@ -29,10 +30,13 @@ class UpdateCapabilities:
         allowed_rates = {unit.name for unit in self.units if unit.has_learning_rate} & action.units
         if action.learning_rate_scales.keys() - allowed_rates:
             raise ValueError("learning rate scales specified for units without a step size")
+        fixed_periods = {unit.name for unit in self.units if not unit.has_batch_period}
+        if action.periods.keys() & fixed_periods:
+            raise ValueError("batch periods specified for units with native scheduling")
 
 
 class UnitSchedule:
-    """Count each unit's native legal opportunities, independently of duration."""
+    """Trigger a batch after each unit has collected its declared period."""
 
     def __init__(self) -> None:
         self.periods: dict[str, int] = {}
@@ -47,9 +51,8 @@ class UnitSchedule:
     def due(self, name: str) -> bool:
         if name not in self.periods:
             return False
-        count = self.counts[name]
         self.counts[name] += 1
-        return count % self.periods[name] == 0
+        return self.counts[name] % self.periods[name] == 0
 
     def adaptation_due(self) -> bool:
         """FSNet calls this only on forwards that natively advance memory."""

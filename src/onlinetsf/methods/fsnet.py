@@ -423,20 +423,25 @@ class FSNetMethod:
 
     def update_feedback(self, feedback: MethodFeedback, selected: frozenset[str], *,
                         gradient_memory: bool, memory_schedule: Callable[[], bool] | None = None) -> float | None:
+        if not feedback.observed_mask.all():
+            raise ValueError("FSNetMethod requires complete-horizon feedback")
+        return self.update_batch(feedback.context.unsqueeze(0), feedback.target.unsqueeze(0), selected,
+                                 gradient_memory=gradient_memory, memory_schedule=memory_schedule)
+
+    def update_batch(self, context: Tensor, target: Tensor, selected: frozenset[str], *,
+                     gradient_memory: bool, memory_schedule: Callable[[], bool] | None = None) -> float | None:
         """Compute real gradients for memory even when no parameters are stepped.
 
         Memory scheduling is called only on native inner forwards that advance
         adaptation state. The first feedback forward remains read-only.
         """
-        if not feedback.observed_mask.all():
-            raise ValueError("FSNetMethod requires complete-horizon feedback")
         self.last_gradient_steps = self.last_egd_steps = 0
         if not selected and not gradient_memory:
             return None
         groups = self.parameter_groups()
         self.model.eval()
-        context = feedback.context.unsqueeze(0).to(self.device)
-        target = feedback.target.unsqueeze(0).to(self.device)
+        context = context.to(self.device)
+        target = target.to(self.device)
         losses: list[float] = []
         layers = [module for module in self.model.modules() if isinstance(module, AdaptiveConv1d)]
         for inner_step in range(self.n_inner):

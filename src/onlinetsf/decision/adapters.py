@@ -9,6 +9,7 @@ from ..methods import DSOFMethod, FSNetMethod, OneNetMethod
 from ..online import MethodFeedback
 from .capabilities import UpdateCapabilities, UpdateUnit, UnitSchedule
 from .optimizers import OptimizerRates
+from .batches import FeedbackBatches
 
 
 @dataclass
@@ -28,6 +29,7 @@ class OneNetAdapter:
 
     def __init__(self, method: OneNetMethod) -> None:
         self.method = method
+        self.batches = FeedbackBatches()
         self.rates = OptimizerRates([
             (method.expert_optimizer, {"time": list(method.model.cross_time.parameters()),
                                        "variable": list(method.model.cross_variable.parameters())}),
@@ -45,18 +47,29 @@ class OneNetAdapter:
         return PreparedFeedback(feedback, ("time", "variable", "decision", "long", "short"), predictions)
 
     def apply(self, prepared: PreparedFeedback, due: frozenset[str], schedule: UnitSchedule) -> float | None:
-        method, feedback = self.method, prepared.feedback
+        self.batches.append(prepared, (name for name in prepared.opportunities if name in schedule.periods))
+        return self.apply_batches(self.batches.take(name for name in prepared.opportunities if name in due), schedule)
+
+    def apply_batches(self, batches, schedule: UnitSchedule) -> float | None:
+        method = self.method
         method.last_gradient_steps = method.last_egd_steps = 0
-        if not due:
-            return None
-        cross_time, cross_variable = prepared.expert_predictions
-        cross_time = cross_time.unsqueeze(0).to(method.device)
-        cross_variable = cross_variable.unsqueeze(0).to(method.device)
-        target, context = feedback.target.unsqueeze(0).to(method.device), feedback.context.unsqueeze(0).to(method.device)
-        for _ in range(method.n_inner):
-            method._update(context, target, cross_time, cross_variable, due & {"time", "variable", "decision"},
-                           update_long="long" in due, refresh_short="short" in due)
-        return method.loss_fn(feedback.prediction, feedback.target).detach().item()
+        losses = []
+        for units, items in batches:
+            context = torch.stack([item.feedback.context for item in items]).to(method.device)
+            target = torch.stack([item.feedback.target for item in items]).to(method.device)
+            cross_time = torch.stack([item.expert_predictions[0] for item in items]).to(method.device)
+            cross_variable = torch.stack([item.expert_predictions[1] for item in items]).to(method.device)
+            long_rate = method.weight_learning_rate
+            method.weight_learning_rate = long_rate * len(items)
+            try:
+                for _ in range(method.n_inner):
+                    method._update(context, target, cross_time, cross_variable, units & {"time", "variable", "decision"},
+                                   update_long="long" in units, refresh_short="short" in units)
+            finally:
+                method.weight_learning_rate = long_rate
+            prediction = torch.stack([item.feedback.prediction for item in items]).to(method.device)
+            losses.append(method.loss_fn(prediction, target).detach().item())
+        return sum(losses) / len(losses) if losses else None
 
     def predict(self, context: Tensor, schedule: UnitSchedule) -> Tensor:
         return self.method.predict(context)
@@ -68,10 +81,11 @@ class FSNetAdapter:
          UpdateUnit("adapter", "complete_feedback", True),
          UpdateUnit("head", "complete_feedback", True),
          UpdateUnit("gradient_memory", "complete_feedback"),
-         UpdateUnit("adaptation_memory", "prediction_and_native_inner_forward")))
+         UpdateUnit("adaptation_memory", "prediction_and_native_inner_forward", has_batch_period=False)))
 
     def __init__(self, method: FSNetMethod) -> None:
         self.method = method
+        self.batches = FeedbackBatches()
         self.rates = OptimizerRates([(method.optimizer, method.parameter_groups())])
 
     def configure(self, learning_rate_scales) -> None:
@@ -83,9 +97,22 @@ class FSNetAdapter:
         return PreparedFeedback(feedback, ("base", "adapter", "head", "gradient_memory"))
 
     def apply(self, prepared: PreparedFeedback, due: frozenset[str], schedule: UnitSchedule) -> float | None:
-        return self.method.update_feedback(prepared.feedback, due & {"base", "adapter", "head"},
-                                           gradient_memory="gradient_memory" in due,
-                                           memory_schedule=schedule.adaptation_due)
+        self.batches.append(prepared, (name for name in prepared.opportunities if name in schedule.periods))
+        return self.apply_batches(self.batches.take(name for name in prepared.opportunities if name in due), schedule)
+
+    def apply_batches(self, batches, schedule: UnitSchedule) -> float | None:
+        method = self.method
+        gradient_steps = 0
+        losses = []
+        for units, items in batches:
+            context = torch.stack([item.feedback.context for item in items])
+            target = torch.stack([item.feedback.target for item in items])
+            losses.append(method.update_batch(context, target, units & {"base", "adapter", "head"},
+                                               gradient_memory="gradient_memory" in units,
+                                               memory_schedule=schedule.adaptation_due))
+            gradient_steps += method.last_gradient_steps
+        method.last_gradient_steps, method.last_egd_steps = gradient_steps, 0
+        return sum(losses) / len(losses) if losses else None
 
     def predict(self, context: Tensor, schedule: UnitSchedule) -> Tensor:
         return self.method.predict(context, advance_state=schedule.adaptation_due())
@@ -93,12 +120,13 @@ class FSNetAdapter:
 
 class DSOFAdapter:
     capabilities = UpdateCapabilities(
-        (UpdateUnit("teacher", "native_replay_trigger", True),
-         UpdateUnit("student", "native_replay_trigger", True),
+        (UpdateUnit("teacher", "native_replay_trigger", True, has_batch_period=False),
+         UpdateUnit("student", "native_replay_trigger", True, has_batch_period=False),
          UpdateUnit("online", "first_step_feedback", True)))
 
     def __init__(self, method: DSOFMethod) -> None:
         self.method = method
+        self.batches = FeedbackBatches()
         self.rates = OptimizerRates([
             (method.teacher_optimizer, {"teacher": list(method.model.teacher.parameters())}),
             (method.student_optimizer, {"student": list(method.model.student.parameters())}),
@@ -139,8 +167,24 @@ class DSOFAdapter:
                 context = torch.stack([method.replay[index][0] for index in indices]).to(method.device)
                 target = torch.stack([method.replay[index][1] for index in indices]).to(method.device)
                 losses.append(method._supervised_update(context, target, due & {"teacher", "student"}))
-        if "online" in due:
-            losses.append(method._fast_update(prepared.feedback))
+        if "online" in prepared.opportunities and "online" in schedule.periods:
+            self.batches.append(prepared, ("online",))
+        gradient_steps = method.last_gradient_steps
+        online_loss = self.apply_batches(self.batches.take(("online",) if "online" in due else ()), schedule)
+        method.last_gradient_steps += gradient_steps
+        if online_loss is not None:
+            losses.append(online_loss)
+        return sum(losses) / len(losses) if losses else None
+
+    def apply_batches(self, batches, schedule: UnitSchedule) -> float | None:
+        method = self.method
+        method.last_gradient_steps = 0
+        losses = []
+        for _, items in batches:
+            context = torch.stack([item.feedback.context for item in items])
+            current = torch.stack([item.feedback.current_context for item in items])
+            first_target = torch.stack([item.feedback.target[:1] for item in items])
+            losses.append(method._fast_update_batch(context, current, first_target))
         return sum(losses) / len(losses) if losses else None
 
     def predict(self, context: Tensor, schedule: UnitSchedule) -> Tensor:

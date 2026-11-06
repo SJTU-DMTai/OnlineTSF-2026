@@ -17,6 +17,9 @@ def positive_integer(value: int, name: str) -> None:
 class UpdateAction:
     """Learning rate multipliers; omitted scales and periods default to 1.
 
+    A period collects that many arrived samples for one batch update.
+    Units with native scheduling do not accept a configurable batch period.
+
     An empty set of units freezes parameters and adaptation state while
     preserving the method's necessary prediction and feedback records.
     """

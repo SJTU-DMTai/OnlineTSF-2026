@@ -233,14 +233,18 @@ class DSOFMethod:
         return sum(losses) / len(losses)
 
     def _fast_update(self, feedback: MethodFeedback) -> float:
+        return self._fast_update_batch(feedback.context.unsqueeze(0), feedback.current_context.unsqueeze(0),
+                                       feedback.target[:1].unsqueeze(0))
+
+    def _fast_update_batch(self, context: Tensor, current_context: Tensor, first_target: Tensor) -> float:
         self.model.teacher.eval()
         self.model.student.train()
-        previous_context = feedback.context.unsqueeze(0).to(self.device)
-        current_context = feedback.current_context.unsqueeze(0).to(self.device)
+        previous_context = context.to(self.device)
+        current_context = current_context.to(self.device)
         with torch.no_grad():
             previous_teacher = self.model.teacher(previous_context)
             current_teacher = self.model.teacher(current_context)
-            pseudo_target = torch.cat((feedback.target[:1].unsqueeze(0).to(self.device), current_teacher[:, :-1]), dim=1)
+            pseudo_target = torch.cat((first_target.to(self.device), current_teacher[:, :-1]), dim=1)
         prediction = previous_teacher + self.model.residual(previous_context, previous_teacher)
         weights = self.discount ** torch.arange(self.model.horizon, device=self.device, dtype=prediction.dtype)
         loss = ((prediction - pseudo_target).square() * weights.view(1, -1, 1)).mean()

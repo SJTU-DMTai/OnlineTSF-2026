@@ -87,6 +87,14 @@ class UpdateController:
         if not isinstance(action, UpdateAction):
             raise TypeError("policy must return an UpdateAction")
         self.capabilities.validate(action)
+        self.decision_seconds += perf_counter() - began
+        if self.action is not None:
+            changed = frozenset(name for name in self.action.units
+                                if name not in action.units
+                                or self.action.periods.get(name, 1) != action.periods.get(name, 1)
+                                or self.action.learning_rate_scales.get(name, 1.0) != action.learning_rate_scales.get(name, 1.0))
+            self._finish_batches(changed)
+        began = perf_counter()
         self.adapter.configure(action.learning_rate_scales)
         self.schedule.activate(action)
         self.action = action
@@ -109,6 +117,10 @@ class UpdateController:
         self._synchronize()
         began = perf_counter()
         loss = self.adapter.apply(prepared, due, self.schedule)
+        self._record_update(began)
+        return loss
+
+    def _record_update(self, began: float) -> None:
         self._synchronize()
         self.update_seconds += perf_counter() - began
         self.gradient_steps += self.method.last_gradient_steps
@@ -116,7 +128,23 @@ class UpdateController:
         if self.method.last_gradient_steps and self._gradient_clock != self.index:
             self.gradient_update_clocks += 1
             self._gradient_clock = self.index
-        return loss
+
+    def _finish_batches(self, units: frozenset[str]) -> None:
+        pending = self.adapter.batches.pending
+        names = [unit.name for unit in self.capabilities.units if unit.name in units and pending.get(unit.name)]
+        if not names:
+            return
+        self._synchronize()
+        began = perf_counter()
+        self.adapter.apply_batches(self.adapter.batches.take(names), self.schedule)
+        for name in names:
+            self.schedule.counts[name] = 0
+        self._record_update(began)
+
+    def finish_updates(self) -> None:
+        """Use all buffered, already arrived labels before the final prediction."""
+        self._decide()
+        self._finish_batches(self.capabilities.unit_names)
 
     def predict(self, context: Tensor) -> Tensor:
         self._decide()

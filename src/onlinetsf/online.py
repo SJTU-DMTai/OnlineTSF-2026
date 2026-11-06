@@ -191,8 +191,13 @@ class OnlineExecutor:
             mean_adaptation_loss=mean_adaptation_loss,
         )
 
-    def step(self, index: int, context: Tensor, target: Tensor, *, decision_context=None) -> OnlineStep:
-        """Deliver due labels, forecast, then schedule this forecast's labels."""
+    def step(self, index: int, context: Tensor, target: Tensor, *, decision_context=None,
+             final: bool = False) -> OnlineStep:
+        """Deliver due labels, forecast, then schedule this forecast's labels.
+
+        ``final=True`` completes buffered updates before this prediction, using
+        only labels that have already arrived at this clock.
+        """
 
         if self._last_index is not None and index <= self._last_index:
             raise ValueError("stream indices must be strictly increasing")
@@ -202,6 +207,8 @@ class OnlineExecutor:
         if hasattr(self.method, "on_observation"):
             self.method.on_observation(index, context if decision_context is None else decision_context)
         feedback = list(self._deliver_through(index, context))
+        if final and hasattr(self.method, "finish_updates"):
+            self.method.finish_updates()
         prediction = self.method.predict(context.detach().clone()).detach().to(device="cpu").clone()
         if prediction.shape != target.shape:
             raise ValueError(
@@ -251,11 +258,12 @@ class OnlineExecutor:
         for index in range(start, stop):
             context, target = dataset[index]
             if decision_values is None:
-                self.step(index, context, target)
+                self.step(index, context, target, final=flush and index == stop - 1)
             else:
                 raw_start = index * dataset.stride
                 self.step(index, context, target,
-                          decision_context=decision_values[raw_start:raw_start + dataset.context_length])
+                          decision_context=decision_values[raw_start:raw_start + dataset.context_length],
+                          final=flush and index == stop - 1)
             decision = getattr(self.method, "last_decision", None)
             if decision is not None:
                 decisions.append(decision)

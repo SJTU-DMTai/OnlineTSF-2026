@@ -1,8 +1,8 @@
-"""Search OneNet update units, independent rate scales and holding durations.
+"""Optuna search for method-declared online update actions.
 
 Only forecasts issued in [start, start + duration) are scored, with full-horizon
-MAE. No updates, predictions or continuation actions run after that interval.
-Run ``python scripts/search_onenet.py --help`` for the experiment controls.
+MAE. Arrived tail batches finish before the final forecast; no continuation runs.
+Run ``python scripts/search_actions.py --help`` for the experiment controls.
 """
 
 from __future__ import annotations
@@ -23,38 +23,19 @@ import yaml
 from torch.utils.data import DataLoader, Subset
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from onlinetsf.data import SlidingWindowDataset, load_benchmark_dataset
 from onlinetsf.decision import UpdateAction, UpdateController
-from onlinetsf.decision.adapters import OneNetAdapter
-from onlinetsf.decision.capabilities import UnitSchedule
+from onlinetsf.decision.search_space import ActionSearchSpace, includes_native
 from onlinetsf.factory import build_backbone, build_method
 from onlinetsf.online import OnlineExecutor
-from scripts.experiment_onenet import restore_rng, rng_state, synchronize
 
 
-DEFAULT_DURATIONS = (32, 64, 128, 256, 512)
-
-
-def suggest_action(trial, durations: list[int], scale_low: float, scale_high: float) -> UpdateAction:
-    units, scales = set(), {}
-    for unit in OneNetAdapter.capabilities.units:
-        if trial.suggest_categorical(f"enable_{unit.name}", [False, True]):
-            units.add(unit.name)
-            if unit.has_learning_rate:
-                scales[unit.name] = trial.suggest_float(
-                    f"lr_scale_{unit.name}", scale_low, scale_high, log=True)
-    return UpdateAction(units=units, learning_rate_scales=scales,
-                        duration=trial.suggest_categorical("duration", durations))
-
-
-def action_key(action: UpdateAction, *, include_duration: bool = True) -> str:
+def action_key(action: UpdateAction) -> str:
     record = {"units": sorted(action.units),
               "learning_rate_scales": {name: value for name, value in action.learning_rate_scales.items()
-                                       if value != 1.0}}
-    if include_duration:
-        record["duration"] = action.duration
+                                       if value != 1.0},
+              "periods": dict(action.periods), "duration": action.duration}
     return json.dumps(record, sort_keys=True, separators=(",", ":"))
 
 
@@ -68,29 +49,21 @@ def select_origins(first_target: int, end_row: int, context: int, horizon: int,
     return np.linspace(first, last, count, dtype=np.int64).tolist()
 
 
-def score_prefixes(executor: OnlineExecutor, dataset: SlidingWindowDataset, start: int,
-                   durations: list[int]) -> dict[int, dict]:
-    """Reuse identical prediction prefixes across durations; never flush or continue."""
-    results = {}
+def score_window(executor: OnlineExecutor, dataset: SlidingWindowDataset, start: int,
+                 duration: int) -> dict:
+    """Score a complete action interval, including its final arrived tail batch."""
     absolute_sum = squared_sum = 0.0
     values = 0
-    requested = set(durations)
-    for offset in range(max(durations)):
+    for offset in range(duration):
         context, target = dataset[start + offset]
-        prediction = executor.step(start + offset, context, target).emission.prediction
+        prediction = executor.step(start + offset, context, target, final=offset == duration - 1).emission.prediction
         if not torch.isfinite(prediction).all():
-            for duration in durations:
-                if duration not in results:
-                    results[duration] = {"mae": None, "mse": None, "status": "nonfinite"}
-            break
+            return {"mae": None, "mse": None, "status": "nonfinite"}
         error = prediction.double() - target.double()
         absolute_sum += error.abs().sum().item()
         squared_sum += error.square().sum().item()
         values += error.numel()
-        if offset + 1 in requested:
-            results[offset + 1] = {"mae": absolute_sum / values, "mse": squared_sum / values,
-                                   "status": "complete"}
-    return results
+    return {"mae": absolute_sum / values, "mse": squared_sum / values, "status": "complete"}
 
 
 def collect_snapshots(native: OnlineExecutor, dataset: SlidingWindowDataset, start: int,
@@ -105,7 +78,8 @@ def collect_snapshots(native: OnlineExecutor, dataset: SlidingWindowDataset, sta
             scheduler["events"] = []
             paths[index] = directory / f"state-{index}.pt"
             torch.save({"controller": native.method, "scheduler": scheduler,
-                        "rng": rng_state(device)}, paths[index])
+                        "rng": (torch.get_rng_state().clone(),
+                                torch.cuda.get_rng_state(device).clone() if device.type == "cuda" else None)}, paths[index])
             print(f"snapshot origin={index}", flush=True)
         if index < max(origins):
             native.step(index, *dataset[index])
@@ -115,50 +89,43 @@ def collect_snapshots(native: OnlineExecutor, dataset: SlidingWindowDataset, sta
 
 
 class ActionEvaluator:
-    """Independent causal branches, exact prefix caching and same-window baselines."""
+    """Independent causal branches, exact action caching and matched baselines."""
 
     def __init__(self, dataset: SlidingWindowDataset, snapshots: dict[int, Path],
-                 durations: list[int], log_path: Path) -> None:
+                 space: ActionSearchSpace, log_path: Path) -> None:
         self.dataset = dataset
         self.snapshots = snapshots
-        self.durations = durations
+        self.space = space
         self.log_path = log_path
-        self.cache: dict[tuple[int, str], dict[int, dict]] = {}
+        self.cache: dict[tuple[int, str], dict] = {}
         self.baselines: dict[int, dict[int, dict]] = {}
         self.branch_count = 0
 
     def evaluate(self, origin: int, action: UpdateAction) -> dict:
-        key = (origin, action_key(action, include_duration=False))
-        cached = self.cache.setdefault(key, {})
-        if action.duration not in cached:
+        key = (origin, action_key(action))
+        if key not in self.cache:
             saved = torch.load(self.snapshots[origin], weights_only=False)
             controller = saved["controller"]
             # Loading owns fresh storage, so a second deepcopy is unnecessary.
             controller.policy = action
             controller.expires_at = None
-            controller.schedule = UnitSchedule()
-            executor = OnlineExecutor(controller, feedback_delay=self.dataset.horizon)
+            executor = OnlineExecutor(controller, feedback_delay=saved["scheduler"]["feedback_delay"])
             executor.load_state_dict(saved["scheduler"])
-            restore_rng(saved["rng"], controller.method.device)
-            prefixes = [duration for duration in self.durations if duration <= action.duration]
-            scores = score_prefixes(executor, self.dataset, origin, prefixes)
+            torch.set_rng_state(saved["rng"][0])
+            if saved["rng"][1] is not None:
+                torch.cuda.set_rng_state(saved["rng"][1], controller.method.device)
+            score = score_window(executor, self.dataset, origin, action.duration)
             self.branch_count += 1
             with self.log_path.open("a", encoding="utf-8") as handle:
-                for duration, metrics in scores.items():
-                    if duration in cached:
-                        continue
-                    record = action.to_dict()
-                    record["duration"] = duration
-                    handle.write(json.dumps({"origin": origin, "action": record, **metrics},
-                                            allow_nan=False) + "\n")
-            cached.update(scores)
-        return cached[action.duration]
+                handle.write(json.dumps({"origin": origin, "action": action.to_dict(), **score},
+                                        allow_nan=False) + "\n")
+            self.cache[key] = score
+        return self.cache[key]
 
     def prepare_baselines(self, origins: list[int]) -> None:
-        action = OneNetAdapter.capabilities.native_action(duration=max(self.durations))
         for origin in origins:
-            self.evaluate(origin, action)
-            self.baselines[origin] = dict(self.cache[(origin, action_key(action, include_duration=False))])
+            self.baselines[origin] = {duration: self.evaluate(origin, self.space.capabilities.native_action(duration))
+                                      for duration in self.space.durations}
             if any(row["status"] != "complete" for row in self.baselines[origin].values()):
                 raise FloatingPointError(f"nonfinite Native forecast at origin {origin}")
 
@@ -182,18 +149,26 @@ def run_study(evaluator: ActionEvaluator, origins: list[int], args, name: str,
         pruner=optuna.pruners.MedianPruner(n_startup_trials=20,
                                           n_warmup_steps=max(1, len(origins) // 2), n_min_trials=5))
     if enqueue_baselines:
-        # Matched references at every H, not a hand-picked restriction of the search space.
-        for duration in args.durations:
-            for units in (OneNetAdapter.capabilities.unit_names, frozenset()):
-                params = {f"enable_{unit.name}": unit.name in units for unit in OneNetAdapter.capabilities.units}
-                params.update({f"lr_scale_{unit.name}": 1.0 for unit in OneNetAdapter.capabilities.units
+        # References are trials only when they belong to the configured space.
+        space = evaluator.space
+        for duration in space.durations:
+            for units in (space.capabilities.unit_names, frozenset()):
+                if space.units is not None and set(space.units) != units:
+                    continue
+                if units and (not includes_native(space.learning_rate_scales) or not includes_native(space.periods)):
+                    continue
+                params = {f"enable_{unit.name}": unit.name in units for unit in space.capabilities.units
+                          if space.units is None}
+                params.update({f"lr_scale_{unit.name}": 1.0 for unit in space.capabilities.units
                                if unit.name in units and unit.has_learning_rate})
+                params.update({f"period_{unit.name}": 1 for unit in space.capabilities.units
+                               if unit.name in units and unit.has_batch_period})
                 study.enqueue_trial({**params, "duration": duration})
     for _ in range(trials):
         if deadline is not None and perf_counter() >= deadline:
             break
         trial = study.ask()
-        action = suggest_action(trial, args.durations, args.lr_scale_low, args.lr_scale_high)
+        action = evaluator.space.suggest(trial)
         trial.set_user_attr("action", action.to_dict())
         ratios = []
         try:
@@ -220,7 +195,7 @@ def run_study(evaluator: ActionEvaluator, origins: list[int], args, name: str,
 
 def select_portfolio(actions: list[UpdateAction], ratios: np.ndarray, count: int,
                      anchor: UpdateAction) -> list[int]:
-    """Greedy state coverage, starting with Native and using prediction loss only."""
+    """Greedy coverage from Native, then fill by mean loss to the requested size."""
     selected = [next(index for index, action in enumerate(actions) if action_key(action) == action_key(anchor))]
     best = ratios[selected[0]].copy()
     while len(selected) < min(count, len(actions)):
@@ -228,7 +203,9 @@ def select_portfolio(actions: list[UpdateAction], ratios: np.ndarray, count: int
         scores[selected] = math.inf
         index = int(np.argmin(scores))
         if scores[index] >= best.mean() - 1e-12:
-            break
+            scores = ratios.mean(axis=1)
+            scores[selected] = math.inf
+            index = int(np.argmin(scores))
         selected.append(index)
         best = np.minimum(best, ratios[index])
     return selected
@@ -237,6 +214,9 @@ def select_portfolio(actions: list[UpdateAction], ratios: np.ndarray, count: int
 def main(argv: list[str] | None = None) -> None:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--method", required=True, help="method entry in the search configuration")
+    parser.add_argument("--search-config", type=Path, default=root / "action_search.yaml")
+    parser.add_argument("--dataset", default="ettm1", help="benchmark dataset name")
     parser.add_argument("--data", type=Path, default=root / "data/ETTm1.csv")
     parser.add_argument("--profiles", type=Path, default=root / "profiles.yaml")
     parser.add_argument("--output", type=Path, required=True, help="new directory; existing runs are never overwritten")
@@ -247,36 +227,49 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--durations", nargs="+", type=int, default=list(DEFAULT_DURATIONS))
-    parser.add_argument("--lr-scale-low", type=float, default=.01)
-    parser.add_argument("--lr-scale-high", type=float, default=10.)
     parser.add_argument("--offline-ratio", type=float, default=.2)
     parser.add_argument("--search-end", type=float, default=.4)
     parser.add_argument("--validation-end", type=float, default=.6)
-    parser.add_argument("--states", type=int, default=12, help="uniformly spaced search snapshots")
-    parser.add_argument("--validation-states", type=int, default=6)
-    parser.add_argument("--trials", type=int, default=100, help="global trials including 2 references per duration")
-    parser.add_argument("--timeout", type=float, default=1800,
+    parser.add_argument("--states", type=int, default=32, help="uniformly spaced search snapshots")
+    parser.add_argument("--validation-states", type=int, default=16)
+    parser.add_argument("--trials", type=int, default=300, help="global trials including in-space Native/Frozen references")
+    parser.add_argument("--timeout", type=float, default=3600,
                         help="seconds for all Optuna trials combined; excludes preparation and final validation")
-    parser.add_argument("--local-trials", type=int, default=8, help="extra trials per search state; 0 disables")
-    parser.add_argument("--pool-size", type=int, default=24, help="maximum actions evaluated on validation states")
-    parser.add_argument("--candidates", type=int, default=8, help="maximum final portfolio size, including Native")
+    parser.add_argument("--local-trials", type=int, default=16, help="extra trials per search state; 0 disables")
+    parser.add_argument("--pool-size", type=int, default=96, help="maximum actions evaluated on validation states")
+    parser.add_argument("--candidates", type=int, default=32,
+                        help="target final portfolio size, including Native; fewer if valid actions are insufficient")
     args = parser.parse_args(argv)
     if min(args.context_length, args.horizon, args.epochs, args.batch_size, args.threads,
-           args.states, args.validation_states, args.trials, args.pool_size, args.candidates, *args.durations) <= 0:
+           args.states, args.validation_states, args.trials, args.pool_size, args.candidates) <= 0:
         parser.error("lengths and counts must be positive")
     if args.local_trials < 0 or args.candidates > args.pool_size:
         parser.error("local-trials must be nonnegative and candidates cannot exceed pool-size")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("timeout must be finite and positive")
-    if (not math.isfinite(args.lr_scale_low) or not math.isfinite(args.lr_scale_high)
-            or not 0 < args.lr_scale_low <= 1 <= args.lr_scale_high):
-        parser.error("finite learning rate bounds must satisfy 0 < low <= 1 <= high")
     if not 0 < args.offline_ratio < args.search_end < args.validation_end <= 1:
         parser.error("require 0 < offline-ratio < search-end < validation-end <= 1")
-    if len(set(args.durations)) != len(args.durations):
-        parser.error("durations must be distinct")
-    args.durations.sort()
+    with args.search_config.open(encoding="utf-8") as handle:
+        search_config = yaml.safe_load(handle)
+    if not isinstance(search_config, dict) or set(search_config) != {"search", "methods"}:
+        parser.error("search configuration requires search and methods mappings")
+    if not isinstance(search_config["search"], dict) or not isinstance(search_config["methods"], dict):
+        parser.error("search and methods must be mappings")
+    if args.method not in search_config["methods"]:
+        parser.error(f"unknown search method {args.method!r}")
+    selected_method = search_config["methods"][args.method]
+    if (not isinstance(selected_method, dict) or set(selected_method) - {"strategy", "search"}
+            or not isinstance(selected_method.get("strategy"), str)
+            or not isinstance(selected_method.get("search", {}), dict)):
+        parser.error("method entry requires strategy and an optional search mapping")
+    dimensions = {**search_config["search"], **selected_method.get("search", {})}
+    with args.profiles.open(encoding="utf-8") as handle:
+        profiles = yaml.safe_load(handle)["strategies"]
+    if selected_method["strategy"] not in profiles:
+        parser.error(f"unknown strategy {selected_method['strategy']!r}")
+    profile = profiles[selected_method["strategy"]]
+    if profile["method"]["name"] != args.method:
+        parser.error("selected strategy method.name must match --method")
     device = torch.device(args.device)
     if device.type not in {"cpu", "cuda"}:
         parser.error("device must be cpu or cuda[:index]")
@@ -286,8 +279,18 @@ def main(argv: list[str] | None = None) -> None:
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
-    dataset = load_benchmark_dataset("ettm1", args.data, args.context_length, args.horizon,
+    dataset = load_benchmark_dataset(args.dataset, args.data, args.context_length, args.horizon,
                                      include_time_features=True)
+    config = {"data": {"context_length": args.context_length, "horizon": args.horizon},
+              "forecasting": profile["forecasting"], "method": profile["method"],
+              "online": {"device": str(device)}}
+    method = build_method(config, build_backbone(config, dataset.num_features,
+                                                dataset.num_targets, dataset.target_indices))
+    controller = UpdateController(method, UpdateAction())
+    try:
+        space = ActionSearchSpace(controller.capabilities, **dimensions)
+    except (TypeError, ValueError) as error:
+        parser.error(str(error))
     offline_end, search_end, validation_end = [int(len(dataset.values) * ratio) for ratio in
                                               (args.offline_ratio, args.search_end, args.validation_end)]
     train_windows = offline_end - args.context_length - args.horizon + 1
@@ -295,35 +298,31 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("offline interval is shorter than context plus horizon")
     # First search snapshot has matured feedback, while all its labels remain historical.
     search_origins = select_origins(offline_end + args.horizon, search_end, args.context_length,
-                                    args.horizon, max(args.durations), args.states)
+                                    args.horizon, max(space.durations), args.states)
     validation_origins = select_origins(search_end, validation_end, args.context_length,
-                                        args.horizon, max(args.durations), args.validation_states)
+                                        args.horizon, max(space.durations), args.validation_states)
     prefix = dataset.values[:offline_end]
     std = prefix.std(dim=0, unbiased=False)
     scaler = {"mean": prefix.mean(dim=0).tolist(),
               "std": torch.where(std < 1e-6, torch.ones_like(std), std).tolist()}
     dataset.standardize(train_windows)
-    with args.profiles.open(encoding="utf-8") as handle:
-        profile = yaml.safe_load(handle)["strategies"]["onenet"]
-    if profile["method"]["name"] != "onenet":
-        raise ValueError("profiles.strategies.onenet must specify method.name: onenet")
-    config = {"data": {"context_length": args.context_length, "horizon": args.horizon},
-              "forecasting": profile["forecasting"], "method": profile["method"],
-              "online": {"device": str(device)}}
-    method = build_method(config, build_backbone(config, dataset.num_features,
-                                                dataset.num_targets, dataset.target_indices))
     args.output.mkdir(parents=True, exist_ok=False)
     manifest = {"status": "training", "arguments": {key: str(value) if isinstance(value, Path) else value
                                                     for key, value in vars(args).items()},
-                "config": config, "optuna_version": optuna.__version__, "scaler": scaler,
+                "config": config, "search_space": space.to_dict(),
+                "capabilities": [{"name": unit.name, "has_learning_rate": unit.has_learning_rate,
+                                  "has_batch_period": unit.has_batch_period}
+                                 for unit in space.capabilities.units],
+                "optuna_version": optuna.__version__, "scaler": scaler,
                 "feature_names": list(dataset.feature_names), "target_names": list(dataset.target_names),
                 "data_sha256": hashlib.sha256(args.data.read_bytes()).hexdigest(),
                 "raw_rows": len(dataset.values), "offline_end": offline_end,
                 "search_end": search_end, "validation_end": validation_end,
                 "search_origins": search_origins, "validation_origins": validation_origins,
                 "objective": "mean of per-state MAE / Native MAE over identical duration windows",
-                "scoring": "full horizons of forecasts issued in [origin, origin + H); no continuation or flush",
-                "periods": "not searched; all selected units retain native period 1",
+                "scoring": "full horizons in [origin, origin + H); finish arrived tail batches before final prediction; no continuation or flush",
+                "periods": "collect p arrived samples for one batch; native scheduling units have no period parameter",
+                "native_reference": "always retained in portfolio, even outside the configured trial space",
                 "snapshot_timing": "before origin feedback; native trajectory; optimizer and pending forecasts retained"}
     manifest_path = args.output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False), encoding="utf-8")
@@ -334,16 +333,19 @@ def main(argv: list[str] | None = None) -> None:
             for context, target in loader:
                 if not math.isfinite(method.train_batch(context, target)):
                     raise FloatingPointError("nonfinite offline loss")
-            method.end_offline_epoch(epoch + 1)
+            if hasattr(method, "end_offline_epoch"):
+                method.end_offline_epoch(epoch + 1)
             print(f"offline epoch={epoch + 1}/{args.epochs}", flush=True)
-        method.reset_online_state()
-        native = OnlineExecutor(UpdateController(method, OneNetAdapter.capabilities.native_action(
-            duration=len(dataset))), feedback_delay=args.horizon)
+        if hasattr(method, "reset_online_state"):
+            method.reset_online_state()
+        controller.policy = space.capabilities.native_action(duration=len(dataset))
+        delay = tuple(range(1, args.horizon + 1)) if method.incremental_feedback else args.horizon
+        native = OnlineExecutor(controller, feedback_delay=delay)
         with TemporaryDirectory(prefix=".snapshots-", dir=args.output) as temporary:
             paths = collect_snapshots(native, dataset, offline_end - args.context_length,
                                       search_origins + validation_origins, Path(temporary))
-            del native, method
-            evaluator = ActionEvaluator(dataset, paths, args.durations, args.output / "evaluations.jsonl")
+            del native, controller, method
+            evaluator = ActionEvaluator(dataset, paths, space, args.output / "evaluations.jsonl")
             evaluator.prepare_baselines(search_origins)
             manifest["status"] = "searching"
             manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False), encoding="utf-8")
@@ -357,7 +359,7 @@ def main(argv: list[str] | None = None) -> None:
                     studies.append(run_study(evaluator, [origin], args, f"state-{origin}",
                                               args.local_trials, args.seed + number + 1, deadline=deadline))
             manifest["search_budget_exhausted"] = perf_counter() >= deadline
-            anchor = OneNetAdapter.capabilities.native_action(duration=args.durations[len(args.durations) // 2])
+            anchor = space.capabilities.native_action(duration=space.durations[len(space.durations) // 2])
             unique = {action_key(anchor): anchor}
             for study in studies:
                 completed = [trial for trial in study.trials if trial.state == optuna.trial.TrialState.COMPLETE]
@@ -397,7 +399,8 @@ def main(argv: list[str] | None = None) -> None:
         manifest.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
     finally:
-        synchronize(device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         manifest["seconds"] = perf_counter() - began
         manifest_path.write_text(json.dumps(manifest, indent=2, allow_nan=False), encoding="utf-8")
 

@@ -99,12 +99,13 @@ def fork_executor(source: UpdateController, scheduler_state: dict, action: Updat
     """Keep weights, optimizer moments and pending forecasts; start a new action phase.
 
     The snapshot is taken before the boundary clock's feedback and prediction.
-    A new schedule makes every selected unit due on its first legal opportunity.
+    Each selected unit starts collecting a fresh batch at the boundary.
     """
     controller = copy.deepcopy(source)
     controller.policy = action
     controller.expires_at = None
     controller.schedule = UnitSchedule()
+    controller.adapter.batches.pending.clear()
     executor = OnlineExecutor(controller, feedback_delay=scheduler_state["feedback_delay"])
     executor.load_state_dict(scheduler_state)
     return executor
@@ -142,7 +143,7 @@ def run_segment(executor: OnlineExecutor, dataset: SlidingWindowDataset, start: 
             inputs, target = dataset[index]
             step_before = {name: getattr(controller, name) for name in COUNTERS}
             step_began = perf_counter()
-            step = executor.step(index, inputs, target)
+            step = executor.step(index, inputs, target, final=index == stop - 1)
             step_seconds = perf_counter() - step_began
             online_seconds += step_seconds
             prediction = step.emission.prediction

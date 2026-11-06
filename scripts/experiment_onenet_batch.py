@@ -53,56 +53,26 @@ def build_batch_actions(periods, duration: int) -> list[dict]:
 
 
 class BatchOneNetAdapter(OneNetAdapter):
-    """Consume every arrived training sample; batch all selected units together.
+    """Record sample and batch counts for the shared action executor."""
 
-    The sweep assigns the same period to all selected units. The controller's
-    usual thinning result is deliberately ignored here: our buffer determines
-    when a batch is ready. Neural losses and short-term corrections are batch
-    means; the long-term logit increment is compensated to sum loss gaps.
-    """
-
-    def __init__(self, method, action: UpdateAction, stop: int) -> None:
+    def __init__(self, method, action: UpdateAction) -> None:
         if method.n_inner != 1:
             raise ValueError("batch experiments require OneNet n_inner=1 for one step per optimizer")
         super().__init__(method)
-        self.units = action.units
         self.batch_size = max(action.periods.values(), default=1)
-        self.stop = stop
-        self.buffer: list[PreparedFeedback] = []
         self.feedback_samples = self.samples_used = self.batch_updates = self.tail_batch_updates = 0
 
     def apply(self, prepared: PreparedFeedback, due, schedule) -> float | None:
-        method = self.method
-        method.last_gradient_steps = method.last_egd_steps = 0
         self.feedback_samples += 1
-        if not self.units:
-            return None
-        self.buffer.append(prepared)
-        if len(self.buffer) < self.batch_size and prepared.feedback.available_at != self.stop - 1:
-            return None
+        return super().apply(prepared, due, schedule)
 
-        # Keep the immutable expert predictions emitted for each historical
-        # origin. Recomputing them at batch time would change ensemble feedback.
-        items, self.buffer = self.buffer, []
-        context = torch.stack([item.feedback.context for item in items]).to(method.device)
-        target = torch.stack([item.feedback.target for item in items]).to(method.device)
-        cross_time = torch.stack([item.expert_predictions[0] for item in items]).to(method.device)
-        cross_variable = torch.stack([item.expert_predictions[1] for item in items]).to(method.device)
-        long_rate = method.weight_learning_rate
-        # _update averages expert losses across the batch. Scale only the long
-        # step to preserve their cumulative contribution, including a tail batch.
-        method.weight_learning_rate = long_rate * len(items)
-        try:
-            method._update(context, target, cross_time, cross_variable,
-                           self.units & {"time", "variable", "decision"},
-                           update_long="long" in self.units, refresh_short="short" in self.units)
-        finally:
-            method.weight_learning_rate = long_rate
-        self.samples_used += len(items)
-        self.batch_updates += 1
-        self.tail_batch_updates += int(len(items) < self.batch_size)
-        prediction = torch.stack([item.feedback.prediction for item in items]).to(method.device)
-        return method.loss_fn(prediction, target).detach().item()
+    def apply_batches(self, batches, schedule) -> float | None:
+        loss = super().apply_batches(batches, schedule)
+        for _, items in batches:
+            self.samples_used += len(items)
+            self.batch_updates += 1
+            self.tail_batch_updates += int(len(items) < self.batch_size)
+        return loss
 
 
 def run_batch_configuration(item, source, scheduler_state, saved_rng, dataset, start, stop,
@@ -118,7 +88,7 @@ def run_batch_configuration(item, source, scheduler_state, saved_rng, dataset, s
     synchronize(source.method.device)
     began = perf_counter()
     branch = fork_executor(source, scheduler_state, item["action"])
-    adapter = BatchOneNetAdapter(branch.method.method, item["action"], stop)
+    adapter = BatchOneNetAdapter(branch.method.method, item["action"])
     branch.method.adapter = adapter
     synchronize(source.method.device)
     fork_seconds = perf_counter() - began
@@ -126,7 +96,8 @@ def run_batch_configuration(item, source, scheduler_state, saved_rng, dataset, s
     return {"fork_seconds": fork_seconds, **result, "update_rule": "batch_all_feedback",
             "batch_size": adapter.batch_size, "feedback_samples": adapter.feedback_samples,
             "samples_used": adapter.samples_used, "batch_updates": adapter.batch_updates,
-            "tail_batch_updates": adapter.tail_batch_updates, "buffered_samples": len(adapter.buffer)}
+            "tail_batch_updates": adapter.tail_batch_updates,
+            "buffered_samples": max((len(items) for items in adapter.batches.pending.values()), default=0)}
 
 
 def initialize_worker(dataset: SlidingWindowDataset, threads: int, device: torch.device) -> None:
