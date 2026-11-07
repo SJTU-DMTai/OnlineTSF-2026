@@ -27,9 +27,8 @@ from .actions import UpdateAction, positive_integer
 from .catalog import ActionCatalog
 from .capabilities import UpdateCapabilities, UpdateUnit
 from .features import DATA_FEATURES, FEEDBACK_FEATURES, StateFeatures
-from .feature_selection import select_state_features
 from .runtime import UpdateController
-from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, SelectorPolicy
+from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, LOG1P_FEATURES, SelectorPolicy
 
 
 def save_json(path: Path, record) -> None:
@@ -66,8 +65,9 @@ class ProbePolicy:
         return self.action
 
 
-def score_action(source: OnlineExecutor, dataset, origin: int, action: UpdateAction) -> tuple[dict, dict]:
-    """A normal, nonterminal H-step segment; future labels are used only to score."""
+def score_action(source: OnlineExecutor, dataset, origin: int, action: UpdateAction, *,
+                 stop: int | None = None) -> tuple[dict, dict]:
+    """Score H origins; only an explicit terminal stop finishes arrived tail batches."""
     saved_rng = rng_state()
     try:
         branch = copy.deepcopy(source)
@@ -75,8 +75,9 @@ def score_action(source: OnlineExecutor, dataset, origin: int, action: UpdateAct
         branch.method.policy, branch.method.expires_at = policy, None
         absolute = squared = 0.
         count = 0
-        for index in range(origin, origin + action.duration):
-            prediction = step_dataset(branch, dataset, index).emission.prediction.double()
+        end = origin + action.duration if stop is None else min(origin + action.duration, stop)
+        for index in range(origin, end):
+            prediction = step_dataset(branch, dataset, index, final=stop is not None and index == stop - 1).emission.prediction.double()
             if not torch.isfinite(prediction).all():
                 raise FloatingPointError(f"nonfinite forecast at origin {origin}")
             error = prediction - dataset[index][1].double()
@@ -275,7 +276,7 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
     options = manifest["config"]["selectors"] if options is None else options
     formulations, estimators = options["formulations"], options["estimators"]
     if "feature_sets" in options:
-        raise ValueError("feature_sets is obsolete; ElasticNet now selects from the combined candidate pool")
+        raise ValueError("feature_sets is obsolete; selectors use all collected state features")
     for values, allowed, name in ((formulations, FORMULATIONS, "formulations"),
                                    (estimators, ESTIMATORS, "estimators")):
         if not values or len(set(values)) != len(values) or set(values) - set(allowed):
@@ -297,17 +298,8 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
     results = []
     save_json(output / "manifest.json", {"status": "training", "data": str(data_directory.resolve()), "options": options})
     try:
-        began = perf_counter()
-        selection = select_state_features(states, gains, manifest["feature_names"], catalog.ids,
-                                          catalog.native_indices, origins, label_ends,
-                                          **options.get("feature_selection", {}))
-        selection["seconds"] = perf_counter() - began
-        selection["collection_sha256"] = collection_digest
-        save_json(output / "feature_selection.json", selection)
-        names = selection["selected_features"]
-        indices = [manifest["feature_names"].index(name) for name in names]
-        selected_states = states[:, indices]
-        print(f"ElasticNet selected {len(names)}/{len(manifest['feature_names'])} features: {names}", flush=True)
+        names = manifest["feature_names"]
+        print(f"Using all {len(names)} state features: {names}", flush=True)
         for formulation in formulations:
             for estimator in estimators:
                 began = perf_counter()
@@ -315,7 +307,7 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
                                           parameters=parameters.get(estimator, {}), seed=manifest["config"].get("seed", 0),
                                           feature_window=manifest["config"]["collection"].get("feature_window", 32),
                                           error_window=manifest["config"]["collection"].get("error_window", 128))
-                selector.fit(selected_states, gains)
+                selector.fit(states, gains)
                 fit_seconds = perf_counter() - began
                 directory = output / formulation / estimator
                 directory.mkdir(parents=True)
@@ -332,7 +324,9 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
                 save_json(directory / "metadata.json", {**row, "features": names, "catalog": catalog.to_dict(),
                                                         "action_encoding": catalog.encoding_names,
                                                         "parameters": selector.parameters,
-                                                        "feature_selection": "elastic_net",
+                                                        "feature_selection": "none",
+                                                        "feature_transforms": {name: "log1p" for name in names
+                                                                               if name in LOG1P_FEATURES},
                                                         "collection_sha256": collection_digest})
                 print(f"trained {formulation}/{estimator}", flush=True)
     except BaseException as error:

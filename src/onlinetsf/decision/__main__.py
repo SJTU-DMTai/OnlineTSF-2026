@@ -25,6 +25,11 @@ def main(argv=None) -> None:
     evaluate.add_argument("--data", type=Path, required=True)
     evaluate.add_argument("--models", type=Path, required=True)
     evaluate.add_argument("--output", type=Path, required=True)
+    oracle = commands.add_parser("oracle", help="evaluate only the greedy hindsight Oracle")
+    oracle.add_argument("--data", type=Path, required=True, help="completed collection directory")
+    oracle.add_argument("--output", type=Path, required=True)
+    oracle.add_argument("--actions", type=Path, help="candidate YAML; defaults to the collected action catalog")
+    oracle.add_argument("--steps", type=int, help="optional limit on test forecast origins")
     args = parser.parse_args(argv)
     if args.command in {"run", "collect"}:
         config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
@@ -42,8 +47,12 @@ def main(argv=None) -> None:
     elif args.command == "train":
         options = yaml.safe_load(args.config.read_text(encoding="utf-8"))["selectors"] if args.config else None
         train_experiment(args.data, args.output, options)
-    else:
+    elif args.command == "evaluate":
         evaluate_experiment(args.data, args.models, args.output)
+    else:
+        from .oracle import evaluate_oracle
+
+        evaluate_oracle(args.data, args.output, actions=args.actions, steps=args.steps)
 
 
 if __name__ == "__main__":

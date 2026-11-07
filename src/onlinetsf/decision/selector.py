@@ -14,6 +14,7 @@ from .catalog import ActionCatalog
 
 FORMULATIONS = ("independent_regression", "shared_regression", "classification")
 ESTIMATORS = ("random_forest", "lightgbm", "mlp")
+LOG1P_FEATURES = ("volatility_ratio", "normalized_mean_shift", "trend_shift")
 
 
 class MLPEstimator:
@@ -130,11 +131,14 @@ class ActionSelector:
         if states.ndim != 2 or states.shape[1] != len(self.features):
             raise ValueError("state matrix differs from the saved feature schema")
         if not self.features:
-            # ElasticNet may reject every state feature. A constant input lets
-            # the existing models learn a fixed action preference honestly.
+            # A constant input represents a state-independent action preference.
             return np.zeros((len(states), 1))
         missing = ~np.isfinite(states)
-        result = np.column_stack((np.where(missing, self.medians, states), missing.astype(float)))
+        values = np.where(missing, self.medians, states)
+        for index, name in enumerate(self.features):
+            if name in LOG1P_FEATURES:
+                values[:, index] = np.log1p(values[:, index])
+        result = np.column_stack((values, missing.astype(float)))
         return (result - self.mean) / self.scale
 
     def design(self, states: np.ndarray) -> np.ndarray:
