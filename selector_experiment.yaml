@@ -1,6 +1,6 @@
 # Each collection fits selectors for one data set and one forecasting method.
 seed: 0
-threads: 1
+threads: 4
 data:
   name: ettm1
   path: data/ETTm1.csv
@@ -18,6 +18,7 @@ collection:
   offline_fraction: 0.2
   train_end_fraction: 0.6
   train_states: 96  # Number of sampled decision origins; evaluate every candidate at each origin.
+  workers: 4  # Independent action branches at the same origin; 1 runs serially.
   feature_window: 32
   error_window: 128
 selectors:

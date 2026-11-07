@@ -5,8 +5,13 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
+import io
 import json
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
@@ -84,6 +89,23 @@ def score_action(source: OnlineExecutor, dataset, origin: int, action: UpdateAct
         restore_rng(saved_rng)
 
 
+def initialize_collection_worker(dataset, threads: int, device: torch.device) -> None:
+    global _collection_dataset
+    _collection_dataset = dataset
+    torch.set_num_threads(threads)
+    if device.type == "cuda":
+        torch.cuda.set_device(device.index if device.index is not None else 0)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+
+def score_action_worker(snapshot: bytes, origin: int, action: UpdateAction) -> tuple[dict, dict]:
+    # Bytes avoid sharing mutable model/optimizer CUDA storage between processes.
+    saved = torch.load(io.BytesIO(snapshot), weights_only=False)
+    restore_rng(saved["rng"])
+    return score_action(saved["executor"], _collection_dataset, origin, action)
+
+
 def sample_origins(first_target: int, end_row: int, context: int, horizon: int,
                    max_duration: int, count: int) -> list[int]:
     positive_integer(count, "state count")
@@ -95,11 +117,14 @@ def sample_origins(first_target: int, end_row: int, context: int, horizon: int,
 
 def collect_experiment(config: dict, base: Path, output: Path) -> None:
     """One data set and forecasting method per independently fitted experiment."""
+    print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] collection started", flush=True)
     seed, threads = config.get("seed", 0), config.get("threads", 1)
     positive_integer(threads, "threads")
     torch.set_num_threads(threads)
     torch.manual_seed(seed)
     forecast, collection = config["forecast"], config["collection"]
+    workers = collection.get("workers", 1)
+    positive_integer(workers, "collection.workers")
     profiles = yaml.safe_load((base / forecast["profiles"]).read_text(encoding="utf-8"))["strategies"]
     profile = profiles[forecast["strategy"]]
     method_name = profile["method"]["name"]
@@ -171,6 +196,7 @@ def collect_experiment(config: dict, base: Path, output: Path) -> None:
             if hasattr(method, "end_offline_epoch"):
                 method.end_offline_epoch(epoch + 1)
             print(f"offline epoch {epoch + 1}/{forecast['epochs']}", flush=True)
+        print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] offline training finished", flush=True)
         if hasattr(method, "reset_online_state"):
             method.reset_online_state()
         controller.policy = controller.capabilities.native_action(duration=len(dataset))
@@ -178,7 +204,10 @@ def collect_experiment(config: dict, base: Path, output: Path) -> None:
         native = OnlineExecutor(controller, feedback_delay=delay)
         requested = set(train_origins)
         state_values, gains, origins = [], [], []
-        with (output / "states.csv").open("w", encoding="utf-8", newline="") as state_file, \
+        with (ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
+                                  initializer=initialize_collection_worker, initargs=(dataset, threads, device))
+              if workers > 1 else nullcontext()) as pool, \
+                (output / "states.csv").open("w", encoding="utf-8", newline="") as state_file, \
                 (output / "outcomes.csv").open("w", encoding="utf-8", newline="") as outcome_file:
             state_writer = csv.DictWriter(state_file, fieldnames=["state_id", "origin", *feature_names])
             outcome_writer = csv.DictWriter(outcome_file, fieldnames=["state_id", "origin", "action_id",
@@ -188,16 +217,28 @@ def collect_experiment(config: dict, base: Path, output: Path) -> None:
             outcome_writer.writeheader()
             for index in range(offline_end - dataset.context_length, test_start):
                 if index in requested:
-                    baseline = {}
-                    for duration in sorted({action.duration for action in catalog.actions}):
-                        state, score = score_action(native, dataset, index, catalog.capabilities.native_action(duration))
-                        baseline[duration] = score
+                    durations = sorted({action.duration for action in catalog.actions})
+                    action_indices = [number for number in range(len(catalog.actions))
+                                      if number not in catalog.native_indices]
+                    jobs = [catalog.capabilities.native_action(duration) for duration in durations]
+                    jobs.extend(catalog.actions[number] for number in action_indices)
+                    if pool is None:
+                        results = [score_action(native, dataset, index, action) for action in jobs]
+                    else:
+                        snapshot = io.BytesIO()
+                        torch.save({"executor": native, "rng": rng_state()}, snapshot)
+                        payload = snapshot.getvalue()
+                        futures = [pool.submit(score_action_worker, payload, index, action) for action in jobs]
+                        results = [future.result() for future in futures]
+                    baseline = {duration: result[1] for duration, result in zip(durations, results)}
+                    scores = {number: result[1] for number, result in zip(action_indices, results[len(durations):])}
+                    state = results[len(durations) - 1][0]
                     state_id = len(origins)
                     state_writer.writerow({"state_id": state_id, "origin": index,
                                            **{name: state[name] for name in feature_names}})
                     row = []
                     for number, (name, action) in enumerate(zip(catalog.ids, catalog.actions)):
-                        score = baseline[action.duration] if number in catalog.native_indices else score_action(native, dataset, index, action)[1]
+                        score = baseline[action.duration] if number in catalog.native_indices else scores[number]
                         reference = baseline[action.duration]["mae"]
                         gain = 0. if number in catalog.native_indices else (reference - score["mae"]) / max(reference, 1e-12)
                         row.append(gain)
@@ -210,7 +251,7 @@ def collect_experiment(config: dict, base: Path, output: Path) -> None:
                     origins.append(index)
                     state_file.flush()
                     outcome_file.flush()
-                    print(f"collected train origin={index}, actions={len(catalog.ids)}", flush=True)
+                    print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] collected train origin={index}, actions={len(catalog.ids)}", flush=True)
                 step_dataset(native, dataset, index)
                 native._events.clear()
         np.savez(output / "training.npz", states=np.asarray(state_values, dtype=float), gains=np.asarray(gains),
