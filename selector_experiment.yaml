@@ -1,0 +1,40 @@
+# Each collection fits selectors for one data set and one forecasting method.
+seed: 0
+threads: 1
+data:
+  name: ettm1
+  path: data/ETTm1.csv
+  context_length: 96
+  horizon: 24
+  include_time_features: true
+forecast:
+  profiles: profiles.yaml
+  strategy: onenet
+  device: cuda:0
+  epochs: 6
+  batch_size: 32
+actions: configs/actions/onenet_ettm1.yaml
+collection:
+  offline_fraction: 0.2
+  train_end_fraction: 0.6
+  train_states: 96  # Number of sampled decision origins; evaluate every candidate at each origin.
+  feature_window: 32
+  error_window: 128
+selectors:
+  formulations: [independent_regression, shared_regression, classification]
+  estimators: [random_forest, lightgbm, mlp]
+  # One screened pool per data set and forecasting method, shared by all nine models.
+  feature_selection:
+    alphas: [0.0001, 0.001, 0.01, 0.1]
+    l1_ratios: [0.5, 0.9, 1.0]
+    cv_splits: 3
+  parameters:
+    random_forest: {n_estimators: 200, max_depth: 6, min_samples_leaf: 4, n_jobs: 1}
+    lightgbm: {n_estimators: 200, learning_rate: 0.05, num_leaves: 7, min_child_samples: 4, n_jobs: 1}
+    mlp:
+      hidden_sizes: [64, 32]
+      learning_rate: 0.001
+      min_learning_rate: 0.0001
+      epochs: 100
+      batch_size: 64
+      weight_decay: 0.0001

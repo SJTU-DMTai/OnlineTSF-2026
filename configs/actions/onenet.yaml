@@ -1,0 +1,16 @@
+method: onenet
+actions:
+  - id: native
+    units: [time, variable, decision, long, short]
+    duration: 128
+  - id: frozen_32
+    units: []
+    duration: 32
+  - id: time_half_batch4_64
+    units: [time]
+    learning_rate_scales: {time: 0.5}
+    periods: {time: 4}
+    duration: 64
+  - id: ensemble_256
+    units: [long, short]
+    duration: 256

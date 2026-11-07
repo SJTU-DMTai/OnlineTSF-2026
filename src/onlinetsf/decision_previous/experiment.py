@@ -27,6 +27,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--context-length", type=int, default=96)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--positions", type=int, required=True)
+    parser.add_argument("--collection-start-fraction", type=float, default=.2)
+    parser.add_argument("--collection-end-fraction", type=float, default=.6)
+    parser.add_argument("--sampling-segments", type=int,
+                        help="consecutive sampling segments; default: one per position")
+    parser.add_argument("--sampling-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=2)
@@ -46,6 +51,12 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("sizes must be positive and workers must not exceed positions")
     if not 0 < args.test_start_fraction < 1 or args.steps is not None and args.steps <= 0:
         parser.error("test-start-fraction must be between zero and one; steps must be positive")
+    if not 0 <= args.collection_start_fraction < args.collection_end_fraction <= 1:
+        parser.error("collection fractions must satisfy 0 <= start < end <= 1")
+    if args.sampling_segments is not None and not 0 < args.sampling_segments <= args.positions:
+        parser.error("sampling-segments must be between 1 and positions")
+    if args.sampling_seed < 0:
+        parser.error("sampling-seed must be nonnegative")
     decision = DecisionConfig.load(args.decision_config)
     args.controller = args.controller or ("policy_data" if args.oracle_diagnostics == "policy_data" else "policy_full")
     args.output.mkdir(parents=True, exist_ok=False)
@@ -76,6 +87,11 @@ def main(argv: list[str] | None = None) -> None:
                                  "--decision-config", str(snapshot), "--scope", "prepare", "--output", str(source)]),
             ("collection", collect.main, [*common, *identity, *boundary_args, "--runs", str(source),
                                           "--seed", str(args.seed), "--positions", str(args.positions),
+                                          "--collection-start-fraction", str(args.collection_start_fraction),
+                                          "--collection-end-fraction", str(args.collection_end_fraction),
+                                          "--sampling-seed", str(args.sampling_seed),
+                                          *(["--sampling-segments", str(args.sampling_segments)]
+                                            if args.sampling_segments is not None else []),
                                           "--workers", str(args.workers), "--output", str(training)]),
             ("experiment", policy_experiment.main, [*common, *identity, *boundary_args, "--runs", str(source),
                                                     "--train-seeds", str(args.seed), "--test-seed", str(args.seed),

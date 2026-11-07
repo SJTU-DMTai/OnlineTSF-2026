@@ -392,8 +392,9 @@ def main(argv: list[str] | None = None) -> None:
             (args.output / "pool.json").write_text(json.dumps(records, indent=2, allow_nan=False), encoding="utf-8")
             (args.output / "candidates.json").write_text(json.dumps(
                 [records[index] for index in selected], indent=2, allow_nan=False), encoding="utf-8")
+            catalog = space.write_catalog(args.method, [records[index] for index in selected], args.output / "actions.yaml")
             manifest.update(status="complete", branch_evaluations=evaluator.branch_count,
-                            pool_size=len(actions), candidate_count=len(selected),
+                            pool_size=len(actions), candidate_count=len(selected), exported_candidate_count=len(catalog.actions),
                             validation_portfolio_ratio=float(validation_ratios[selected].min(axis=0).mean()))
     except BaseException as error:
         manifest.update(status="failed", error=f"{type(error).__name__}: {error}")

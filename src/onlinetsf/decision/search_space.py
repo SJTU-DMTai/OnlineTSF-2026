@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
 
 from .actions import UpdateAction, positive_integer
 from .capabilities import UpdateCapabilities
+from .catalog import ActionCatalog
 
 
 def validate_dimension(spec, name: str, *, integer: bool) -> None:
@@ -104,3 +108,23 @@ class ActionSearchSpace:
     def to_dict(self) -> dict:
         return {"units": self.units, "learning_rate_scales": self.learning_rate_scales,
                 "periods": self.periods, "durations": self.durations}
+
+    def write_catalog(self, method: str, candidates: list[dict], path: str | Path) -> ActionCatalog:
+        """Export selected configurations, adding only missing Native/Frozen references.
+
+        Preserve searched IDs, order and durations. Added references use the
+        smallest configured H, even if their update scope lies outside the
+        sampled search dimensions.
+        """
+        ids = [row["id"] for row in candidates]
+        actions = [UpdateAction.from_dict(row["action"]) for row in candidates]
+        if not any(action.units == self.capabilities.unit_names and not action.periods
+                   and all(scale == 1 for scale in action.learning_rate_scales.values()) for action in actions):
+            ids.append("native")
+            actions.append(self.capabilities.native_action(duration=self.durations[0]))
+        if not any(not action.units for action in actions):
+            ids.append("frozen")
+            actions.append(UpdateAction(duration=self.durations[0]))
+        catalog = ActionCatalog(method, ids, actions, self.capabilities)
+        Path(path).write_text(yaml.safe_dump(catalog.to_dict(), sort_keys=False, allow_unicode=True), encoding="utf-8")
+        return catalog

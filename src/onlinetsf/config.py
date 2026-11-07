@@ -274,9 +274,17 @@ def load_config(
     if decision is not None:
         from .decision.actions import UpdateAction
 
-        if not isinstance(decision, dict) or set(decision) != {"action"}:
-            raise ValueError("config.decision requires only action")
-        UpdateAction.from_dict(decision["action"])
+        if not isinstance(decision, dict) or set(decision) not in ({"action"}, {"selector"}):
+            raise ValueError("config.decision requires only action or only selector")
+        decision = dict(decision)
+        if "action" in decision:
+            UpdateAction.from_dict(decision["action"])
+        else:
+            if not isinstance(decision["selector"], str):
+                raise ValueError("config.decision.selector must be a model artifact path")
+            artifact = Path(decision["selector"])
+            decision["selector"] = str((source.parent / artifact).resolve()) if not artifact.is_absolute() else str(artifact)
+        config["decision"] = decision
         if method_name not in {"onenet", "fsnet", "dsof"}:
             raise ValueError("update actions support onenet, fsnet and dsof")
         if data.get("stride", 1) != 1:

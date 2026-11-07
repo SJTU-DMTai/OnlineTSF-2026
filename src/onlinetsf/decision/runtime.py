@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 
 import torch
@@ -25,6 +25,7 @@ class DecisionState:
     previous_action: UpdateAction | None
     # Read-only snapshot; counters count native opportunities, not optimizer steps.
     opportunity_counts: dict[str, int]
+    features: dict[str, float | None] = field(default_factory=dict)
 
 
 class UpdateController:
@@ -34,11 +35,12 @@ class UpdateController:
     A fixed UpdateAction is also accepted and is selected again at every expiry.
     """
 
-    def __init__(self, method, policy: UpdateAction | Callable[[DecisionState], UpdateAction]) -> None:
+    def __init__(self, method, policy: UpdateAction | Callable[[DecisionState], UpdateAction], *, features=None) -> None:
         self.method = method
         self.adapter = build_adapter(method)
         self.capabilities = self.adapter.capabilities
         self.policy = policy
+        self.features = features
         self.schedule = UnitSchedule()
         self.action: UpdateAction | None = None
         self.expires_at: int | None = None
@@ -64,6 +66,8 @@ class UpdateController:
             raise ValueError("update actions require consecutive data clocks")
         self.index = index
         self.context = torch.as_tensor(context).detach().clone()
+        if self.features is not None:
+            self.features.on_observation(context)
         self.last_decision = None
 
     def prepare_feedback(self, feedback: tuple[MethodFeedback, ...]) -> None:
@@ -71,7 +75,10 @@ class UpdateController:
         if self.prepared:
             raise RuntimeError("previous feedback batch has not been consumed")
         for item in feedback:
-            self.prepared.append(self.adapter.prepare(item, training=item.current_context is not None))
+            prepared = self.adapter.prepare(item, training=item.current_context is not None)
+            self.prepared.append(prepared)
+            if self.features is not None:
+                self.features.observe(prepared)
         if feedback and feedback[0].current_context is not None:
             self._decide(feedback)
 
@@ -82,7 +89,8 @@ class UpdateController:
             return
         began = perf_counter()
         state = DecisionState(self.index, self.context.clone(), feedback,
-                              self.capabilities, self.action, dict(self.schedule.counts))
+                              self.capabilities, self.action, dict(self.schedule.counts),
+                              self.features.snapshot(self.method) if self.features is not None else {})
         action = self.policy if isinstance(self.policy, UpdateAction) else self.policy(state)
         if not isinstance(action, UpdateAction):
             raise TypeError("policy must return an UpdateAction")
@@ -101,6 +109,9 @@ class UpdateController:
         self.expires_at = self.index + action.duration
         self.decision_count += 1
         self.last_decision = {"index": self.index, "expires_at": self.expires_at, "action": action.to_dict()}
+        selection = getattr(self.policy, "last_selection", None)
+        if isinstance(selection, dict):
+            self.last_decision.update(selection)
         self.decision_seconds += perf_counter() - began
 
     def _synchronize(self) -> None:

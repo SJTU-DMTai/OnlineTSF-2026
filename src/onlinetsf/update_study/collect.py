@@ -1,4 +1,4 @@
-"""Collect uniformly spaced, strictly historical action comparisons in parallel.
+"""Collect stratified random, strictly historical action comparisons in parallel.
 
 One producer replays native history once and supplies complete snapshots to
 branch workers. The final pre-test snapshot is reused by experiment 2.
@@ -23,6 +23,7 @@ import pandas as pd
 from ..decision_previous.actions import policies
 from ..decision_previous.config import DecisionConfig, FEATURE_SCHEMA_VERSION
 from .policy_support import DEFAULT_ANNOTATIONS, DEFAULT_RUNS, file_sha256, find_job, save_json, save_timings
+from .sampling import sample_positions
 
 
 def initialize_worker(plan: dict) -> None:
@@ -49,8 +50,9 @@ def collect_worker(plan: dict, clock: int, snapshot: Path) -> tuple[list[dict], 
     index = clock - plan["context_length"] + 1
     if replay.last_index != index - 1:
         raise ValueError("snapshot is not immediately before the requested decision")
-    probe_id = f"uniform_{clock}"
-    state = dict(metadata, probe_id=probe_id, index=index, clock=clock, kind="uniform",
+    strategy = plan["sampling"]["strategy"]
+    probe_id = f"{strategy}_{clock}"
+    state = dict(metadata, probe_id=probe_id, index=index, clock=clock, kind=strategy,
                  **state_features(_worker_stream, replay, index))
     state["steps_since_gradient"] = replay.method.gradient_age(index)
     outcomes = []
@@ -138,6 +140,14 @@ def main(argv: list[str] | None = None) -> None:
     boundary.add_argument("--test-start", type=int)
     boundary.add_argument("--test-start-fraction", type=float, default=.6)
     parser.add_argument("--positions", type=int, default=16)
+    parser.add_argument("--collection-start-fraction", type=float, default=.2,
+                        help="first candidate origin as a fraction of raw rows (default: 0.2)")
+    parser.add_argument("--collection-end-fraction", type=float, default=.6,
+                        help="exclusive end of candidate origins as a fraction of raw rows (default: 0.6)")
+    parser.add_argument("--sampling-segments", type=int,
+                        help="consecutive sampling segments; default: one per position")
+    parser.add_argument("--sampling-seed", type=int, default=0,
+                        help="random seed for positions, independent of model training (default: 0)")
     parser.add_argument("--decision-config", type=Path, help="override features/actions without retraining the offline model")
     parser.add_argument("--decision-interval", type=int, help="positive branch length and test decision interval")
     parser.add_argument("--workers", type=int, default=3)
@@ -152,6 +162,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("sizes must be positive and workers must not exceed positions")
     if not 0 < args.test_start_fraction < 1:
         parser.error("test-start-fraction must be between zero and one")
+    if not 0 <= args.collection_start_fraction < args.collection_end_fraction <= 1:
+        parser.error("collection fractions must satisfy 0 <= start < end <= 1")
     job = find_job(args.runs, args.dataset, args.method, args.horizon, args.seed)
     source_manifest = json.loads((job.parent.parent / "manifest.json").read_text(encoding="utf-8"))
     if source_manifest.get("feature_schema_version") != FEATURE_SCHEMA_VERSION:
@@ -172,12 +184,18 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("annotations differ from source run")
     prefix = int(record["prefix_rows"])
     test_start = args.test_start if args.test_start is not None else int(annotation["rows"] * args.test_start_fraction)
-    # Leave enough native history for 128 matured forecast errors at the first decision.
-    first = prefix + args.horizon + decision.error_window
-    last = test_start - args.decision_interval - args.horizon
-    if last - first + 1 < args.positions or test_start > annotation["rows"] - args.horizon - 1:
-        parser.error("training interval is too short for the requested positions or test boundary")
-    clocks = np.linspace(first, last, args.positions, dtype=int).tolist()
+    if not prefix <= test_start <= annotation["rows"] - args.horizon - 1:
+        parser.error("test-start must follow the offline prefix and leave complete forecast targets")
+    # Origins may use short/missing feedback histories, handled by the feature
+    # extractor. Only the offline prefix and global test boundary restrict them.
+    first = max(prefix - 1, int(annotation["rows"] * args.collection_start_fraction))
+    stop = min(int(annotation["rows"] * args.collection_end_fraction),
+               test_start - args.decision_interval - args.horizon + 1)
+    try:
+        clocks = sample_positions(first, stop, args.positions,
+                                  segments=args.sampling_segments, seed=args.sampling_seed)
+    except ValueError as error:
+        parser.error(str(error))
     actions = [item.to_dict() for item in policies(tuple(record["update_groups"]), decision)]
     names = [item["name"] for item in actions]
     if "native" not in names or len(names) != len(set(names)):
@@ -187,13 +205,19 @@ def main(argv: list[str] | None = None) -> None:
             "seed": args.seed, "prefix_rows": prefix, "context_length": int(record["context_length"]),
             "test_start": test_start, "decision_interval": args.decision_interval,
             "positions": args.positions, "clocks": clocks, "workers": args.workers,
+            "sampling": {"strategy": "stratified_random", "seed": args.sampling_seed,
+                         "segments": args.positions if args.sampling_segments is None else args.sampling_segments,
+                         "start_fraction": args.collection_start_fraction,
+                         "end_fraction": args.collection_end_fraction,
+                         "start": first, "end_exclusive": stop},
             "device": args.device, "threads": args.threads, "annotations": str(args.annotations),
             "save_branch_logs": args.save_branch_logs,
             "output": str(args.output), "source_job": str(job), "input_sha256": source_hash,
             "checkpoint": str(job / "initial.pt"), "checkpoint_sha256": file_sha256(job / "initial.pt"),
             "decision_config": decision.to_dict(), "update_groups": record["update_groups"],
             "method_features": record["method_features"],
-            "actions": actions, "train_target_end_exclusive": last + args.decision_interval + args.horizon}
+            "actions": actions,
+            "train_target_end_exclusive": clocks[-1] + args.decision_interval + args.horizon}
     args.output.mkdir(parents=True, exist_ok=False)
     save_json(args.output / "manifest.json", plan)
     pd.DataFrame({"clock": clocks, "target_end_exclusive": np.array(clocks) + args.decision_interval + args.horizon}

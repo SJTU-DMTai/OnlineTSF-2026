@@ -1,0 +1,16 @@
+method: dsof
+actions:
+  - id: native
+    units: [teacher, student, online]
+    duration: 128
+  - id: frozen_32
+    units: []
+    duration: 32
+  - id: online_half_batch4_64
+    units: [online]
+    learning_rate_scales: {online: 0.5}
+    periods: {online: 4}
+    duration: 64
+  - id: replay_256
+    units: [teacher, student]
+    duration: 256

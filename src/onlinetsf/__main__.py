@@ -87,7 +87,8 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
         include_time_features=data.get("include_time_features", config["forecasting"]["backbone"] in {
             "tcn", "fsnet_tcn", "onenet_tcn"
         }),
-        keep_decision_inputs=config.get("decision_previous") is not None,
+        keep_decision_inputs=(config.get("decision_previous") is not None
+                              or "selector" in (config.get("decision") or {})),
     )
     train_windows = int(len(dataset) * config["offline"]["train_ratio"])
     dataset.standardize(train_windows)
@@ -118,7 +119,19 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
     if decision is not None:
         from .decision import UpdateAction, UpdateController
 
-        method = UpdateController(method, UpdateAction.from_dict(decision["action"]))
+        if "selector" in decision:
+            from .decision.features import StateFeatures
+            from .decision.selector import ActionSelector, SelectorPolicy
+
+            selector = ActionSelector.load(decision["selector"])
+            if selector.catalog.method != config["method"]["name"]:
+                raise ValueError("selector method differs from the forecasting method")
+            features = StateFeatures(selector.feature_window, selector.error_window)
+            if hasattr(method, "configure_feature_history"):
+                method.configure_feature_history(features.feature_window, features.error_window)
+            method = UpdateController(method, SelectorPolicy(selector), features=features)
+        else:
+            method = UpdateController(method, UpdateAction.from_dict(decision["action"]))
     executor = OnlineExecutor(
         method,
         feedback_delay=online["feedback_delay"],
