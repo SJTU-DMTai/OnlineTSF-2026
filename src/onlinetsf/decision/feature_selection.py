@@ -11,7 +11,7 @@ def purged_time_splits(origins: np.ndarray, label_ends: np.ndarray, n_splits: in
     if (origins.ndim != 1 or label_ends.shape != origins.shape or not np.isfinite(origins).all()
             or not np.isfinite(label_ends).all() or np.any(np.diff(origins) <= 0)
             or np.any(label_ends <= origins)):
-        raise ValueError("feature selection requires increasing origins and later finite label ends")
+        raise ValueError("time splits require increasing origins and later finite label ends")
     folds = []
     for train, validation in TimeSeriesSplit(n_splits=n_splits).split(origins):
         train = train[label_ends[train] <= origins[validation[0]]]

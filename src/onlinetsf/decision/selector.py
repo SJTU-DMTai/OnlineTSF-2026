@@ -15,6 +15,24 @@ from .catalog import ActionCatalog
 FORMULATIONS = ("independent_regression", "shared_regression", "classification")
 ESTIMATORS = ("random_forest", "lightgbm", "mlp")
 LOG1P_FEATURES = ("volatility_ratio", "normalized_mean_shift", "trend_shift")
+FORMULATION_PARAMETERS = {
+    "independent_regression": {
+        "lightgbm": {"n_estimators": 100, "learning_rate": .03, "num_leaves": 3,
+                     "min_child_samples": 12, "reg_lambda": 1.}},
+    "shared_regression": {
+        "random_forest": {"max_depth": 12, "min_samples_leaf": 2},
+        "lightgbm": {"n_estimators": 600, "num_leaves": 31, "min_child_samples": 2}},
+}
+
+
+def soft_targets(gains: np.ndarray, temperature: float) -> np.ndarray:
+    """Temperature is measured in relative-gain units: .01 is one percentage point."""
+    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+            or not np.isfinite(temperature) or temperature <= 0):
+        raise ValueError("classification temperature must be finite and positive")
+    logits = (gains - gains.max(axis=1, keepdims=True)) / temperature
+    probabilities = np.exp(logits)
+    return probabilities / probabilities.sum(axis=1, keepdims=True)
 
 
 class MLPEstimator:
@@ -41,7 +59,7 @@ class MLPEstimator:
         self.target_mean = 0. if self.classification else float(np.mean(y))
         self.target_scale = 1. if self.classification else max(float(np.std(y)), 1e-6)
         values = torch.as_tensor(x, dtype=torch.float32)
-        targets = torch.as_tensor(y, dtype=torch.long) if self.classification else torch.as_tensor(
+        targets = torch.as_tensor(y, dtype=torch.float32) if self.classification else torch.as_tensor(
             (y - self.target_mean) / self.target_scale, dtype=torch.float32).reshape(-1, 1)
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(self.seed)
@@ -92,37 +110,56 @@ def fit_estimator(kind: str, x: np.ndarray, y: np.ndarray, *, classification: bo
         model = MLPEstimator(class_count if classification else 1, classification=classification,
                              seed=seed, **parameters)
         return model.fit(x, y)
+    weights = None
+    if classification:
+        if y.shape != (len(x), class_count):
+            raise ValueError("classification requires one soft target probability per state and action")
+        # Weighted copies have exactly the same cross-entropy as soft targets:
+        # sum_a -q[state,a] * log p(a|state). All copies use identical inputs.
+        weights = y.reshape(-1)
+        y = np.tile(np.arange(class_count), len(x))
+        x = np.repeat(x, class_count, axis=0)
     if kind == "random_forest":
         from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
         model_type = RandomForestClassifier if classification else RandomForestRegressor
         options = {"n_estimators": 200, "max_depth": 6, "min_samples_leaf": 4, "n_jobs": 1, **parameters}
+        if classification:
+            options["criterion"] = "log_loss"
+            # Convert integer leaf thresholds to the expanded sample scale.
+            if isinstance(options["min_samples_leaf"], int):
+                options["min_samples_leaf"] *= class_count
     elif kind == "lightgbm":
         from lightgbm import LGBMClassifier, LGBMRegressor
 
         model_type = LGBMClassifier if classification else LGBMRegressor
         options = {"n_estimators": 200, "learning_rate": .05, "num_leaves": 7, "min_child_samples": 4,
                    "verbosity": -1, "n_jobs": 1, **parameters}
+        if classification:
+            options["min_child_samples"] *= class_count
     else:
         raise ValueError(f"unknown estimator: {kind}")
-    if classification and len(np.unique(y)) == 1:
+    if classification and class_count == 1:
         from sklearn.dummy import DummyClassifier
 
         return DummyClassifier(strategy="constant", constant=y[0]).fit(x, y)
-    return model_type(random_state=seed, **options).fit(x, y)
+    return model_type(random_state=seed, **options).fit(x, y, sample_weight=weights)
 
 
 class ActionSelector:
     def __init__(self, catalog: ActionCatalog, features: list[str], formulation: str,
                  estimator: str, *, parameters: dict | None = None, seed: int = 0,
-                 feature_window: int = 32, error_window: int = 128) -> None:
+                 feature_window: int = 32, error_window: int = 128, temperature: float = .05) -> None:
         if formulation not in FORMULATIONS or estimator not in ESTIMATORS:
             raise ValueError("unknown selector formulation or estimator")
         if len(features) != len(set(features)):
             raise ValueError("state features must be unique")
         self.catalog, self.features = catalog, list(features)
         self.formulation, self.estimator = formulation, estimator
-        self.parameters, self.seed = dict(parameters or {}), seed
+        self.parameters = {**FORMULATION_PARAMETERS.get(formulation, {}).get(estimator, {}), **(parameters or {})}
+        self.seed = seed
+        soft_targets(np.zeros((1, 1)), temperature)
+        self.temperature = temperature
         self.feature_window, self.error_window = feature_window, error_window
         self.models = []
 
@@ -138,8 +175,7 @@ class ActionSelector:
         for index, name in enumerate(self.features):
             if name in LOG1P_FEATURES:
                 values[:, index] = np.log1p(values[:, index])
-        result = np.column_stack((values, missing.astype(float)))
-        return (result - self.mean) / self.scale
+        return (values - self.mean) / self.scale
 
     def design(self, states: np.ndarray) -> np.ndarray:
         states = self.transform(states)
@@ -160,7 +196,7 @@ class ActionSelector:
             raise ValueError("Native training gains must be zero")
         self.medians = np.asarray([float(np.median(column[np.isfinite(column)])) if np.isfinite(column).any() else 0.
                                    for column in states.T])
-        self.mean, self.scale = np.zeros(2 * states.shape[1]), np.ones(2 * states.shape[1])
+        self.mean, self.scale = np.zeros(states.shape[1]), np.ones(states.shape[1])
         if self.estimator == "mlp":
             filled = self.transform(states)
             self.mean, self.scale = filled.mean(0), filled.std(0)
@@ -172,7 +208,7 @@ class ActionSelector:
         classification = self.formulation == "classification"
         self.models = []
         targets = ([gains[:, i] for i in range(len(self.catalog.ids))] if self.formulation == "independent_regression"
-                   else [self.catalog.best(gains) if classification else gains.reshape(-1)])
+                   else [soft_targets(gains, self.temperature) if classification else gains.reshape(-1)])
         for index, target in enumerate(targets):
             if self.formulation == "independent_regression" and index in self.catalog.native_indices:
                 self.models.append(None)

@@ -30,6 +30,7 @@ from .capabilities import UpdateCapabilities, UpdateUnit
 from .features import DATA_FEATURES, FEEDBACK_FEATURES, StateFeatures
 from .runtime import UpdateController
 from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, LOG1P_FEATURES, SelectorPolicy
+from .training import select_temperature
 
 
 def save_json(path: Path, record) -> None:
@@ -285,6 +286,14 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
     parameters = options.get("parameters", {})
     if set(parameters) - set(ESTIMATORS):
         raise ValueError("unknown estimator parameter section")
+    formulation_parameters = options.get("formulation_parameters", {})
+    if set(formulation_parameters) - set(FORMULATIONS):
+        raise ValueError("unknown formulation parameter section")
+    if any(set(values) - set(ESTIMATORS) for values in formulation_parameters.values()):
+        raise ValueError("unknown estimator in formulation parameters")
+    classification = options.get("classification", {})
+    if set(classification) - {"temperature", "temperature_candidates", "cv_splits"}:
+        raise ValueError("unknown classification temperature option")
     torch.set_num_threads(manifest["config"].get("threads", 1))
     capabilities = UpdateCapabilities(tuple(UpdateUnit(**row) for row in manifest["capabilities"]))
     catalog = ActionCatalog.from_dict(manifest["catalog"], capabilities)
@@ -308,14 +317,31 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
             for estimator in estimators:
                 began = perf_counter()
                 selector = ActionSelector(catalog, names, formulation, estimator,
-                                          parameters=parameters.get(estimator, {}), seed=manifest["config"].get("seed", 0),
+                                          parameters={**parameters.get(estimator, {}),
+                                                      **formulation_parameters.get(formulation, {}).get(estimator, {})},
+                                          seed=manifest["config"].get("seed", 0),
                                           feature_window=manifest["config"]["collection"].get("feature_window", 32),
                                           error_window=manifest["config"]["collection"].get("error_window", 128))
+                temperature_report = None
+                if formulation == "classification":
+                    temperature = classification.get("temperature", "auto")
+                    if temperature == "auto":
+                        temperature_report = select_temperature(
+                            selector, states, gains, origins, label_ends,
+                            temperatures=classification.get("temperature_candidates", [.01, .02, .05, .1, .2]),
+                            cv_splits=classification.get("cv_splits", 3))
+                        temperature = temperature_report["temperature"]
+                    else:
+                        temperature_report = {"method": "fixed", "temperature": temperature}
+                    selector.temperature = temperature
+                    print(f"classification/{estimator}: temperature={temperature}", flush=True)
                 selector.fit(states, gains)
                 fit_seconds = perf_counter() - began
                 directory = output / formulation / estimator
                 directory.mkdir(parents=True)
                 selector.save(directory / "selector.pkl")
+                if temperature_report is not None:
+                    save_json(directory / "temperature_selection.json", temperature_report)
                 if estimator == "mlp":
                     save_json(directory / "learning_rates.json", {
                         "schedule": "cosine", "unit": "epoch",
@@ -324,6 +350,8 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
                                    for i, model in enumerate(selector.models) if model is not None]})
                 row = {"formulation": formulation, "estimator": estimator, "feature_count": len(names),
                        "fit_seconds": fit_seconds, "model_bytes": (directory / "selector.pkl").stat().st_size}
+                if formulation == "classification":
+                    row.update(target="softmax_gain", temperature=selector.temperature)
                 results.append(row)
                 save_json(directory / "metadata.json", {**row, "features": names, "catalog": catalog.to_dict(),
                                                         "action_encoding": catalog.encoding_names,
@@ -509,7 +537,7 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
                                                  output / name, name=name,
                                                  target_mean=np.asarray(manifest["target_mean"]),
                                                  target_std=np.asarray(manifest["target_std"])))
-                print(f"tested {name}: MAE={summaries[-1]['mae']:.6f}", flush=True)
+                print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] tested {name}: MAE={summaries[-1]['mae']:.6f}", flush=True)
                 del executor
         else:
             pools, pending = [], {}
@@ -531,7 +559,7 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
                         pool = pending.pop(future)
                         summary = future.result()
                         summaries.append(summary)
-                        print(f"tested {summary['name']} on {summary['device']}: MAE={summary['mae']:.6f}", flush=True)
+                        print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] tested {summary['name']} on {summary['device']}: MAE={summary['mae']:.6f}", flush=True)
                         job = next(remaining, None)
                         if job is not None:
                             name, policy = job

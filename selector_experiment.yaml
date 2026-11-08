@@ -24,7 +24,7 @@ collection:
 selectors:
   formulations: [independent_regression, shared_regression, classification]
   estimators: [random_forest, lightgbm, mlp]
-  # Original OneNet inputs; uncomment additional features for later experiments.
+  # All 15 collected OneNet state features.
   features:
     - channel_shift_fraction
     - volatility_ratio
@@ -34,13 +34,13 @@ selectors:
     - residual_bias_ratio
     - expert_relative_gap
     - combined_time_weight
-    # - normalized_mean_shift
-    # - trend_shift
-    # - cross_correlation_shift
-    # - error_volatility
-    # - tail_error_ratio
-    # - first_step_mae
-    # - residual_autocorrelation
+    - normalized_mean_shift
+    - trend_shift
+    - cross_correlation_shift
+    - error_volatility
+    - tail_error_ratio
+    - first_step_mae
+    - residual_autocorrelation
   parameters:
     random_forest: {n_estimators: 200, max_depth: 6, min_samples_leaf: 4, n_jobs: 1}
     lightgbm: {n_estimators: 200, learning_rate: 0.05, num_leaves: 7, min_child_samples: 4, n_jobs: 1}
@@ -51,3 +51,19 @@ selectors:
       epochs: 100
       batch_size: 64
       weight_decay: 0.0001
+  formulation_parameters:
+    independent_regression:
+      lightgbm:
+        n_estimators: 100
+        learning_rate: 0.03
+        num_leaves: 3
+        min_child_samples: 12
+        reg_lambda: 1.0
+    shared_regression:
+      random_forest: {max_depth: 12, min_samples_leaf: 2}
+      lightgbm: {n_estimators: 600, num_leaves: 31, min_child_samples: 2}
+  classification:
+    temperature: auto
+    # Gains are fractions: 0.01 corresponds to one percentage point.
+    temperature_candidates: [0.01, 0.02, 0.05, 0.1, 0.2]
+    cv_splits: 3
