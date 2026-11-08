@@ -2,13 +2,14 @@
 
 import numpy as np
 
-from .feature_selection import purged_time_splits
+from .feature_selection import purged_time_splits, select_state_features
 from .selector import ActionSelector, soft_targets
 
 
 def select_temperature(selector: ActionSelector, states: np.ndarray, gains: np.ndarray,
                        origins: np.ndarray, label_ends: np.ndarray, *,
-                       temperatures=(.01, .02, .05, .1, .2), cv_splits: int = 3) -> dict:
+                       temperatures=(.01, .02, .05, .1, .2), cv_splits: int = 3,
+                       feature_selection: dict | None = None) -> dict:
     """Choose by realized held-out gain, then refit externally on all historical states.
 
     Cross-entropies at different temperatures are not comparable selection scores.
@@ -23,21 +24,29 @@ def select_temperature(selector: ActionSelector, states: np.ndarray, gains: np.n
     folds = purged_time_splits(origins, label_ends, cv_splits)
     report = {"method": "purged_forward_gain", "selection_metric": "mean_selected_relative_mae_gain",
               "tie_break": "larger_temperature", "folds": [], "candidates": []}
+    fold_features = []
     for train, validation in folds:
+        names = selector.features
+        if feature_selection is not None:
+            selection = select_state_features(states[train], gains[train], names, selector.catalog.ids,
+                                              selector.catalog.native_indices, **feature_selection)
+            names = selection["selected_features"]
+        indices = np.asarray([selector.features.index(name) for name in names], dtype=int)
+        fold_features.append((names, indices))
         report["folds"].append({"train_origins": origins[train].tolist(),
                                 "validation_origins": origins[validation].tolist(),
-                                "train_label_end_max": int(label_ends[train].max())})
+                                "train_label_end_max": int(label_ends[train].max()), "features": names})
     for temperature in sorted(temperatures):
         total_gain = total_regret = 0.
         total_states = 0
         fold_scores = []
-        for train, validation in folds:
-            candidate = ActionSelector(selector.catalog, selector.features, "classification", selector.estimator,
+        for (train, validation), (names, indices) in zip(folds, fold_features):
+            candidate = ActionSelector(selector.catalog, names, "classification", selector.estimator,
                                        parameters=selector.parameters, seed=selector.seed,
                                        feature_window=selector.feature_window, error_window=selector.error_window,
                                        temperature=temperature)
-            candidate.fit(states[train], gains[train])
-            selected, _ = candidate.select(states[validation])
+            candidate.fit(states[train][:, indices], gains[train])
+            selected, _ = candidate.select(states[validation][:, indices])
             actual = gains[validation, selected]
             regret = gains[validation].max(axis=1) - actual
             total_gain += actual.sum()

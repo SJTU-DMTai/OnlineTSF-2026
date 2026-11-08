@@ -28,6 +28,7 @@ from .actions import UpdateAction, positive_integer
 from .catalog import ActionCatalog
 from .capabilities import UpdateCapabilities, UpdateUnit
 from .features import DATA_FEATURES, FEEDBACK_FEATURES, StateFeatures
+from .feature_selection import select_state_features
 from .runtime import UpdateController
 from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, LOG1P_FEATURES, SelectorPolicy
 from .training import select_temperature
@@ -278,7 +279,7 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
     options = manifest["config"]["selectors"] if options is None else options
     formulations, estimators = options["formulations"], options["estimators"]
     if "feature_sets" in options:
-        raise ValueError("feature_sets is obsolete; selectors use all collected state features")
+        raise ValueError("feature_sets is obsolete; ElasticNet selects from selectors.features or all collected features")
     for values, allowed, name in ((formulations, FORMULATIONS, "formulations"),
                                    (estimators, ESTIMATORS, "estimators")):
         if not values or len(set(values)) != len(values) or set(values) - set(allowed):
@@ -311,8 +312,17 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
         names = options.get("features", manifest["feature_names"])
         if not names or len(set(names)) != len(names) or set(names) - set(manifest["feature_names"]):
             raise ValueError("selectors.features must contain unique collected feature names")
-        states = states[:, [manifest["feature_names"].index(name) for name in names]]
-        print(f"Using {len(names)} state features: {names}", flush=True)
+        candidate_names = list(names)
+        candidate_states = states[:, [manifest["feature_names"].index(name) for name in candidate_names]]
+        selection_options = options.get("feature_selection", {})
+        began = perf_counter()
+        selection = select_state_features(candidate_states, gains, candidate_names, catalog.ids,
+                                          catalog.native_indices, **selection_options)
+        selection.update(seconds=perf_counter() - began, collection_sha256=collection_digest)
+        save_json(output / "feature_selection.json", selection)
+        names = selection["selected_features"]
+        states = candidate_states[:, [candidate_names.index(name) for name in names]]
+        print(f"ElasticNet selected {len(names)}/{len(candidate_names)} state features: {names}", flush=True)
         for formulation in formulations:
             for estimator in estimators:
                 began = perf_counter()
@@ -326,10 +336,12 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
                 if formulation == "classification":
                     temperature = classification.get("temperature", "auto")
                     if temperature == "auto":
+                        temperature_selector = copy.copy(selector)
+                        temperature_selector.features = candidate_names
                         temperature_report = select_temperature(
-                            selector, states, gains, origins, label_ends,
+                            temperature_selector, candidate_states, gains, origins, label_ends,
                             temperatures=classification.get("temperature_candidates", [.01, .02, .05, .1, .2]),
-                            cv_splits=classification.get("cv_splits", 3))
+                            cv_splits=classification.get("cv_splits", 3), feature_selection=selection_options)
                         temperature = temperature_report["temperature"]
                     else:
                         temperature_report = {"method": "fixed", "temperature": temperature}
@@ -356,7 +368,8 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
                 save_json(directory / "metadata.json", {**row, "features": names, "catalog": catalog.to_dict(),
                                                         "action_encoding": catalog.encoding_names,
                                                         "parameters": selector.parameters,
-                                                        "feature_selection": "none",
+                                                        "feature_selection": "elastic_net",
+                                                        "feature_selection_parameters": selection["parameters"],
                                                         "feature_transforms": {name: "log1p" for name in names
                                                                                if name in LOG1P_FEATURES},
                                                         "collection_sha256": collection_digest})

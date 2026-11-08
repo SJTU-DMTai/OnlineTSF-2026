@@ -24,7 +24,8 @@ collection:
 selectors:
   formulations: [independent_regression, shared_regression, classification]
   estimators: [random_forest, lightgbm, mlp]
-  # All 15 collected OneNet state features.
+  feature_selection: {alpha: 0.06, l1_ratio: 0.5}
+  # Candidate pool; ElasticNet selects the final inputs from these features.
   features:
     - channel_shift_fraction
     - volatility_ratio
