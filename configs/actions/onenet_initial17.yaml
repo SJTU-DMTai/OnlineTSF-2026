@@ -1,0 +1,72 @@
+# Initial 17 configurations plus every1_lr0.5, all held for H=128.
+# Periods use the current framework's accumulated feedback batches.
+# long/short remain native when only gradient modules are restricted.
+method: onenet
+actions:
+  - id: native
+    units: [time, variable, decision, long, short]
+    duration: 128
+  - id: frozen
+    units: []
+    duration: 128
+  - id: no_grad
+    units: [long, short]
+    duration: 128
+  - id: every1_lr0.3
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 0.3, variable: 0.3, decision: 0.3}
+    duration: 128
+  - id: every1_lr0.5
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 0.5, variable: 0.5, decision: 0.5}
+    duration: 128
+  - id: every1_lr3
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 3, variable: 3, decision: 3}
+    duration: 128
+  - id: every4_lr0.3
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 0.3, variable: 0.3, decision: 0.3}
+    periods: {time: 4, variable: 4, decision: 4}
+    duration: 128
+  - id: every4_lr1
+    units: [time, variable, decision, long, short]
+    periods: {time: 4, variable: 4, decision: 4}
+    duration: 128
+  - id: every4_lr3
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 3, variable: 3, decision: 3}
+    periods: {time: 4, variable: 4, decision: 4}
+    duration: 128
+  - id: every16_lr0.3
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 0.3, variable: 0.3, decision: 0.3}
+    periods: {time: 16, variable: 16, decision: 16}
+    duration: 128
+  - id: every16_lr1
+    units: [time, variable, decision, long, short]
+    periods: {time: 16, variable: 16, decision: 16}
+    duration: 128
+  - id: every16_lr3
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 3, variable: 3, decision: 3}
+    periods: {time: 16, variable: 16, decision: 16}
+    duration: 128
+  - id: only_time
+    units: [time, long, short]
+    duration: 128
+  - id: only_variable
+    units: [variable, long, short]
+    duration: 128
+  - id: only_decision
+    units: [decision, long, short]
+    duration: 128
+  - id: only_time+variable
+    units: [time, variable, long, short]
+    duration: 128
+  - id: only_time+decision
+    units: [time, decision, long, short]
+    duration: 128
+  - id: only_variable+decision
+    units: [variable, decision, long, short]
+    duration: 128

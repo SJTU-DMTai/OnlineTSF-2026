@@ -25,6 +25,8 @@ def main(argv=None) -> None:
     evaluate.add_argument("--data", type=Path, required=True)
     evaluate.add_argument("--models", type=Path, required=True)
     evaluate.add_argument("--output", type=Path, required=True)
+    evaluate.add_argument("--devices", nargs="+", help="parallel OneNet evaluation on physical GPUs, e.g. cuda:0 cuda:2")
+    evaluate.add_argument("--workers-per-device", nargs="+", type=int, help="concurrent policies per device, e.g. 1 2")
     oracle = commands.add_parser("oracle", help="evaluate only the greedy hindsight Oracle")
     oracle.add_argument("--data", type=Path, required=True, help="completed collection directory")
     oracle.add_argument("--output", type=Path, required=True)
@@ -48,7 +50,8 @@ def main(argv=None) -> None:
         options = yaml.safe_load(args.config.read_text(encoding="utf-8"))["selectors"] if args.config else None
         train_experiment(args.data, args.output, options)
     elif args.command == "evaluate":
-        evaluate_experiment(args.data, args.models, args.output)
+        evaluate_experiment(args.data, args.models, args.output,
+                            devices=args.devices, workers_per_device=args.workers_per_device)
     else:
         from .oracle import evaluate_oracle
 

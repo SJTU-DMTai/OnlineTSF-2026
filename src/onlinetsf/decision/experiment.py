@@ -8,7 +8,8 @@ import hashlib
 import io
 import json
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
+import os
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
@@ -298,8 +299,11 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
     results = []
     save_json(output / "manifest.json", {"status": "training", "data": str(data_directory.resolve()), "options": options})
     try:
-        names = manifest["feature_names"]
-        print(f"Using all {len(names)} state features: {names}", flush=True)
+        names = options.get("features", manifest["feature_names"])
+        if not names or len(set(names)) != len(names) or set(names) - set(manifest["feature_names"]):
+            raise ValueError("selectors.features must contain unique collected feature names")
+        states = states[:, [manifest["feature_names"].index(name) for name in names]]
+        print(f"Using {len(names)} state features: {names}", flush=True)
         for formulation in formulations:
             for estimator in estimators:
                 began = perf_counter()
@@ -402,15 +406,84 @@ def evaluate_policy(executor: OnlineExecutor, dataset, start: int, stop: int, ou
     return summary
 
 
-def evaluate_experiment(data_directory: Path, model_directory: Path, output: Path) -> None:
+def initialize_evaluation_worker(device: str, threads: int) -> None:
+    """Give each evaluation process one physical GPU and a private CUDA context."""
+    global _evaluation_device, _evaluation_device_name
+    requested = torch.device(device)
+    _evaluation_device_name = device
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(requested.index) if requested.type == "cuda" else ""
+    _evaluation_device = torch.device("cuda:0" if requested.type == "cuda" else "cpu")
+    torch.set_num_threads(threads)
+    if requested.type == "cuda":
+        torch.cuda.set_device(0)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+
+def evaluate_policy_worker(data_directory: Path, manifest: dict, output: Path, name: str, policy) -> dict:
+    """Restore a fresh OneNet trajectory, including optimizer state, for one policy."""
+    saved = torch.load(data_directory / "evaluation_start.pt", weights_only=False, map_location="cpu")
+    executor, dataset = saved["executor"], saved["dataset"]
+    method = executor.method.method
+    original_device = method.device
+    original_parameters = tuple(method.model.parameters())
+    method.model.to(_evaluation_device)
+    parameters = dict(zip(original_parameters, method.model.parameters()))
+    method.device = _evaluation_device
+    # Keep optimizer groups intact: the adapter holds references to these groups.
+    # OneNet's Adam/AdamW moment tensors follow parameters; step counters stay on CPU.
+    for optimizer in method.update_optimizers:
+        for group in optimizer.param_groups:
+            group["params"] = [parameters[parameter] for parameter in group["params"]]
+        for parameter in list(optimizer.state):
+            moved = parameters[parameter]
+            if moved is not parameter:
+                optimizer.state[moved] = optimizer.state.pop(parameter)
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor) and key != "step":
+                    state[key] = value.to(_evaluation_device)
+    torch.set_rng_state(saved["rng"][0])
+    if _evaluation_device.type == "cuda":
+        if saved["rng"][1]:
+            torch.cuda.set_rng_state(saved["rng"][1][original_device.index or 0], device=0)
+        else:
+            torch.cuda.manual_seed(manifest["config"].get("seed", 0))
+    executor.method.policy = policy
+    summary = evaluate_policy(executor, dataset, manifest["test_start"], manifest["test_stop"],
+                              output / name, name=name,
+                              target_mean=np.asarray(manifest["target_mean"]),
+                              target_std=np.asarray(manifest["target_std"]))
+    summary["device"] = _evaluation_device_name
+    save_json(output / name / "summary.json", summary)
+    return summary
+
+
+def evaluate_experiment(data_directory: Path, model_directory: Path, output: Path, *,
+                        devices: list[str] | None = None, workers_per_device: list[int] | None = None) -> None:
     manifest = json.loads((data_directory / "manifest.json").read_text(encoding="utf-8"))
     trained = json.loads((model_directory / "manifest.json").read_text(encoding="utf-8"))
     if manifest["status"] != "complete" or trained["status"] != "complete":
         raise ValueError("collection and model training must both complete")
     torch.set_num_threads(manifest["config"].get("threads", 1))
-    saved = torch.load(data_directory / "evaluation_start.pt", weights_only=False)
-    source, dataset = saved["executor"], saved["dataset"]
-    catalog = ActionCatalog.from_dict(manifest["catalog"], source.method.capabilities)
+    capabilities = UpdateCapabilities(tuple(UpdateUnit(**row) for row in manifest["capabilities"]))
+    catalog = ActionCatalog.from_dict(manifest["catalog"], capabilities)
+    if devices is None and workers_per_device is not None:
+        raise ValueError("workers_per_device requires devices")
+    if devices is not None:
+        if not devices or len(set(devices)) != len(devices):
+            raise ValueError("evaluation devices must be nonempty and unique")
+        for name in devices:
+            device = torch.device(name)
+            if device.type not in {"cpu", "cuda"} or (device.type == "cuda" and device.index is None):
+                raise ValueError("evaluation devices must be cpu or indexed CUDA devices such as cuda:2")
+        workers_per_device = [1] * len(devices) if workers_per_device is None else workers_per_device
+        if len(workers_per_device) != len(devices):
+            raise ValueError("workers_per_device must provide one count per device")
+        for count in workers_per_device:
+            positive_integer(count, "workers_per_device")
+        if catalog.method != "onenet":
+            raise ValueError("parallel evaluation currently supports OneNet only")
     digest = hashlib.sha256((data_directory / "training.npz").read_bytes()).hexdigest()
     jobs = [("native", catalog.actions[catalog.native_indices[0]]),
             ("frozen", UpdateAction(duration=catalog.actions[catalog.native_indices[0]].duration))]
@@ -425,16 +498,51 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
     summaries = []
     save_json(output / "manifest.json", {"status": "evaluating"})
     try:
-        for name, policy in jobs:
-            executor = copy.deepcopy(source)
-            executor.method.policy = policy
-            restore_rng(saved["rng"])
-            summaries.append(evaluate_policy(executor, dataset, manifest["test_start"], manifest["test_stop"],
-                                             output / name, name=name,
-                                             target_mean=np.asarray(manifest["target_mean"]),
-                                             target_std=np.asarray(manifest["target_std"])))
-            print(f"tested {name}: MAE={summaries[-1]['mae']:.6f}", flush=True)
-            del executor
+        if devices is None:
+            saved = torch.load(data_directory / "evaluation_start.pt", weights_only=False)
+            source, dataset = saved["executor"], saved["dataset"]
+            for name, policy in jobs:
+                executor = copy.deepcopy(source)
+                executor.method.policy = policy
+                restore_rng(saved["rng"])
+                summaries.append(evaluate_policy(executor, dataset, manifest["test_start"], manifest["test_stop"],
+                                                 output / name, name=name,
+                                                 target_mean=np.asarray(manifest["target_mean"]),
+                                                 target_std=np.asarray(manifest["target_std"])))
+                print(f"tested {name}: MAE={summaries[-1]['mae']:.6f}", flush=True)
+                del executor
+        else:
+            pools, pending = [], {}
+            remaining = iter(jobs)
+            try:
+                for device, count in zip(devices, workers_per_device):
+                    pool = ProcessPoolExecutor(max_workers=count, mp_context=multiprocessing.get_context("spawn"),
+                                               initializer=initialize_evaluation_worker,
+                                               initargs=(device, manifest["config"].get("threads", 1)))
+                    pools.append(pool)
+                    for _ in range(count):
+                        job = next(remaining, None)
+                        if job is not None:
+                            name, policy = job
+                            pending[pool.submit(evaluate_policy_worker, data_directory, manifest, output, name, policy)] = pool
+                while pending:
+                    completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        pool = pending.pop(future)
+                        summary = future.result()
+                        summaries.append(summary)
+                        print(f"tested {summary['name']} on {summary['device']}: MAE={summary['mae']:.6f}", flush=True)
+                        job = next(remaining, None)
+                        if job is not None:
+                            name, policy = job
+                            pending[pool.submit(evaluate_policy_worker, data_directory, manifest, output, name, policy)] = pool
+            finally:
+                for future in pending:
+                    future.cancel()
+                for pool in pools:
+                    pool.shutdown(wait=True, cancel_futures=True)
+            order = {name: index for index, (name, _) in enumerate(jobs)}
+            summaries.sort(key=lambda row: order[row["name"]])
     except BaseException as error:
         save_json(output / "manifest.json", {"status": "failed", "error": f"{type(error).__name__}: {error}", "results": summaries})
         raise

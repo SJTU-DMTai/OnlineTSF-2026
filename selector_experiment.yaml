@@ -13,7 +13,7 @@ forecast:
   device: cuda:0
   epochs: 6
   batch_size: 32
-actions: configs/actions/onenet_ettm1.yaml
+actions: configs/actions/onenet_initial17.yaml
 collection:
   offline_fraction: 0.2
   train_end_fraction: 0.6
@@ -24,7 +24,23 @@ collection:
 selectors:
   formulations: [independent_regression, shared_regression, classification]
   estimators: [random_forest, lightgbm, mlp]
-  # All collected state features are shared by all nine models.
+  # Original OneNet inputs; uncomment additional features for later experiments.
+  features:
+    - channel_shift_fraction
+    - volatility_ratio
+    - autocorrelation_shift
+    - recent_mae
+    - error_ratio
+    - residual_bias_ratio
+    - expert_relative_gap
+    - combined_time_weight
+    # - normalized_mean_shift
+    # - trend_shift
+    # - cross_correlation_shift
+    # - error_volatility
+    # - tail_error_ratio
+    # - first_step_mae
+    # - residual_autocorrelation
   parameters:
     random_forest: {n_estimators: 200, max_depth: 6, min_samples_leaf: 4, n_jobs: 1}
     lightgbm: {n_estimators: 200, learning_rate: 0.05, num_leaves: 7, min_child_samples: 4, n_jobs: 1}
