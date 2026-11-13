@@ -17,6 +17,8 @@ def main(argv=None) -> None:
         command.add_argument("--output", type=Path, required=True, help="new output directory")
         command.add_argument("--strategy", help="override the forecasting strategy in profiles.yaml")
         command.add_argument("--actions", type=Path, help="override the candidate action YAML")
+        if name == "run":
+            command.add_argument("--ema-beta", type=float, help="test EMA coefficient in [0, 1); default matches tau effective samples")
     train = commands.add_parser("train")
     train.add_argument("--data", type=Path, required=True, help="completed collection directory")
     train.add_argument("--config", type=Path, help="optional experiment YAML whose selectors section overrides training")
@@ -27,11 +29,13 @@ def main(argv=None) -> None:
     evaluate.add_argument("--output", type=Path, required=True)
     evaluate.add_argument("--devices", nargs="+", help="parallel OneNet evaluation on physical GPUs, e.g. cuda:0 cuda:2")
     evaluate.add_argument("--workers-per-device", nargs="+", type=int, help="concurrent policies per device, e.g. 1 2")
+    evaluate.add_argument("--ema-beta", type=float, help="override the test EMA coefficient without retraining")
     oracle = commands.add_parser("oracle", help="evaluate greedy and EMA hindsight Oracles")
     oracle.add_argument("--data", type=Path, required=True, help="completed collection directory")
     oracle.add_argument("--output", type=Path, required=True)
     oracle.add_argument("--actions", type=Path, help="candidate YAML; defaults to the collected action catalog")
     oracle.add_argument("--steps", type=int, help="optional limit on test forecast origins")
+    oracle.add_argument("--ema-beta", type=float, help="override the EMA Oracle coefficient")
     args = parser.parse_args(argv)
     if args.command in {"run", "collect"}:
         config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
@@ -42,6 +46,8 @@ def main(argv=None) -> None:
         if args.command == "collect":
             collect_experiment(config, args.config.resolve().parent, args.output)
         else:
+            if args.ema_beta is not None:
+                config.setdefault("evaluation", {})["ema_beta"] = args.ema_beta
             args.output.mkdir(parents=True, exist_ok=False)
             collect_experiment(config, args.config.resolve().parent, args.output / "data")
             train_experiment(args.output / "data", args.output / "models")
@@ -51,11 +57,11 @@ def main(argv=None) -> None:
         train_experiment(args.data, args.output, options)
     elif args.command == "evaluate":
         evaluate_experiment(args.data, args.models, args.output,
-                            devices=args.devices, workers_per_device=args.workers_per_device)
+                            devices=args.devices, workers_per_device=args.workers_per_device, ema_beta=args.ema_beta)
     else:
         from .oracle import evaluate_oracle
 
-        evaluate_oracle(args.data, args.output, actions=args.actions, steps=args.steps)
+        evaluate_oracle(args.data, args.output, actions=args.actions, steps=args.steps, ema_beta=args.ema_beta)
 
 
 if __name__ == "__main__":

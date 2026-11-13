@@ -11,6 +11,7 @@ import torch
 from torch import nn
 
 from .catalog import ActionCatalog
+from .actions import positive_integer
 
 
 FORMULATIONS = ("independent_regression", "shared_regression", "classification")
@@ -244,14 +245,24 @@ class ActionSelector:
         return model
 
 
+def resolve_ema_beta(beta: float | None, tau: int = 64) -> float:
+    """Default EMA effective sample size to the training label length."""
+    if beta is None:
+        positive_integer(tau, "tau")
+        return (tau - 1) / (tau + 1)
+    if isinstance(beta, bool) or not isinstance(beta, (int, float)) or not math.isfinite(beta) or not 0 <= beta < 1:
+        raise ValueError("ema_beta must be finite and satisfy 0 <= ema_beta < 1")
+    return float(beta)
+
+
 class SelectorPolicy:
     """The runtime consumes state features and returns the persisted action."""
 
-    def __init__(self, selector: ActionSelector) -> None:
+    def __init__(self, selector: ActionSelector, *, ema_beta: float | None = None) -> None:
         self.selector = selector
         self.last_selection: dict | None = None
         self.smoothed_scores: np.ndarray | None = None
-        self.rho = math.exp(-1 / selector.tau)
+        self.beta = resolve_ema_beta(ema_beta, selector.tau)
 
     def __call__(self, state):
         for action in self.selector.catalog.actions:
@@ -259,14 +270,14 @@ class SelectorPolicy:
         values = np.asarray([[state.features[name] for name in self.selector.features]], dtype=float)
         scores = self.selector.scores(values)[0]
         self.smoothed_scores = (scores.copy() if self.smoothed_scores is None else
-                                self.rho * self.smoothed_scores + (1 - self.rho) * scores)
+                                self.beta * self.smoothed_scores + (1 - self.beta) * scores)
         ranked = (self.smoothed_scores if self.selector.formulation == "classification" else
                   -self.smoothed_scores)
         index = int(self.selector.catalog.best(ranked[None, :])[0])
         self.last_selection = {"action_id": self.selector.catalog.ids[index],
                                "scores": dict(zip(self.selector.catalog.ids, self.smoothed_scores.tolist())),
                                "raw_scores": dict(zip(self.selector.catalog.ids, scores.tolist())),
-                               "ema_rho": self.rho,
+                               "ema_beta": self.beta,
                                "score_kind": "probability" if self.selector.formulation == "classification" else "action_mae",
                                "features": {name: state.features[name] for name in self.selector.features}}
         return self.selector.catalog.actions[index]

@@ -6,7 +6,6 @@ import csv
 import copy
 import hashlib
 import json
-import math
 from pathlib import Path
 from time import perf_counter
 
@@ -18,6 +17,7 @@ from ..online import OnlineExecutor
 from .actions import positive_integer
 from .catalog import ActionCatalog
 from .experiment import evaluate_policy, restore_rng, save_json, score_action
+from .selector import resolve_ema_beta
 
 
 class OracleExecutor:
@@ -29,11 +29,11 @@ class OracleExecutor:
     """
 
     def __init__(self, executor: OnlineExecutor, dataset, catalog: ActionCatalog, stop: int,
-                 *, ema_tau: int | None = None) -> None:
+                 *, ema_beta: float | None = None) -> None:
         self.executor, self.dataset, self.catalog, self.stop = executor, dataset, catalog, stop
         self.method = executor.method
         self._events = executor._events
-        self.rho = math.exp(-1 / ema_tau) if ema_tau is not None else None
+        self.beta = resolve_ema_beta(ema_beta) if ema_beta is not None else None
         self.smoothed_maes: np.ndarray | None = None
         self.candidate_search_seconds = 0.
         self.candidate_evaluations = 0
@@ -45,9 +45,9 @@ class OracleExecutor:
             features, score = score_action(self.executor, self.dataset, index, action, steps=1, stop=self.stop)
             outcomes.append({"action_id": name, "scored_steps": 1, **score})
         losses = np.asarray([row["mae"] for row in outcomes])
-        if self.rho is not None:
+        if self.beta is not None:
             self.smoothed_maes = (losses.copy() if self.smoothed_maes is None else
-                                  self.rho * self.smoothed_maes + (1 - self.rho) * losses)
+                                  self.beta * self.smoothed_maes + (1 - self.beta) * losses)
         ranked = losses if self.smoothed_maes is None else self.smoothed_maes
         for row, value in zip(outcomes, ranked):
             row["ema_mae"] = float(value)
@@ -58,8 +58,8 @@ class OracleExecutor:
         action = self.catalog.actions[chosen]
         self.method.policy = action
         selection = {"action_id": self.catalog.ids[chosen],
-                     "score_kind": "current_mae" if self.rho is None else "ema_current_mae",
-                     "features": features, "ema_rho": self.rho,
+                     "score_kind": "current_mae" if self.beta is None else "ema_current_mae",
+                     "features": features, "ema_beta": self.beta,
                      "selected_current_mae": outcomes[chosen]["mae"],
                      "selected_ema_mae": outcomes[chosen]["ema_mae"],
                      "selected_current_mse": outcomes[chosen]["mse"],
@@ -74,12 +74,14 @@ class OracleExecutor:
 
 
 def evaluate_oracle(data_directory: Path, output: Path, *, actions: Path | None = None,
-                    steps: int | None = None) -> dict:
+                    steps: int | None = None, ema_beta: float | None = None) -> dict:
     """Evaluate just Oracle from an existing collection, without fitting selectors."""
     manifest_path = data_directory / "manifest.json"
     collection = json.loads(manifest_path.read_text(encoding="utf-8"))
     if collection["status"] != "complete":
         raise ValueError("collection must complete before Oracle evaluation")
+    beta = resolve_ema_beta(ema_beta if ema_beta is not None else
+                            collection["config"].get("evaluation", {}).get("ema_beta"), collection["tau"])
     torch.set_num_threads(collection["config"].get("threads", 1))
     saved = torch.load(data_directory / "evaluation_start.pt", weights_only=False)
     dataset = saved["dataset"]
@@ -97,14 +99,14 @@ def evaluate_oracle(data_directory: Path, output: Path, *, actions: Path | None 
             "collection_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
             "controllers": ["oracle_greedy", "oracle_ema"], "uses_future_labels_for_selection": True,
             "objective": "minimum current standardized MAE, with or without per-action EMA",
-            "ema_tau": collection["tau"], "ema_rho": math.exp(-1 / collection["tau"]),
+            "ema_beta": beta,
             "test_start": start, "test_stop": stop, "candidate_count": len(catalog.actions)}
     save_json(output / "manifest.json", plan)
     summaries = []
     try:
-        for name, ema_tau in (("oracle_greedy", None), ("oracle_ema", collection["tau"])):
+        for name, policy_beta in (("oracle_greedy", None), ("oracle_ema", beta)):
             restore_rng(saved["rng"])
-            oracle = OracleExecutor(copy.deepcopy(saved["executor"]), dataset, catalog, stop, ema_tau=ema_tau)
+            oracle = OracleExecutor(copy.deepcopy(saved["executor"]), dataset, catalog, stop, ema_beta=policy_beta)
             directory = output / name
             summary = evaluate_policy(oracle, dataset, start, stop, directory, name=name,
                                       target_mean=np.asarray(collection["target_mean"]),

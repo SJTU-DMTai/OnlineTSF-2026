@@ -129,7 +129,7 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
             features = StateFeatures(selector.feature_window, selector.error_window)
             if hasattr(method, "configure_feature_history"):
                 method.configure_feature_history(features.feature_window, features.error_window)
-            method = UpdateController(method, SelectorPolicy(selector), features=features)
+            method = UpdateController(method, SelectorPolicy(selector, ema_beta=decision.get("ema_beta")), features=features)
         else:
             method = UpdateController(method, UpdateAction.from_dict(decision["action"]))
     executor = OnlineExecutor(

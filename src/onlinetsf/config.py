@@ -284,14 +284,17 @@ def load_config(
     if decision is not None:
         from .decision.actions import UpdateAction
 
-        if not isinstance(decision, dict) or set(decision) not in ({"action"}, {"selector"}):
-            raise ValueError("config.decision requires only action or only selector")
+        if not isinstance(decision, dict) or set(decision) not in ({"action"}, {"selector"}, {"selector", "ema_beta"}):
+            raise ValueError("config.decision requires action or selector with optional ema_beta")
         decision = dict(decision)
         if "action" in decision:
             UpdateAction.from_dict(decision["action"])
         else:
             if not isinstance(decision["selector"], str):
                 raise ValueError("config.decision.selector must be a model artifact path")
+            from .decision.selector import resolve_ema_beta
+
+            resolve_ema_beta(decision.get("ema_beta"))
             artifact = Path(decision["selector"])
             decision["selector"] = str((source.parent / artifact).resolve()) if not artifact.is_absolute() else str(artifact)
         config["decision"] = decision

@@ -22,10 +22,12 @@ collection:
   workers: 4  # Independent action branches at the same origin; 1 runs serially.
   feature_window: 32
   error_window: 128
+evaluation:
+  ema_beta: null  # null: (tau - 1) / (tau + 1); 0 disables smoothing.
 selectors:
   formulations: [independent_regression, shared_regression, classification]
   estimators: [random_forest, lightgbm, mlp]
-  feature_selection: {alpha: 0.06, l1_ratio: 0.5}
+  feature_selection: null
   # Candidate pool; ElasticNet selects the final inputs from these features.
   features:
     - channel_shift_fraction

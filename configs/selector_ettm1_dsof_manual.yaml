@@ -21,6 +21,8 @@ collection:
   workers: 4
   feature_window: 32
   error_window: 128
+evaluation:
+  ema_beta: null  # null: (tau - 1) / (tau + 1); 0 disables smoothing.
 selectors:
   formulations:
   - independent_regression
@@ -30,9 +32,7 @@ selectors:
   - random_forest
   - lightgbm
   - mlp
-  feature_selection:
-    alpha: 0.06
-    l1_ratio: 0.5
+  feature_selection: null
   features:
   - channel_shift_fraction
   - volatility_ratio

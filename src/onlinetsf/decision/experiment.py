@@ -30,7 +30,7 @@ from .capabilities import UpdateCapabilities, UpdateUnit
 from .features import DATA_FEATURES, FEEDBACK_FEATURES, StateFeatures
 from .feature_selection import select_state_features
 from .runtime import UpdateController
-from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, LOG1P_FEATURES, SelectorPolicy
+from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, LOG1P_FEATURES, SelectorPolicy, resolve_ema_beta
 from .training import select_temperature
 
 
@@ -128,6 +128,7 @@ def collect_experiment(config: dict, base: Path, output: Path) -> None:
     torch.set_num_threads(threads)
     torch.manual_seed(seed)
     forecast, collection = config["forecast"], config["collection"]
+    resolve_ema_beta(config.get("evaluation", {}).get("ema_beta"), collection.get("tau", 64))
     workers = collection.get("workers", 1)
     positive_integer(workers, "collection.workers")
     profiles = yaml.safe_load((base / forecast["profiles"]).read_text(encoding="utf-8"))["strategies"]
@@ -321,13 +322,17 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
         candidate_states = states[:, [manifest["feature_names"].index(name) for name in candidate_names]]
         selection_options = options.get("feature_selection", {})
         began = perf_counter()
-        selection = select_state_features(candidate_states, gains, candidate_names, catalog.ids,
-                                          catalog.native_indices, **selection_options)
+        if selection_options is None:
+            selection = {"method": "none", "candidate_features": candidate_names,
+                         "selected_features": list(candidate_names), "parameters": {}}
+        else:
+            selection = select_state_features(candidate_states, gains, candidate_names, catalog.ids,
+                                              catalog.native_indices, **selection_options)
         selection.update(seconds=perf_counter() - began, collection_sha256=collection_digest)
         save_json(output / "feature_selection.json", selection)
         names = selection["selected_features"]
         states = candidate_states[:, [candidate_names.index(name) for name in names]]
-        print(f"ElasticNet selected {len(names)}/{len(candidate_names)} state features: {names}", flush=True)
+        print(f"Feature selection ({selection['method']}): {len(names)}/{len(candidate_names)} state features: {names}", flush=True)
         for formulation in formulations:
             for estimator in estimators:
                 began = perf_counter()
@@ -376,7 +381,7 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
                 save_json(directory / "metadata.json", {**row, "features": names, "catalog": catalog.to_dict(),
                                                         "action_encoding": catalog.encoding_names,
                                                         "parameters": selector.parameters,
-                                                        "feature_selection": "elastic_net",
+                                                        "feature_selection": selection["method"],
                                                         "feature_selection_parameters": selection["parameters"],
                                                         "feature_transforms": {name: "log1p" for name in names
                                                                                if name in LOG1P_FEATURES},
@@ -509,11 +514,14 @@ def evaluate_policy_worker(data_directory: Path, manifest: dict, output: Path, n
 
 
 def evaluate_experiment(data_directory: Path, model_directory: Path, output: Path, *,
-                        devices: list[str] | None = None, workers_per_device: list[int] | None = None) -> None:
+                        devices: list[str] | None = None, workers_per_device: list[int] | None = None,
+                        ema_beta: float | None = None) -> None:
     manifest = json.loads((data_directory / "manifest.json").read_text(encoding="utf-8"))
     trained = json.loads((model_directory / "manifest.json").read_text(encoding="utf-8"))
     if manifest["status"] != "complete" or trained["status"] != "complete":
         raise ValueError("collection and model training must both complete")
+    beta = resolve_ema_beta(ema_beta if ema_beta is not None else
+                            manifest["config"].get("evaluation", {}).get("ema_beta"), manifest["tau"])
     torch.set_num_threads(manifest["config"].get("threads", 1))
     capabilities = UpdateCapabilities(tuple(UpdateUnit(**row) for row in manifest["capabilities"]))
     catalog = ActionCatalog.from_dict(manifest["catalog"], capabilities)
@@ -542,10 +550,10 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
         if metadata["collection_sha256"] != digest or metadata["catalog"] != catalog.to_dict():
             raise ValueError("selector was trained on a different collection or candidate catalog")
         selector = ActionSelector.load(directory / "selector.pkl")
-        jobs.append((f"policy/{row['formulation']}/{row['estimator']}", SelectorPolicy(selector)))
+        jobs.append((f"policy/{row['formulation']}/{row['estimator']}", SelectorPolicy(selector, ema_beta=beta)))
     output.mkdir(parents=True, exist_ok=False)
     summaries = []
-    save_json(output / "manifest.json", {"status": "evaluating"})
+    save_json(output / "manifest.json", {"status": "evaluating", "ema_beta": beta})
     try:
         if devices is None:
             saved = torch.load(data_directory / "evaluation_start.pt", weights_only=False)
@@ -593,9 +601,9 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
             order = {name: index for index, (name, _) in enumerate(jobs)}
             summaries.sort(key=lambda row: order[row["name"]])
     except BaseException as error:
-        save_json(output / "manifest.json", {"status": "failed", "error": f"{type(error).__name__}: {error}", "results": summaries})
+        save_json(output / "manifest.json", {"status": "failed", "ema_beta": beta, "error": f"{type(error).__name__}: {error}", "results": summaries})
         raise
-    save_json(output / "manifest.json", {"status": "complete", "results": summaries})
+    save_json(output / "manifest.json", {"status": "complete", "ema_beta": beta, "results": summaries})
     with (output / "comparison.csv").open("w", encoding="utf-8", newline="") as handle:
         fields = [key for key, value in summaries[0].items() if not isinstance(value, list)]
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
