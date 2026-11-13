@@ -17,8 +17,8 @@ from torch.utils.data import DataLoader, Subset
 
 from ..factory import build_backbone, build_method as build_online_method
 from ..methods import DSOFMethod, FSNetMethod, OneNetMethod
-from ..decision_previous.config import DecisionConfig, FEATURE_SCHEMA_VERSION
-from ..decision_previous.actions import policies
+from ..decision_previous.decision_version1.config import DecisionConfig, FEATURE_SCHEMA_VERSION
+from ..decision_previous.decision_version1.actions import policies
 from .data import load_stream, select_probes
 from .reporting import Reporter, write_csv
 from .runtime import ControlledMethod, Policy, Replay, restore_rng, rng_state, state_features
@@ -174,7 +174,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--methods", nargs="+", choices=["fsnet", "onenet", "dsof"], default=["fsnet", "onenet", "dsof"])
     parser.add_argument("--horizons", nargs="+", type=int, default=[1, 24])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
-    parser.add_argument("--profiles", type=Path, default=Path("profiles.yaml"))
+    parser.add_argument("--profiles", type=Path, default=Path("configs/profiles.yaml"))
     parser.add_argument("--context-length", type=int, default=96)
     parser.add_argument("--prefix-rows", type=int, help="default/minimum: max(calibration rows, ceil(20%% of raw rows))")
     parser.add_argument("--epochs", type=int, default=6)

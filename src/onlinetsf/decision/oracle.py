@@ -1,10 +1,12 @@
-"""Greedy hindsight Oracle over the current finite update-action catalog."""
+"""Per-origin hindsight Oracles over the current update-action catalog."""
 
 from __future__ import annotations
 
 import csv
+import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 from time import perf_counter
 
@@ -23,43 +25,48 @@ class OracleExecutor:
 
     Every candidate starts from the same pre-observation state and RNG. Search
     rolls back its branches; the winner is executed again on the real trajectory.
-    The policy therefore retains normal period phases, pending labels and batches.
+    The policy retains pending labels and optimizer state.
     """
 
-    def __init__(self, executor: OnlineExecutor, dataset, catalog: ActionCatalog, stop: int) -> None:
+    def __init__(self, executor: OnlineExecutor, dataset, catalog: ActionCatalog, stop: int,
+                 *, ema_tau: int | None = None) -> None:
         self.executor, self.dataset, self.catalog, self.stop = executor, dataset, catalog, stop
         self.method = executor.method
-        self.method.expires_at = None
         self._events = executor._events
+        self.rho = math.exp(-1 / ema_tau) if ema_tau is not None else None
+        self.smoothed_maes: np.ndarray | None = None
         self.candidate_search_seconds = 0.
         self.candidate_evaluations = 0
 
     def step(self, index, context, target, *, decision_context=None, final=False):
-        selection = None
-        if self.method.expires_at is None or index >= self.method.expires_at:
-            began = perf_counter()
-            outcomes = []
-            for name, action in zip(self.catalog.ids, self.catalog.actions):
-                features, score = score_action(self.executor, self.dataset, index, action, stop=self.stop)
-                outcomes.append({"action_id": name, "duration": action.duration,
-                                 "scored_steps": min(action.duration, self.stop - index), **score})
-            losses = np.asarray([[row["mae"] for row in outcomes]])
-            chosen = int(self.catalog.best(-losses)[0])
-            seconds = perf_counter() - began
-            self.candidate_search_seconds += seconds
-            self.candidate_evaluations += len(outcomes)
-            action = self.catalog.actions[chosen]
-            self.method.policy, self.method.expires_at = action, None
-            selection = {"action_id": self.catalog.ids[chosen], "score_kind": "future_mae", "features": features,
-                         "selected_future_mae": outcomes[chosen]["mae"],
-                         "selected_future_mse": outcomes[chosen]["mse"],
-                         "executed_steps": outcomes[chosen]["scored_steps"],
-                         "candidate_search_seconds": seconds, "candidate_outcomes": outcomes}
-            print(f"oracle origin={index} action={self.catalog.ids[chosen]} H={action.duration} "
-                  f"steps={outcomes[chosen]['scored_steps']} future_mae={outcomes[chosen]['mae']:.6f}", flush=True)
+        began = perf_counter()
+        outcomes = []
+        for name, action in zip(self.catalog.ids, self.catalog.actions):
+            features, score = score_action(self.executor, self.dataset, index, action, steps=1, stop=self.stop)
+            outcomes.append({"action_id": name, "scored_steps": 1, **score})
+        losses = np.asarray([row["mae"] for row in outcomes])
+        if self.rho is not None:
+            self.smoothed_maes = (losses.copy() if self.smoothed_maes is None else
+                                  self.rho * self.smoothed_maes + (1 - self.rho) * losses)
+        ranked = losses if self.smoothed_maes is None else self.smoothed_maes
+        for row, value in zip(outcomes, ranked):
+            row["ema_mae"] = float(value)
+        chosen = int(self.catalog.best(-ranked[None, :])[0])
+        seconds = perf_counter() - began
+        self.candidate_search_seconds += seconds
+        self.candidate_evaluations += len(outcomes)
+        action = self.catalog.actions[chosen]
+        self.method.policy = action
+        selection = {"action_id": self.catalog.ids[chosen],
+                     "score_kind": "current_mae" if self.rho is None else "ema_current_mae",
+                     "features": features, "ema_rho": self.rho,
+                     "selected_current_mae": outcomes[chosen]["mae"],
+                     "selected_ema_mae": outcomes[chosen]["ema_mae"],
+                     "selected_current_mse": outcomes[chosen]["mse"],
+                     "executed_steps": outcomes[chosen]["scored_steps"],
+                     "candidate_search_seconds": seconds, "candidate_outcomes": outcomes}
         result = self.executor.step(index, context, target, decision_context=decision_context, final=final)
-        if selection is not None:
-            self.method.last_decision.update(selection)
+        self.method.last_decision.update(selection)
         return result
 
     def flush(self):
@@ -75,8 +82,8 @@ def evaluate_oracle(data_directory: Path, output: Path, *, actions: Path | None 
         raise ValueError("collection must complete before Oracle evaluation")
     torch.set_num_threads(collection["config"].get("threads", 1))
     saved = torch.load(data_directory / "evaluation_start.pt", weights_only=False)
-    executor, dataset = saved["executor"], saved["dataset"]
-    capabilities = executor.method.capabilities
+    dataset = saved["dataset"]
+    capabilities = saved["executor"].method.capabilities
     method = collection["catalog"]["method"]
     catalog = (ActionCatalog.from_dict(collection["catalog"], capabilities) if actions is None
                else ActionCatalog.load(actions, method, capabilities))
@@ -84,53 +91,55 @@ def evaluate_oracle(data_directory: Path, output: Path, *, actions: Path | None 
     if steps is not None:
         positive_integer(steps, "steps")
         stop = min(stop, start + steps)
-    oracle = OracleExecutor(executor, dataset, catalog, stop)
     output.mkdir(parents=True, exist_ok=False)
     (output / "actions.yaml").write_text(yaml.safe_dump(catalog.to_dict(), sort_keys=False), encoding="utf-8")
     plan = {"status": "evaluating", "data": str(data_directory.resolve()),
             "collection_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-            "controller": "oracle_greedy", "uses_future_labels_for_selection": True,
-            "objective": "minimum standardized MAE over each candidate's next min(H, remaining) origins",
+            "controllers": ["oracle_greedy", "oracle_ema"], "uses_future_labels_for_selection": True,
+            "objective": "minimum current standardized MAE, with or without per-action EMA",
+            "ema_tau": collection["tau"], "ema_rho": math.exp(-1 / collection["tau"]),
             "test_start": start, "test_stop": stop, "candidate_count": len(catalog.actions)}
     save_json(output / "manifest.json", plan)
+    summaries = []
     try:
-        restore_rng(saved["rng"])
-        directory = output / "oracle_greedy"
-        summary = evaluate_policy(oracle, dataset, start, stop, directory, name="oracle_greedy",
-                                  target_mean=np.asarray(collection["target_mean"]),
-                                  target_std=np.asarray(collection["target_std"]))
-        summary.update(candidate_search_seconds=oracle.candidate_search_seconds,
-                       candidate_evaluations=oracle.candidate_evaluations,
-                       candidate_search_role="decision", uses_future_labels_for_selection=True)
-        # Check that searched losses really describe the executed winning branches.
-        with (directory / "forecasts.csv").open(encoding="utf-8", newline="") as handle:
-            forecasts = list(csv.DictReader(handle))
-        with (directory / "decisions.jsonl").open(encoding="utf-8") as decision_file, \
-                (directory / "action_outcomes.csv").open("w", encoding="utf-8", newline="") as outcome_file:
-            writer = csv.DictWriter(outcome_file, fieldnames=["decision_index", "origin", "action_id", "duration",
-                                                             "scored_steps", "mae", "mse", "selected"])
-            writer.writeheader()
-            for line in decision_file:
-                decision = json.loads(line)
-                offset, count = decision["index"] - start, decision["executed_steps"]
-                selected_forecasts = forecasts[offset:offset + count]
-                for metric in ("mae", "mse"):
-                    actual = np.mean([float(row[metric]) for row in selected_forecasts])
-                    if not np.isclose(actual, decision[f"selected_future_{metric}"], rtol=1e-7, atol=1e-10):
-                        raise RuntimeError(f"Oracle selected branch differs from executed {metric} at {decision['index']}")
-                for candidate in decision["candidate_outcomes"]:
-                    writer.writerow({"decision_index": decision["decision_index"], "origin": decision["index"],
-                                     **candidate, "selected": candidate["action_id"] == decision["action_id"]})
-        save_json(directory / "summary.json", summary)
+        for name, ema_tau in (("oracle_greedy", None), ("oracle_ema", collection["tau"])):
+            restore_rng(saved["rng"])
+            oracle = OracleExecutor(copy.deepcopy(saved["executor"]), dataset, catalog, stop, ema_tau=ema_tau)
+            directory = output / name
+            summary = evaluate_policy(oracle, dataset, start, stop, directory, name=name,
+                                      target_mean=np.asarray(collection["target_mean"]),
+                                      target_std=np.asarray(collection["target_std"]))
+            summary.update(candidate_search_seconds=oracle.candidate_search_seconds,
+                           candidate_evaluations=oracle.candidate_evaluations,
+                           candidate_search_role="decision", uses_future_labels_for_selection=True)
+            with (directory / "forecasts.csv").open(encoding="utf-8", newline="") as handle:
+                forecasts = list(csv.DictReader(handle))
+            with (directory / "decisions.jsonl").open(encoding="utf-8") as decision_file, \
+                    (directory / "action_outcomes.csv").open("w", encoding="utf-8", newline="") as outcome_file:
+                writer = csv.DictWriter(outcome_file, fieldnames=["decision_index", "origin", "action_id",
+                                                                 "scored_steps", "mae", "mse", "ema_mae", "selected"])
+                writer.writeheader()
+                for line in decision_file:
+                    decision = json.loads(line)
+                    offset = decision["index"] - start
+                    for metric in ("mae", "mse"):
+                        actual = float(forecasts[offset][metric])
+                        if not np.isclose(actual, decision[f"selected_current_{metric}"], rtol=1e-7, atol=1e-10):
+                            raise RuntimeError(f"Oracle selected branch differs from executed {metric} at {decision['index']}")
+                    for candidate in decision["candidate_outcomes"]:
+                        writer.writerow({"decision_index": decision["decision_index"], "origin": decision["index"],
+                                         **candidate, "selected": candidate["action_id"] == decision["action_id"]})
+            save_json(directory / "summary.json", summary)
+            summaries.append(summary)
         with (output / "comparison.csv").open("w", encoding="utf-8", newline="") as handle:
-            fields = [key for key, value in summary.items() if not isinstance(value, list)]
+            fields = [key for key, value in summaries[0].items() if not isinstance(value, list)]
             writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
-            writer.writerow(summary)
-        plan.update(status="complete", results=[summary], selected_branches_match_trajectory=True)
+            writer.writerows(summaries)
+        plan.update(status="complete", results=summaries, selected_branches_match_trajectory=True)
     except BaseException as error:
         plan.update(status="failed", error=f"{type(error).__name__}: {error}")
         raise
     finally:
         save_json(output / "manifest.json", plan)
-    return summary
+    return summaries

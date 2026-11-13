@@ -22,14 +22,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Run every requested strategy, seed, and detector combination."""
 
     parser = argparse.ArgumentParser(description="Run a batch of online forecasting experiments")
-    parser.add_argument("--config", default="config.yaml", help="base YAML configuration path")
+    parser.add_argument("--config", default="configs/config.yaml", help="base YAML configuration path")
+    parser.add_argument("--dataset", help="dataset name from config.datasets")
     parser.add_argument("--strategies", nargs="+", required=True, help="strategy profile names")
     parser.add_argument("--detectors", nargs="+", required=True, help="detector profile names")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0], help="random seeds")
     parser.add_argument("--output", help="directory for the batch; defaults to output.directory")
     args = parser.parse_args(argv)
 
-    base_config = load_config(args.config)
+    base_config = load_config(args.config, dataset_name=args.dataset)
     output_directory = Path(args.output) if args.output else Path(base_config["output"]["directory"])
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     batch_directory = output_directory / f"batch-{timestamp}"
@@ -149,6 +150,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.config,
                     strategy_name=strategy,
                     detector_name=args.detectors[0],
+                    dataset_name=args.dataset,
                 )
                 config["seed"] = seed
                 config["batch_detectors"] = args.detectors
@@ -163,6 +165,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         args.config,
                         strategy_name=strategy,
                         detector_name=detector_name,
+                        dataset_name=args.dataset,
                     )
                     detector_config["data"]["feature_names"] = config["data"]["feature_names"]
                     detector_config["data"]["target_names"] = config["data"]["target_names"]

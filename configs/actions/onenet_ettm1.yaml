@@ -8,8 +8,6 @@ actions:
   - time
   - variable
   learning_rate_scales: {}
-  periods: {}
-  duration: 128
 - id: a019
   units:
   - decision
@@ -22,13 +20,6 @@ actions:
     variable: 0.01018510222800627
     decision: 0.9028014301007524
     long: 9.968873020050866
-  periods:
-    time: 8
-    variable: 2
-    decision: 2
-    long: 32
-    short: 32
-  duration: 64
 - id: a002
   units:
   - long
@@ -36,10 +27,6 @@ actions:
   learning_rate_scales:
     time: 0.1933330502050172
     long: 2.6216938007596378
-  periods:
-    time: 32
-    long: 16
-  duration: 128
 - id: a005
   units:
   - decision
@@ -49,11 +36,6 @@ actions:
     time: 2.3526984284200236
     decision: 0.09539463920415629
     long: 6.961538071902884
-  periods:
-    time: 2
-    decision: 32
-    long: 4
-  duration: 64
 - id: a007
   units:
   - decision
@@ -66,12 +48,6 @@ actions:
     variable: 0.016513059814654164
     decision: 6.626447866152477
     long: 3.443487696934195
-  periods:
-    variable: 2
-    decision: 2
-    long: 16
-    short: 32
-  duration: 256
 - id: a011
   units:
   - time
@@ -79,10 +55,6 @@ actions:
   learning_rate_scales:
     time: 9.35441950421687
     variable: 3.1127580555249983
-  periods:
-    time: 16
-    variable: 32
-  duration: 32
 - id: a012
   units:
   - decision
@@ -91,10 +63,6 @@ actions:
   learning_rate_scales:
     decision: 8.444316740128098
     long: 0.01136489384174769
-  periods:
-    long: 8
-    short: 4
-  duration: 32
 - id: a008
   units:
   - decision
@@ -102,10 +70,6 @@ actions:
   learning_rate_scales:
     time: 6.780227021579833
     decision: 0.1233480570086002
-  periods:
-    time: 8
-    decision: 4
-  duration: 128
 - id: a056
   units:
   - decision
@@ -116,11 +80,6 @@ actions:
     variable: 0.022521409530212696
     decision: 0.1166375029847802
     long: 0.07523892475314574
-  periods:
-    variable: 4
-    long: 8
-    short: 4
-  duration: 64
 - id: a016
   units:
   - decision
@@ -130,10 +89,6 @@ actions:
     variable: 0.05660029643998959
     decision: 1.348918924022193
     long: 9.293867488129036
-  periods:
-    decision: 32
-    long: 8
-  duration: 32
 - id: a004
   units:
   - decision
@@ -142,15 +97,9 @@ actions:
   learning_rate_scales:
     variable: 0.015264395128979655
     decision: 3.917637125340442
-  periods:
-    variable: 2
-    short: 16
-  duration: 64
 - id: a064
   units: []
   learning_rate_scales: {}
-  periods: {}
-  duration: 128
 - id: a055
   units:
   - long
@@ -160,11 +109,6 @@ actions:
     time: 0.0676936028259382
     variable: 4.193273839080292
     long: 5.612331928831841
-  periods:
-    time: 4
-    variable: 8
-    long: 32
-  duration: 64
 - id: a017
   units:
   - decision
@@ -177,12 +121,6 @@ actions:
     variable: 0.02674056120864298
     decision: 1.8016817682581048
     long: 3.033189776828274
-  periods:
-    time: 2
-    decision: 2
-    long: 4
-    short: 32
-  duration: 64
 - id: a018
   units:
   - decision
@@ -195,13 +133,6 @@ actions:
     variable: 0.01107201256428491
     decision: 1.6310129212251163
     long: 8.262896978565296
-  periods:
-    time: 16
-    variable: 4
-    decision: 2
-    long: 16
-    short: 32
-  duration: 64
 - id: a030
   units:
   - decision
@@ -212,12 +143,6 @@ actions:
     time: 0.04689284525850035
     variable: 0.020122041452737237
     decision: 3.306862896055749
-  periods:
-    time: 32
-    variable: 2
-    decision: 4
-    short: 32
-  duration: 64
 - id: a020
   units:
   - decision
@@ -230,13 +155,6 @@ actions:
     variable: 0.01002364973866462
     decision: 1.5596841542086384
     long: 8.903489663727983
-  periods:
-    time: 32
-    variable: 2
-    decision: 2
-    long: 16
-    short: 32
-  duration: 64
 - id: a022
   units:
   - decision
@@ -249,13 +167,6 @@ actions:
     variable: 0.019163957640027644
     decision: 2.0306627863018862
     long: 0.3560638940304834
-  periods:
-    time: 32
-    variable: 2
-    decision: 2
-    long: 4
-    short: 32
-  duration: 64
 - id: a023
   units:
   - decision
@@ -268,13 +179,6 @@ actions:
     variable: 0.012171914162730073
     decision: 1.8353770332254953
     long: 0.9201622880143597
-  periods:
-    time: 32
-    variable: 2
-    decision: 2
-    long: 4
-    short: 32
-  duration: 64
 - id: a025
   units:
   - decision
@@ -287,13 +191,6 @@ actions:
     variable: 0.010351154014451632
     decision: 1.659621736825645
     long: 0.9953150240495781
-  periods:
-    time: 32
-    variable: 2
-    decision: 2
-    long: 4
-    short: 32
-  duration: 64
 - id: a021
   units:
   - decision
@@ -306,13 +203,6 @@ actions:
     variable: 0.01270867681697406
     decision: 1.4321358976688205
     long: 3.5617282163853727
-  periods:
-    time: 32
-    variable: 2
-    decision: 2
-    long: 4
-    short: 32
-  duration: 64
 - id: a024
   units:
   - decision
@@ -325,13 +215,6 @@ actions:
     variable: 0.010124358806074929
     decision: 1.42506097259251
     long: 2.336295849058507
-  periods:
-    time: 32
-    variable: 2
-    decision: 2
-    long: 4
-    short: 32
-  duration: 64
 - id: a027
   units:
   - decision
@@ -344,13 +227,6 @@ actions:
     variable: 0.011319985079958385
     decision: 1.3137528786149175
     long: 2.0125530810000902
-  periods:
-    time: 32
-    variable: 2
-    decision: 2
-    long: 4
-    short: 32
-  duration: 64
 - id: a026
   units:
   - decision
@@ -363,13 +239,6 @@ actions:
     variable: 0.011815650599678486
     decision: 0.9884821542620562
     long: 3.329605316416121
-  periods:
-    time: 32
-    variable: 2
-    decision: 2
-    long: 4
-    short: 32
-  duration: 64
 - id: a001
   units:
   - decision
@@ -382,12 +251,6 @@ actions:
     variable: 0.01461190704257195
     decision: 1.3128995712919398
     long: 9.35468940877617
-  periods:
-    time: 8
-    variable: 2
-    decision: 4
-    short: 32
-  duration: 64
 - id: a040
   units:
   - decision
@@ -399,10 +262,6 @@ actions:
     variable: 0.02726120326158203
     decision: 0.22633724420196275
     long: 1.7274446073602194
-  periods:
-    variable: 8
-    decision: 32
-  duration: 64
 - id: a041
   units:
   - long
@@ -412,11 +271,6 @@ actions:
     time: 0.07129703383686636
     variable: 0.10216781798717943
     long: 3.3079735337140046
-  periods:
-    time: 2
-    variable: 8
-    long: 8
-  duration: 64
 - id: a032
   units:
   - decision
@@ -428,11 +282,6 @@ actions:
     variable: 0.046601439126551604
     decision: 0.798640610539928
     long: 8.977679695041818
-  periods:
-    time: 8
-    variable: 32
-    decision: 16
-  duration: 64
 - id: a029
   units:
   - decision
@@ -444,11 +293,6 @@ actions:
     variable: 0.05450142185526654
     decision: 0.5691496072821081
     long: 9.402254470494158
-  periods:
-    time: 8
-    variable: 32
-    decision: 16
-  duration: 64
 - id: a034
   units:
   - decision
@@ -460,11 +304,6 @@ actions:
     variable: 0.04863363065846128
     decision: 0.19804676333379947
     long: 8.40830398247105
-  periods:
-    time: 8
-    variable: 32
-    decision: 32
-  duration: 64
 - id: a035
   units:
   - decision
@@ -476,11 +315,6 @@ actions:
     variable: 0.06348803480304455
     decision: 0.6800269890474397
     long: 8.429300904591761
-  periods:
-    time: 8
-    variable: 32
-    decision: 16
-  duration: 64
 - id: a028
   units:
   - decision
@@ -492,8 +326,3 @@ actions:
     variable: 0.2029130544236799
     decision: 0.19343917925073884
     long: 9.758906003784846
-  periods:
-    time: 8
-    variable: 32
-    decision: 16
-  duration: 64

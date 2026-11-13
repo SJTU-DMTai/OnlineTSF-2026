@@ -18,7 +18,7 @@ from time import perf_counter
 import numpy as np
 import pandas as pd
 
-from ..decision_previous.config import DecisionConfig, FEATURE_SCHEMA_VERSION
+from ..decision_previous.decision_version1.config import DecisionConfig, FEATURE_SCHEMA_VERSION
 from .policy_support import (
     DEFAULT_ANNOTATIONS, DEFAULT_RUNS, file_sha256, find_job,
     load_existing_results, plot_forecasts, save_json, score_action, oracle_decision, summarize_decisions,

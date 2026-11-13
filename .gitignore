@@ -1,5 +1,6 @@
 
 .agents/
+src/onlinetsf/decision_previous/
 .pytest_cache/
 tests/*
 

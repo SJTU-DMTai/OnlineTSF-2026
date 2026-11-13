@@ -107,7 +107,7 @@ def run_forecast(config: dict[str, Any]) -> OnlineRun:
     offline_training_seconds = perf_counter() - offline_started
     online = config["online"]
     if previous is not None:
-        from .decision_previous.runtime import AdaptiveMethod
+        from .decision_previous.decision_version1.runtime import AdaptiveMethod
 
         method = AdaptiveMethod.from_file(method, previous["selector"], previous.get("controller", "policy_full"))
     online_started = perf_counter()
@@ -322,10 +322,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Load a YAML configuration, execute it, and print concise metrics."""
 
     parser = argparse.ArgumentParser(description="Run an online time-series forecasting experiment")
-    parser.add_argument("--config", default="config.yaml", help="path to the YAML configuration")
+    parser.add_argument("--config", default="configs/config.yaml", help="path to the YAML configuration")
+    parser.add_argument("--dataset", help="dataset name from config.datasets")
     args = parser.parse_args(argv)
 
-    config = load_config(args.config)
+    config = load_config(args.config, dataset_name=args.dataset)
     run, drift_indices, drift_records = run_experiment_with_drift(config)
     document_directory = write_experiment_documents(
         config["output"]["directory"],

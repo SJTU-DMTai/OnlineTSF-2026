@@ -1,0 +1,75 @@
+
+# 依据 OneNet 第 3.2 节：两个专家独立训练，长期权重和短期修正负责组合。
+# only_* 沿用已有命名：限制网络训练范围，仍更新 long、short；only_long/short 除外。
+# lr* 只缩放三个网络的学习率，long 步长保持默认值。
+# slow/fast 表示倍率较小/较大，不改变更新频率。
+
+method: onenet
+actions:
+  - id: native
+    units: [time, variable, decision, long, short]
+  - id: frozen
+    units: []
+  - id: no_grad
+    units: [long, short]
+  - id: lr0.3
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 0.3, variable: 0.3, decision: 0.3}
+  - id: lr0.5
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 0.5, variable: 0.5, decision: 0.5}
+  - id: lr3
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 3, variable: 3, decision: 3}
+  - id: only_time
+    units: [time, long, short]
+  - id: only_variable
+    units: [variable, long, short]
+  - id: only_decision
+    units: [decision, long, short]
+  - id: only_time+variable
+    units: [time, variable, long, short]
+  - id: only_time+decision
+    units: [time, decision, long, short]
+  - id: only_variable+decision
+    units: [variable, decision, long, short]
+  - id: lr0.1
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 0.1, variable: 0.1, decision: 0.1}
+  - id: only_time_lr0.1
+    units: [time, long, short]
+    learning_rate_scales: {time: 0.1}
+  - id: only_time_lr0.3
+    units: [time, long, short]
+    learning_rate_scales: {time: 0.3}
+  - id: only_time_lr3
+    units: [time, long, short]
+    learning_rate_scales: {time: 3}
+  - id: only_variable_lr0.1
+    units: [variable, long, short]
+    learning_rate_scales: {variable: 0.1}
+  - id: only_variable_lr0.3
+    units: [variable, long, short]
+    learning_rate_scales: {variable: 0.3}
+  - id: only_variable_lr3
+    units: [variable, long, short]
+    learning_rate_scales: {variable: 3}
+  - id: only_decision_lr0.3
+    units: [decision, long, short]
+    learning_rate_scales: {decision: 0.3}
+  - id: only_decision_lr3
+    units: [decision, long, short]
+    learning_rate_scales: {decision: 3}
+  - id: time_slow_decision_fast
+    units: [time, decision, long, short]
+    learning_rate_scales: {time: 0.3, decision: 3}
+  - id: variable_slow_decision_fast
+    units: [variable, decision, long, short]
+    learning_rate_scales: {variable: 0.3, decision: 3}
+  - id: experts_slow_combination_fast
+    units: [time, variable, decision, long, short]
+    learning_rate_scales: {time: 0.3, variable: 0.3, decision: 3, long: 3}
+  - id: only_long
+    units: [long]
+  - id: only_short
+    units: [short]

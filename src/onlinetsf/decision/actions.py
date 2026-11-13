@@ -1,4 +1,4 @@
-"""Online update actions: selected units, learning rates, periods and duration."""
+"""Online update actions: selected units and learning-rate multipliers."""
 
 from __future__ import annotations
 
@@ -15,10 +15,7 @@ def positive_integer(value: int, name: str) -> None:
 
 @dataclass(frozen=True)
 class UpdateAction:
-    """Learning rate multipliers; omitted scales and periods default to 1.
-
-    A period collects that many arrived samples for one batch update.
-    Units with native scheduling do not accept a configurable batch period.
+    """Learning rate multipliers; omitted scales default to 1.
 
     An empty set of units freezes parameters and adaptation state while
     preserving the method's necessary prediction and feedback records.
@@ -26,8 +23,6 @@ class UpdateAction:
 
     units: frozenset[str] = frozenset()
     learning_rate_scales: Mapping[str, float] = field(default_factory=dict)
-    periods: Mapping[str, int] = field(default_factory=dict)
-    duration: int = 1
 
     def __post_init__(self) -> None:
         if isinstance(self.units, str):
@@ -35,24 +30,17 @@ class UpdateAction:
         units = frozenset(self.units)
         if any(not isinstance(name, str) or not name for name in units):
             raise ValueError("unit names must be nonempty strings")
-        scales, periods = dict(self.learning_rate_scales), dict(self.periods)
-        positive_integer(self.duration, "duration")
+        scales = dict(self.learning_rate_scales)
         for name, scale in scales.items():
             if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
                 raise ValueError(f"learning rate scale for {name} must be finite and positive")
-        for name, period in periods.items():
-            positive_integer(period, f"period for {name}")
-        if scales.keys() - units or periods.keys() - units:
-            raise ValueError("learning rate scales and periods must refer to selected units")
-        periods = {name: period for name, period in periods.items() if period != 1}
+        if scales.keys() - units:
+            raise ValueError("learning rate scales must refer to selected units")
         object.__setattr__(self, "units", units)
         object.__setattr__(self, "learning_rate_scales", MappingProxyType(scales))
-        object.__setattr__(self, "periods", MappingProxyType(periods))
 
     def to_dict(self) -> dict:
-        return {"units": sorted(self.units),
-                "learning_rate_scales": dict(self.learning_rate_scales), "periods": dict(self.periods),
-                "duration": self.duration}
+        return {"units": sorted(self.units), "learning_rate_scales": dict(self.learning_rate_scales)}
 
     @classmethod
     def from_dict(cls, record: dict) -> UpdateAction:

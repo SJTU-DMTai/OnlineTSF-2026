@@ -218,7 +218,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("full", "branches"), help="continuous trajectories or native-state branches")
     parser.add_argument("--data", type=Path, default=root / "data/ETTm1.csv")
-    parser.add_argument("--profiles", type=Path, default=root / "profiles.yaml")
+    parser.add_argument("--profiles", type=Path, default=root / "configs/profiles.yaml")
     parser.add_argument("--output", type=Path, required=True, help="new output directory")
     parser.add_argument("--context-length", type=int, default=96)
     parser.add_argument("--horizon", type=int, default=24)

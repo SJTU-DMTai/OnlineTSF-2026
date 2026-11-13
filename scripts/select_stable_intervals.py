@@ -49,7 +49,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Select stable source intervals using detector, distribution, and loss criteria"
     )
-    parser.add_argument("--config", default="config.yaml", help="base experiment configuration")
+    parser.add_argument("--config", default="configs/config.yaml", help="base experiment configuration")
     parser.add_argument(
         "--strategies",
         nargs="+",

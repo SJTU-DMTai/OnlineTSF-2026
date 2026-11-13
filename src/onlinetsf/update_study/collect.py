@@ -20,8 +20,8 @@ from time import perf_counter
 import numpy as np
 import pandas as pd
 
-from ..decision_previous.actions import policies
-from ..decision_previous.config import DecisionConfig, FEATURE_SCHEMA_VERSION
+from ..decision_previous.decision_version1.actions import policies
+from ..decision_previous.decision_version1.config import DecisionConfig, FEATURE_SCHEMA_VERSION
 from .policy_support import DEFAULT_ANNOTATIONS, DEFAULT_RUNS, file_sha256, find_job, save_json, save_timings
 from .sampling import sample_positions
 

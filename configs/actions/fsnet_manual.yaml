@@ -1,0 +1,70 @@
+
+# 依据 FSNet 第 3.2 节：梯度驱动适配器处理快速变化，关联记忆处理复现模式。
+# only_base/adapter/head 及其组合仍刷新两类记忆；不是只更新所列网络而冻结记忆。
+# gradient_memory 需要反向传播，没有优化器步进也有梯度计算成本。
+# no_grad 只推进 adaptation_memory，检索和写回仍受原生触发条件约束。
+# parameters_only 固定记忆状态，仍使用已有梯度记忆生成适配系数。
+# 两类记忆没有学习率倍率；base_slow_adapter_fast 保持 head 默认学习率。
+
+method: fsnet
+actions:
+  - id: native
+    units: [base, adapter, head, gradient_memory, adaptation_memory]
+  - id: frozen
+    units: []
+  - id: no_grad
+    units: [adaptation_memory]
+  - id: lr0.1
+    units: [base, adapter, head, gradient_memory, adaptation_memory]
+    learning_rate_scales: {base: 0.1, adapter: 0.1, head: 0.1}
+  - id: lr0.3
+    units: [base, adapter, head, gradient_memory, adaptation_memory]
+    learning_rate_scales: {base: 0.3, adapter: 0.3, head: 0.3}
+  - id: lr0.5
+    units: [base, adapter, head, gradient_memory, adaptation_memory]
+    learning_rate_scales: {base: 0.5, adapter: 0.5, head: 0.5}
+  - id: lr3
+    units: [base, adapter, head, gradient_memory, adaptation_memory]
+    learning_rate_scales: {base: 3, adapter: 3, head: 3}
+  - id: only_base
+    units: [base, gradient_memory, adaptation_memory]
+  - id: only_adapter
+    units: [adapter, gradient_memory, adaptation_memory]
+  - id: only_head
+    units: [head, gradient_memory, adaptation_memory]
+  - id: only_base+adapter
+    units: [base, adapter, gradient_memory, adaptation_memory]
+  - id: only_base+head
+    units: [base, head, gradient_memory, adaptation_memory]
+  - id: only_adapter+head
+    units: [adapter, head, gradient_memory, adaptation_memory]
+  - id: only_gradient_memory
+    units: [gradient_memory]
+  - id: memories_only
+    units: [gradient_memory, adaptation_memory]
+  - id: parameters_only
+    units: [base, adapter, head]
+  - id: only_adapter_lr0.1
+    units: [adapter, gradient_memory, adaptation_memory]
+    learning_rate_scales: {adapter: 0.1}
+  - id: only_adapter_lr0.3
+    units: [adapter, gradient_memory, adaptation_memory]
+    learning_rate_scales: {adapter: 0.3}
+  - id: only_adapter_lr3
+    units: [adapter, gradient_memory, adaptation_memory]
+    learning_rate_scales: {adapter: 3}
+  - id: only_head_lr0.3
+    units: [head, gradient_memory, adaptation_memory]
+    learning_rate_scales: {head: 0.3}
+  - id: only_head_lr3
+    units: [head, gradient_memory, adaptation_memory]
+    learning_rate_scales: {head: 3}
+  - id: only_adapter+head_lr0.3
+    units: [adapter, head, gradient_memory, adaptation_memory]
+    learning_rate_scales: {adapter: 0.3, head: 0.3}
+  - id: only_adapter+head_lr3
+    units: [adapter, head, gradient_memory, adaptation_memory]
+    learning_rate_scales: {adapter: 3, head: 3}
+  - id: base_slow_adapter_fast
+    units: [base, adapter, head, gradient_memory, adaptation_memory]
+    learning_rate_scales: {base: 0.3, adapter: 3}

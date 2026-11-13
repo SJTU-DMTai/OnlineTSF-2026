@@ -1,4 +1,4 @@
-"""Causal action execution with an injectable policy and per-action duration."""
+"""Causal action execution with a decision at every forecast origin."""
 
 from __future__ import annotations
 
@@ -31,8 +31,7 @@ class DecisionState:
 class UpdateController:
     """Wrap a native method for OnlineExecutor, without owning its scheduler.
 
-    ``policy(state)`` is called on the first data clock and on action expiry.
-    A fixed UpdateAction is also accepted and is selected again at every expiry.
+    ``policy(state)`` is called once on every data clock.
     """
 
     def __init__(self, method, policy: UpdateAction | Callable[[DecisionState], UpdateAction], *, features=None) -> None:
@@ -43,7 +42,7 @@ class UpdateController:
         self.features = features
         self.schedule = UnitSchedule()
         self.action: UpdateAction | None = None
-        self.expires_at: int | None = None
+        self.last_decided_index: int | None = None
         self.index: int | None = None
         self.context: Tensor | None = None
         self.last_decision: dict | None = None
@@ -85,7 +84,7 @@ class UpdateController:
     def _decide(self, feedback: tuple[MethodFeedback, ...] = ()) -> None:
         if self.index is None:
             raise RuntimeError("call on_observation before executing an action")
-        if self.expires_at is not None and self.index < self.expires_at:
+        if self.last_decided_index == self.index:
             return
         began = perf_counter()
         state = DecisionState(self.index, self.context.clone(), feedback,
@@ -99,16 +98,15 @@ class UpdateController:
         if self.action is not None:
             changed = frozenset(name for name in self.action.units
                                 if name not in action.units
-                                or self.action.periods.get(name, 1) != action.periods.get(name, 1)
                                 or self.action.learning_rate_scales.get(name, 1.0) != action.learning_rate_scales.get(name, 1.0))
             self._finish_batches(changed)
         began = perf_counter()
         self.adapter.configure(action.learning_rate_scales)
         self.schedule.activate(action)
         self.action = action
-        self.expires_at = self.index + action.duration
+        self.last_decided_index = self.index
         self.decision_count += 1
-        self.last_decision = {"index": self.index, "expires_at": self.expires_at, "action": action.to_dict()}
+        self.last_decision = {"index": self.index, "action": action.to_dict()}
         selection = getattr(self.policy, "last_selection", None)
         if isinstance(selection, dict):
             self.last_decision.update(selection)

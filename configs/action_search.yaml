@@ -5,10 +5,6 @@ search:
   units: null
   # null: native scale 1; list: categorical; low/high: continuous range.
   learning_rate_scales: {low: 0.01, high: 10.0, log: true}
-  # null: native period 1; list: categorical; low/high/step: integer range.
-  # Period p collects p arrived samples for one batch update.
-  periods: [1,2,4,8,16,32]
-  durations: [32, 64, 128, 256, 512]
 
 # strategy selects an existing profiles.yaml entry. Optional search entries
 # replace individual dimensions above, e.g. search: {learning_rate_scales: null}.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+import math
 from pathlib import Path
 
 import numpy as np
@@ -25,12 +26,12 @@ FORMULATION_PARAMETERS = {
 }
 
 
-def soft_targets(gains: np.ndarray, temperature: float) -> np.ndarray:
-    """Temperature is measured in relative-gain units: .01 is one percentage point."""
+def soft_targets(maes: np.ndarray, temperature: float) -> np.ndarray:
+    """Lower action MAE receives a higher soft classification target."""
     if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
             or not np.isfinite(temperature) or temperature <= 0):
         raise ValueError("classification temperature must be finite and positive")
-    logits = (gains - gains.max(axis=1, keepdims=True)) / temperature
+    logits = (maes.min(axis=1, keepdims=True) - maes) / temperature
     probabilities = np.exp(logits)
     return probabilities / probabilities.sum(axis=1, keepdims=True)
 
@@ -161,6 +162,7 @@ class ActionSelector:
         soft_targets(np.zeros((1, 1)), temperature)
         self.temperature = temperature
         self.feature_window, self.error_window = feature_window, error_window
+        self.tau = 64
         self.models = []
 
     def transform(self, states: np.ndarray) -> np.ndarray:
@@ -186,14 +188,14 @@ class ActionSelector:
             actions = (actions - self.action_mean) / self.action_scale
         return np.column_stack((np.repeat(states, len(actions), axis=0), np.tile(actions, (len(states), 1))))
 
-    def fit(self, states: np.ndarray, gains: np.ndarray) -> ActionSelector:
-        states, gains = np.asarray(states, dtype=float), np.asarray(gains, dtype=float)
+    def fit(self, states: np.ndarray, targets: np.ndarray) -> ActionSelector:
+        states, targets = np.asarray(states, dtype=float), np.asarray(targets, dtype=float)
         if states.ndim != 2 or states.shape[1] != len(self.features) or not len(states):
             raise ValueError("training requires a nonempty state matrix matching the feature schema")
-        if gains.shape != (len(states), len(self.catalog.ids)) or not np.isfinite(gains).all():
-            raise ValueError("training requires a finite gain for every state and action")
-        if not np.all(gains[:, self.catalog.native_indices] == 0):
-            raise ValueError("Native training gains must be zero")
+        if targets.shape != (len(states), len(self.catalog.ids)) or not np.isfinite(targets).all():
+            raise ValueError("training requires a finite target for every state and action")
+        if np.any(targets < 0):
+            raise ValueError("action MAE targets must be nonnegative")
         self.medians = np.asarray([float(np.median(column[np.isfinite(column)])) if np.isfinite(column).any() else 0.
                                    for column in states.T])
         self.mean, self.scale = np.zeros(states.shape[1]), np.ones(states.shape[1])
@@ -207,12 +209,9 @@ class ActionSelector:
         x = self.design(states)
         classification = self.formulation == "classification"
         self.models = []
-        targets = ([gains[:, i] for i in range(len(self.catalog.ids))] if self.formulation == "independent_regression"
-                   else [soft_targets(gains, self.temperature) if classification else gains.reshape(-1)])
-        for index, target in enumerate(targets):
-            if self.formulation == "independent_regression" and index in self.catalog.native_indices:
-                self.models.append(None)
-                continue
+        fit_targets = ([targets[:, i] for i in range(len(self.catalog.ids))] if self.formulation == "independent_regression"
+                       else [soft_targets(targets, self.temperature) if classification else targets.reshape(-1)])
+        for index, target in enumerate(fit_targets):
             self.models.append(fit_estimator(self.estimator, x, target, classification=classification,
                                             class_count=len(self.catalog.ids), parameters=self.parameters,
                                             seed=self.seed + index))
@@ -221,19 +220,18 @@ class ActionSelector:
     def scores(self, states: np.ndarray) -> np.ndarray:
         x = self.design(states)
         if self.formulation == "independent_regression":
-            scores = np.column_stack([np.zeros(len(x)) if model is None else model.predict(x) for model in self.models])
+            scores = np.column_stack([model.predict(x) for model in self.models])
         elif self.formulation == "shared_regression":
             scores = self.models[0].predict(x).reshape(-1, len(self.catalog.ids))
         else:
             scores = np.zeros((len(x), len(self.catalog.ids)))
             scores[:, np.asarray(self.models[0].classes_, dtype=int)] = self.models[0].predict_proba(x)
-        if self.formulation != "classification":
-            scores[:, self.catalog.native_indices] = 0.
         return scores
 
     def select(self, states: np.ndarray, legal: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         scores = self.scores(states)
-        return self.catalog.best(scores, legal), scores
+        ranked = scores if self.formulation == "classification" else -scores
+        return self.catalog.best(ranked, legal), scores
 
     def save(self, path: str | Path) -> None:
         Path(path).write_bytes(pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL))
@@ -252,15 +250,23 @@ class SelectorPolicy:
     def __init__(self, selector: ActionSelector) -> None:
         self.selector = selector
         self.last_selection: dict | None = None
+        self.smoothed_scores: np.ndarray | None = None
+        self.rho = math.exp(-1 / selector.tau)
 
     def __call__(self, state):
         for action in self.selector.catalog.actions:
             state.capabilities.validate(action)
         values = np.asarray([[state.features[name] for name in self.selector.features]], dtype=float)
-        selected, scores = self.selector.select(values)
-        index = int(selected[0])
+        scores = self.selector.scores(values)[0]
+        self.smoothed_scores = (scores.copy() if self.smoothed_scores is None else
+                                self.rho * self.smoothed_scores + (1 - self.rho) * scores)
+        ranked = (self.smoothed_scores if self.selector.formulation == "classification" else
+                  -self.smoothed_scores)
+        index = int(self.selector.catalog.best(ranked[None, :])[0])
         self.last_selection = {"action_id": self.selector.catalog.ids[index],
-                               "scores": dict(zip(self.selector.catalog.ids, scores[0].tolist())),
-                               "score_kind": "probability" if self.selector.formulation == "classification" else "relative_mae_gain",
+                               "scores": dict(zip(self.selector.catalog.ids, self.smoothed_scores.tolist())),
+                               "raw_scores": dict(zip(self.selector.catalog.ids, scores.tolist())),
+                               "ema_rho": self.rho,
+                               "score_kind": "probability" if self.selector.formulation == "classification" else "action_mae",
                                "features": {name: state.features[name] for name in self.selector.features}}
         return self.selector.catalog.actions[index]

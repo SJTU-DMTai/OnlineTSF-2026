@@ -6,9 +6,18 @@ selection:
   strategy: tcn_ogd
   detector: page_hinkley
 
+# Select with --dataset, or change data.name below. Paths are relative to this file.
+# Results are written to output.directory/<dataset>.
+datasets:
+  etth1: ../data/ETTh1.csv
+  etth2: ../data/ETTh2.csv
+  ettm1: ../data/ETTm1.csv
+  ettm2: ../data/ETTm2.csv
+  weather: ../data/weather.csv
+  traffic: ../data/traffic.csv
+
 data:
   name: etth1
-  path: data/ETTh1.csv
   context_length: 60
   horizon: 1
   stride: 1
@@ -27,6 +36,6 @@ online:
   keep_predictions: false
 
 output:
-  directory: runs
+  directory: ../runs
   run_name: null
   write_per_value_errors: true

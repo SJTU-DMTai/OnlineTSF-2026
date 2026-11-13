@@ -13,7 +13,7 @@ def main(argv=None) -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("run", "collect"):
         command = commands.add_parser(name)
-        command.add_argument("--config", type=Path, default=Path("selector_experiment.yaml"))
+        command.add_argument("--config", type=Path, default=Path("configs/selector_experiment.yaml"))
         command.add_argument("--output", type=Path, required=True, help="new output directory")
         command.add_argument("--strategy", help="override the forecasting strategy in profiles.yaml")
         command.add_argument("--actions", type=Path, help="override the candidate action YAML")
@@ -27,7 +27,7 @@ def main(argv=None) -> None:
     evaluate.add_argument("--output", type=Path, required=True)
     evaluate.add_argument("--devices", nargs="+", help="parallel OneNet evaluation on physical GPUs, e.g. cuda:0 cuda:2")
     evaluate.add_argument("--workers-per-device", nargs="+", type=int, help="concurrent policies per device, e.g. 1 2")
-    oracle = commands.add_parser("oracle", help="evaluate only the greedy hindsight Oracle")
+    oracle = commands.add_parser("oracle", help="evaluate greedy and EMA hindsight Oracles")
     oracle.add_argument("--data", type=Path, required=True, help="completed collection directory")
     oracle.add_argument("--output", type=Path, required=True)
     oracle.add_argument("--actions", type=Path, help="candidate YAML; defaults to the collected action catalog")

@@ -64,12 +64,22 @@ def load_config(
     *,
     strategy_name: str | None = None,
     detector_name: str | None = None,
+    dataset_name: str | None = None,
 ) -> dict[str, Any]:
     """Read an experiment YAML file and validate its component selections."""
 
     source = Path(path)
     config = _load_mapping(source, "config")
     data = _section(config, "data")
+    datasets = config.pop("datasets", None)
+    if datasets is not None:
+        name = dataset_name if dataset_name is not None else data["name"]
+        if name not in datasets:
+            raise ValueError(f"unknown dataset {name!r}; choose one of: {', '.join(datasets)}")
+        data.update(name=name, path=datasets[name])
+        config["output"]["directory"] = str(Path(config["output"]["directory"]) / name)
+    elif dataset_name is not None:
+        raise ValueError("--dataset requires a datasets mapping in the configuration")
     online = _section(config, "online")
     offline_value = config.get("offline", {})
     if not isinstance(offline_value, dict):

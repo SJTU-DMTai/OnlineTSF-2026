@@ -1,0 +1,73 @@
+
+# 依据 DSOF 第 3.2-3.4 节：慢流用完整标签回放，快流用首步反馈及教师伪标签。
+# student、online 更新同一套残差学生参数，但使用不同监督目标和优化器。
+# 教师被冻结时仍参与预测及伪标签生成，回放保持原生触发、抽样和训练轮数。
+# no_grad 与 frozen 同义，只保留 frozen；覆盖三条路径全部八种开关组合。
+# slow/fast 表示倍率较小/较大，不改变更新频率；未指定倍率的选中单元使用 1。
+
+method: dsof
+actions:
+  - id: native
+    units: [teacher, student, online]
+  - id: frozen
+    units: []
+  - id: only_teacher
+    units: [teacher]
+  - id: only_student
+    units: [student]
+  - id: only_online
+    units: [online]
+  - id: replay_only
+    units: [teacher, student]
+  - id: teacher+online
+    units: [teacher, online]
+  - id: student+online
+    units: [student, online]
+  - id: lr0.1
+    units: [teacher, student, online]
+    learning_rate_scales: {teacher: 0.1, student: 0.1, online: 0.1}
+  - id: lr0.3
+    units: [teacher, student, online]
+    learning_rate_scales: {teacher: 0.3, student: 0.3, online: 0.3}
+  - id: lr0.5
+    units: [teacher, student, online]
+    learning_rate_scales: {teacher: 0.5, student: 0.5, online: 0.5}
+  - id: lr3
+    units: [teacher, student, online]
+    learning_rate_scales: {teacher: 3, student: 3, online: 3}
+  - id: only_online_lr0.1
+    units: [online]
+    learning_rate_scales: {online: 0.1}
+  - id: only_online_lr0.3
+    units: [online]
+    learning_rate_scales: {online: 0.3}
+  - id: only_online_lr0.5
+    units: [online]
+    learning_rate_scales: {online: 0.5}
+  - id: only_online_lr3
+    units: [online]
+    learning_rate_scales: {online: 3}
+  - id: replay_only_lr0.3
+    units: [teacher, student]
+    learning_rate_scales: {teacher: 0.3, student: 0.3}
+  - id: replay_only_lr3
+    units: [teacher, student]
+    learning_rate_scales: {teacher: 3, student: 3}
+  - id: student+online_lr0.3
+    units: [student, online]
+    learning_rate_scales: {student: 0.3, online: 0.3}
+  - id: student+online_lr3
+    units: [student, online]
+    learning_rate_scales: {student: 3, online: 3}
+  - id: teacher_slow_online_fast
+    units: [teacher, student, online]
+    learning_rate_scales: {teacher: 0.1, online: 3}
+  - id: replay_slow_online_fast
+    units: [teacher, student, online]
+    learning_rate_scales: {teacher: 0.3, student: 0.3, online: 3}
+  - id: online_slow
+    units: [teacher, student, online]
+    learning_rate_scales: {online: 0.1}
+  - id: online_fast
+    units: [teacher, student, online]
+    learning_rate_scales: {online: 3}

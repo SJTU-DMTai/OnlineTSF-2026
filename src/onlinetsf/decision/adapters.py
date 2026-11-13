@@ -47,7 +47,7 @@ class OneNetAdapter:
         return PreparedFeedback(feedback, ("time", "variable", "decision", "long", "short"), predictions)
 
     def apply(self, prepared: PreparedFeedback, due: frozenset[str], schedule: UnitSchedule) -> float | None:
-        self.batches.append(prepared, (name for name in prepared.opportunities if name in schedule.periods))
+        self.batches.append(prepared, (name for name in prepared.opportunities if name in schedule.active))
         return self.apply_batches(self.batches.take(name for name in prepared.opportunities if name in due), schedule)
 
     def apply_batches(self, batches, schedule: UnitSchedule) -> float | None:
@@ -81,7 +81,7 @@ class FSNetAdapter:
          UpdateUnit("adapter", "complete_feedback", True),
          UpdateUnit("head", "complete_feedback", True),
          UpdateUnit("gradient_memory", "complete_feedback"),
-         UpdateUnit("adaptation_memory", "prediction_and_native_inner_forward", has_batch_period=False)))
+         UpdateUnit("adaptation_memory", "prediction_and_native_inner_forward")))
 
     def __init__(self, method: FSNetMethod) -> None:
         self.method = method
@@ -97,7 +97,7 @@ class FSNetAdapter:
         return PreparedFeedback(feedback, ("base", "adapter", "head", "gradient_memory"))
 
     def apply(self, prepared: PreparedFeedback, due: frozenset[str], schedule: UnitSchedule) -> float | None:
-        self.batches.append(prepared, (name for name in prepared.opportunities if name in schedule.periods))
+        self.batches.append(prepared, (name for name in prepared.opportunities if name in schedule.active))
         return self.apply_batches(self.batches.take(name for name in prepared.opportunities if name in due), schedule)
 
     def apply_batches(self, batches, schedule: UnitSchedule) -> float | None:
@@ -120,8 +120,8 @@ class FSNetAdapter:
 
 class DSOFAdapter:
     capabilities = UpdateCapabilities(
-        (UpdateUnit("teacher", "native_replay_trigger", True, has_batch_period=False),
-         UpdateUnit("student", "native_replay_trigger", True, has_batch_period=False),
+        (UpdateUnit("teacher", "native_replay_trigger", True),
+         UpdateUnit("student", "native_replay_trigger", True),
          UpdateUnit("online", "first_step_feedback", True)))
 
     def __init__(self, method: DSOFMethod) -> None:
@@ -167,7 +167,7 @@ class DSOFAdapter:
                 context = torch.stack([method.replay[index][0] for index in indices]).to(method.device)
                 target = torch.stack([method.replay[index][1] for index in indices]).to(method.device)
                 losses.append(method._supervised_update(context, target, due & {"teacher", "student"}))
-        if "online" in prepared.opportunities and "online" in schedule.periods:
+        if "online" in prepared.opportunities and "online" in schedule.active:
             self.batches.append(prepared, ("online",))
         gradient_steps = method.last_gradient_steps
         online_loss = self.apply_batches(self.batches.take(("online",) if "online" in due else ()), schedule)

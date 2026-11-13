@@ -334,7 +334,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data")
     parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=["ETTh2", "ETTm1", "Electricity"])
-    parser.add_argument("--profiles", type=Path, default=PROJECT_ROOT / "profiles.yaml")
+    parser.add_argument("--profiles", type=Path, default=PROJECT_ROOT / "configs/profiles.yaml")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--time-column", default="date")
     parser.add_argument("--calibration-hours", type=float, default=168.0,

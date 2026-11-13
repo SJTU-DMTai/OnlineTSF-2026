@@ -28,8 +28,7 @@ class ActionCatalog:
         for action in self.actions:
             self.capabilities.validate(action)
             keys.append((action.units,
-                         tuple(sorted((k, v) for k, v in action.learning_rate_scales.items() if v != 1)),
-                         tuple(sorted(action.periods.items())), action.duration))
+                         tuple(sorted((k, v) for k, v in action.learning_rate_scales.items() if v != 1))))
         if len(set(keys)) != len(keys):
             raise ValueError("candidate catalog contains duplicate configurations")
         if not self.native_indices:
@@ -38,25 +37,20 @@ class ActionCatalog:
     @property
     def native_indices(self) -> list[int]:
         return [i for i, action in enumerate(self.actions)
-                if action.units == self.capabilities.unit_names and not action.periods
+                if action.units == self.capabilities.unit_names
                 and all(scale == 1 for scale in action.learning_rate_scales.values())]
 
     @property
     def encoding_names(self) -> list[str]:
         return ([f"enabled_{unit.name}" for unit in self.capabilities.units]
-                + [f"log_lr_scale_{unit.name}" for unit in self.capabilities.units if unit.has_learning_rate]
-                + [f"log_period_{unit.name}" for unit in self.capabilities.units if unit.has_batch_period]
-                + ["log_duration"])
+                + [f"log_lr_scale_{unit.name}" for unit in self.capabilities.units if unit.has_learning_rate])
 
     def encode(self) -> np.ndarray:
         rows = []
         for action in self.actions:
             rows.append([float(unit.name in action.units) for unit in self.capabilities.units]
                         + [np.log(action.learning_rate_scales.get(unit.name, 1)) if unit.name in action.units else 0.
-                           for unit in self.capabilities.units if unit.has_learning_rate]
-                        + [np.log(action.periods.get(unit.name, 1)) if unit.name in action.units else 0.
-                           for unit in self.capabilities.units if unit.has_batch_period]
-                        + [np.log(action.duration)])
+                           for unit in self.capabilities.units if unit.has_learning_rate])
         return np.asarray(rows, dtype=np.float64)
 
     def best(self, scores: np.ndarray, legal: np.ndarray | None = None) -> np.ndarray:

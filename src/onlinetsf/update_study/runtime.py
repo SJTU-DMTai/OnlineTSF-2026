@@ -7,11 +7,11 @@ from collections import deque
 
 import torch
 
-from ..decision_previous.control import ControlledMethod
-from ..decision_previous.actions import Policy
+from ..decision_previous.decision_version1.control import ControlledMethod
+from ..decision_previous.decision_version1.actions import Policy
 from ..online import MethodFeedback
-from ..decision_previous.config import DecisionConfig
-from ..decision_previous.features import extract_features, history_size
+from ..decision_previous.decision_version1.config import DecisionConfig
+from ..decision_previous.decision_version1.features import extract_features, history_size
 
 
 def rng_state() -> tuple:

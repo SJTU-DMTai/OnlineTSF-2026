@@ -9,7 +9,7 @@ RUN_ROOT="${1:?Usage: bash scripts/run_policy.sh runs/unique-output-directory}"
 WORKERS="${WORKERS:-2}"
 # Optional ACC diagnostics: none, policy_full, policy_data, or both.
 ORACLE_DIAGNOSTICS="${ORACLE_DIAGNOSTICS:-none}"
-DECISION_CONFIG="${DECISION_CONFIG:-decision.yaml}"
+DECISION_CONFIG="${DECISION_CONFIG:-configs/legacy/decision.yaml}"
 ETTH2_ANNOTATIONS="${ETTH2_ANNOTATIONS:-data/drift-etth}"
 ETTM1_ANNOTATIONS="${ETTM1_ANNOTATIONS:-data/drift-ettm}"
 WEATHER_ANNOTATIONS="${WEATHER_ANNOTATIONS:-data/drift-weather}"
@@ -22,7 +22,7 @@ run_pipeline() {
     echo "START GPU=$gpu dataset=$dataset method=$method log=$log"
     CUDA_VISIBLE_DEVICES="$gpu" python -u -m onlinetsf.decision_previous \
         --annotations "$annotations" --dataset "$dataset" --method "$method" \
-        --horizon 24 --seed 0 --profiles profiles.yaml --context-length 96 \
+        --horizon 24 --seed 0 --profiles configs/profiles.yaml --context-length 96 \
         --epochs 6 --batch-size 32 --positions "$positions" --workers "$WORKERS" \
         --decision-config "$DECISION_CONFIG" --test-start-fraction 0.6 \
         --oracle-diagnostics "$ORACLE_DIAGNOSTICS" --oracle-metric mae \

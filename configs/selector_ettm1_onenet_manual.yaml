@@ -1,0 +1,97 @@
+seed: 0
+threads: 4
+data:
+  name: ettm1
+  path: ../data/ETTm1.csv
+  context_length: 96
+  horizon: 24
+  include_time_features: true
+forecast:
+  profiles: profiles.yaml
+  strategy: onenet
+  device: cuda:0
+  epochs: 6
+  batch_size: 32
+actions: actions/onenet_manual.yaml
+collection:
+  tau: 64
+  offline_fraction: 0.2
+  train_end_fraction: 0.6
+  train_states: 96
+  workers: 4
+  feature_window: 32
+  error_window: 128
+selectors:
+  formulations:
+  - independent_regression
+  - shared_regression
+  - classification
+  estimators:
+  - random_forest
+  - lightgbm
+  - mlp
+  feature_selection:
+    alpha: 0.06
+    l1_ratio: 0.5
+  features:
+  - channel_shift_fraction
+  - volatility_ratio
+  - autocorrelation_shift
+  - recent_mae
+  - error_ratio
+  - residual_bias_ratio
+  - expert_relative_gap
+  - combined_time_weight
+  - normalized_mean_shift
+  - trend_shift
+  - cross_correlation_shift
+  - error_volatility
+  - tail_error_ratio
+  - first_step_mae
+  - residual_autocorrelation
+  parameters:
+    random_forest:
+      n_estimators: 200
+      max_depth: 6
+      min_samples_leaf: 4
+      n_jobs: 1
+    lightgbm:
+      n_estimators: 200
+      learning_rate: 0.05
+      num_leaves: 7
+      min_child_samples: 4
+      n_jobs: 1
+    mlp:
+      hidden_sizes:
+      - 64
+      - 32
+      learning_rate: 0.001
+      min_learning_rate: 0.0001
+      epochs: 100
+      batch_size: 64
+      weight_decay: 0.0001
+  formulation_parameters:
+    independent_regression:
+      lightgbm:
+        n_estimators: 100
+        learning_rate: 0.03
+        num_leaves: 3
+        min_child_samples: 12
+        reg_lambda: 1.0
+    shared_regression:
+      random_forest:
+        max_depth: 12
+        min_samples_leaf: 2
+      lightgbm:
+        n_estimators: 600
+        num_leaves: 31
+        min_child_samples: 2
+  classification:
+    temperature: auto
+    temperature_candidates:
+    - 0.01
+    - 0.02
+    - 0.05
+    - 0.1
+    - 0.2
+    cv_splits: 3
