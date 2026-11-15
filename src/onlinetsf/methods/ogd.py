@@ -19,7 +19,7 @@ class OGDMethod:
     """Adapt a standard PyTorch forecaster only when feedback is available."""
 
     update_group_names = ("model",)
-    incremental_feedback = True
+    incremental_feedback = False
     adaptation_feature_names = ()
     last_egd_steps = 0
 

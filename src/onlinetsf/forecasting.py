@@ -64,7 +64,7 @@ class LinearForecastBackbone(ForecastBackbone):
 
 
 class DLinearForecastBackbone(ForecastBackbone):
-    """Shared-weight DLinear decomposition used as the DSOF teacher."""
+    """Shared-weight seasonal and trend decomposition for forecasting."""
 
     def __init__(
         self,
@@ -87,6 +87,9 @@ class DLinearForecastBackbone(ForecastBackbone):
             raise ValueError("num_targets must match target_indices")
         self.seasonal = nn.Linear(context_length, horizon)
         self.trend = nn.Linear(context_length, horizon)
+
+    def parameter_groups(self) -> dict[str, list[nn.Parameter]]:
+        return {"seasonal": list(self.seasonal.parameters()), "trend": list(self.trend.parameters())}
 
     def forward(self, context: Tensor) -> Tensor:
         _validate_context(context, self.context_length, self.num_features)
@@ -308,6 +311,13 @@ class PatchTSTForecastBackbone(ForecastBackbone):
         self.normalization = nn.LayerNorm(d_model)
         self.head = nn.Linear(self.num_patches * d_model, horizon)
         nn.init.trunc_normal_(self.position_embedding, std=0.02)
+
+    def parameter_groups(self) -> dict[str, list[nn.Parameter]]:
+        return {
+            "embedding": [*self.patch_embedding.parameters(), self.position_embedding],
+            "encoder": [*self.encoder.parameters(), *self.normalization.parameters()],
+            "head": list(self.head.parameters()),
+        }
 
     def forward(self, context: Tensor) -> Tensor:
         _validate_context(context, self.context_length, self.num_features)

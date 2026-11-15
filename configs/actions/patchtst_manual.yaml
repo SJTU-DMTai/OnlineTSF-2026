@@ -1,0 +1,139 @@
+# Complete-label OGD; learning-rate scales multiply the native online rate.
+method: ogd
+actions:
+- id: native
+  units:
+  - embedding
+  - encoder
+  - head
+- id: frozen
+  units: []
+- id: lr0.1
+  units:
+  - embedding
+  - encoder
+  - head
+  learning_rate_scales:
+    embedding: 0.1
+    encoder: 0.1
+    head: 0.1
+- id: lr0.3
+  units:
+  - embedding
+  - encoder
+  - head
+  learning_rate_scales:
+    embedding: 0.3
+    encoder: 0.3
+    head: 0.3
+- id: lr0.5
+  units:
+  - embedding
+  - encoder
+  - head
+  learning_rate_scales:
+    embedding: 0.5
+    encoder: 0.5
+    head: 0.5
+- id: lr3
+  units:
+  - embedding
+  - encoder
+  - head
+  learning_rate_scales:
+    embedding: 3
+    encoder: 3
+    head: 3
+- id: only_embedding
+  units:
+  - embedding
+- id: only_embedding_lr0.3
+  units:
+  - embedding
+  learning_rate_scales:
+    embedding: 0.3
+- id: only_embedding_lr3
+  units:
+  - embedding
+  learning_rate_scales:
+    embedding: 3
+- id: only_encoder
+  units:
+  - encoder
+- id: only_encoder_lr0.3
+  units:
+  - encoder
+  learning_rate_scales:
+    encoder: 0.3
+- id: only_encoder_lr3
+  units:
+  - encoder
+  learning_rate_scales:
+    encoder: 3
+- id: only_head
+  units:
+  - head
+- id: only_head_lr0.3
+  units:
+  - head
+  learning_rate_scales:
+    head: 0.3
+- id: only_head_lr3
+  units:
+  - head
+  learning_rate_scales:
+    head: 3
+- id: only_embedding+encoder
+  units:
+  - embedding
+  - encoder
+- id: only_embedding+encoder_lr0.3
+  units:
+  - embedding
+  - encoder
+  learning_rate_scales:
+    embedding: 0.3
+    encoder: 0.3
+- id: only_embedding+encoder_lr3
+  units:
+  - embedding
+  - encoder
+  learning_rate_scales:
+    embedding: 3
+    encoder: 3
+- id: only_embedding+head
+  units:
+  - embedding
+  - head
+- id: only_embedding+head_lr0.3
+  units:
+  - embedding
+  - head
+  learning_rate_scales:
+    embedding: 0.3
+    head: 0.3
+- id: only_embedding+head_lr3
+  units:
+  - embedding
+  - head
+  learning_rate_scales:
+    embedding: 3
+    head: 3
+- id: only_encoder+head
+  units:
+  - encoder
+  - head
+- id: only_encoder+head_lr0.3
+  units:
+  - encoder
+  - head
+  learning_rate_scales:
+    encoder: 0.3
+    head: 0.3
+- id: only_encoder+head_lr3
+  units:
+  - encoder
+  - head
+  learning_rate_scales:
+    encoder: 3
+    head: 3

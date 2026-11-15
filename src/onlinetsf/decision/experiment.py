@@ -134,8 +134,8 @@ def collect_experiment(config: dict, base: Path, output: Path) -> None:
     profiles = yaml.safe_load((base / forecast["profiles"]).read_text(encoding="utf-8"))["strategies"]
     profile = profiles[forecast["strategy"]]
     method_name = profile["method"]["name"]
-    if method_name not in {"onenet", "fsnet", "dsof"}:
-        raise ValueError("selector experiments support onenet, fsnet and dsof")
+    if method_name not in {"onenet", "fsnet", "dsof", "ogd"}:
+        raise ValueError("selector experiments support onenet, fsnet, dsof and ogd")
     device = torch.device(forecast.get("device", "cpu"))
     if device.type not in {"cpu", "cuda"}:
         raise ValueError("device must be cpu or cuda")

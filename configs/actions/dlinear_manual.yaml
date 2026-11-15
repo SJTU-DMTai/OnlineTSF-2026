@@ -1,0 +1,63 @@
+# Complete-label OGD; learning-rate scales multiply the native online rate.
+method: ogd
+actions:
+- id: native
+  units:
+  - seasonal
+  - trend
+- id: frozen
+  units: []
+- id: lr0.1
+  units:
+  - seasonal
+  - trend
+  learning_rate_scales:
+    seasonal: 0.1
+    trend: 0.1
+- id: lr0.3
+  units:
+  - seasonal
+  - trend
+  learning_rate_scales:
+    seasonal: 0.3
+    trend: 0.3
+- id: lr0.5
+  units:
+  - seasonal
+  - trend
+  learning_rate_scales:
+    seasonal: 0.5
+    trend: 0.5
+- id: lr3
+  units:
+  - seasonal
+  - trend
+  learning_rate_scales:
+    seasonal: 3
+    trend: 3
+- id: only_seasonal
+  units:
+  - seasonal
+- id: only_seasonal_lr0.3
+  units:
+  - seasonal
+  learning_rate_scales:
+    seasonal: 0.3
+- id: only_seasonal_lr3
+  units:
+  - seasonal
+  learning_rate_scales:
+    seasonal: 3
+- id: only_trend
+  units:
+  - trend
+- id: only_trend_lr0.3
+  units:
+  - trend
+  learning_rate_scales:
+    trend: 0.3
+- id: only_trend_lr3
+  units:
+  - trend
+  learning_rate_scales:
+    trend: 3

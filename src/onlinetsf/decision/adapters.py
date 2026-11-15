@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from ..methods import DSOFMethod, FSNetMethod, OneNetMethod
+from ..forecasting import DLinearForecastBackbone, PatchTSTForecastBackbone
+from ..methods import DSOFMethod, FSNetMethod, OGDMethod, OneNetMethod
 from ..online import MethodFeedback
 from .capabilities import UpdateCapabilities, UpdateUnit, UnitSchedule
 from .optimizers import OptimizerRates
@@ -191,11 +192,66 @@ class DSOFAdapter:
         return self.method.predict(context)
 
 
-def build_adapter(method) -> OneNetAdapter | FSNetAdapter | DSOFAdapter:
+class OGDAdapter:
+    """One optimizer step per complete sample, with selected backbone modules."""
+
+    def __init__(self, method: OGDMethod) -> None:
+        if not isinstance(method.model, (DLinearForecastBackbone, PatchTSTForecastBackbone)):
+            raise TypeError("OGD update actions support DLinear and PatchTST backbones")
+        if method.optimizer is None or method.loss_fn is None or method.update_steps != 1:
+            raise ValueError("OGD update actions require an optimizer, a loss and update_steps=1")
+        self.method = method
+        self.groups = method.model.parameter_groups()
+        self.capabilities = UpdateCapabilities(tuple(
+            UpdateUnit(name, "complete_feedback", True) for name in self.groups))
+        self.batches = FeedbackBatches()
+        self.rates = OptimizerRates([(method.optimizer, self.groups)])
+
+    def configure(self, learning_rate_scales) -> None:
+        self.rates.apply(learning_rate_scales)
+
+    def prepare(self, feedback: MethodFeedback, *, training: bool) -> PreparedFeedback:
+        if not feedback.observed_mask.all():
+            raise ValueError("OGD update actions require complete-horizon feedback")
+        return PreparedFeedback(feedback, tuple(self.groups))
+
+    def apply(self, prepared: PreparedFeedback, due: frozenset[str], schedule: UnitSchedule) -> float | None:
+        self.batches.append(prepared, due)
+        return self.apply_batches(self.batches.take(due), schedule)
+
+    def apply_batches(self, batches, schedule: UnitSchedule) -> float | None:
+        method = self.method
+        method.last_gradient_steps = 0
+        gradient_steps = 0
+        losses = []
+        for units, items in batches:
+            # Frozen modules remain in the forward path, but need no parameter
+            # gradients or optimizer steps. Restore flags before the next action.
+            trainable = [(parameter, parameter.requires_grad) for parameter in method.model.parameters()]
+            for name, parameters in self.groups.items():
+                for parameter in parameters:
+                    parameter.requires_grad_(name in units)
+            try:
+                for item in items:
+                    losses.append(method.on_feedback(item.feedback))
+                    gradient_steps += method.last_gradient_steps
+            finally:
+                for parameter, enabled in trainable:
+                    parameter.requires_grad_(enabled)
+        method.last_gradient_steps = gradient_steps
+        return sum(losses) / len(losses) if losses else None
+
+    def predict(self, context: Tensor, schedule: UnitSchedule) -> Tensor:
+        return self.method.predict(context)
+
+
+def build_adapter(method) -> OneNetAdapter | FSNetAdapter | DSOFAdapter | OGDAdapter:
     if isinstance(method, OneNetMethod):
         return OneNetAdapter(method)
     if isinstance(method, FSNetMethod):
         return FSNetAdapter(method)
     if isinstance(method, DSOFMethod):
         return DSOFAdapter(method)
-    raise TypeError("update actions support OneNetMethod, FSNetMethod and DSOFMethod")
+    if isinstance(method, OGDMethod):
+        return OGDAdapter(method)
+    raise TypeError("update actions support OneNetMethod, FSNetMethod, DSOFMethod and OGDMethod")

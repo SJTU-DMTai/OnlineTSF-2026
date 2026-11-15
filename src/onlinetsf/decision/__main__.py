@@ -18,6 +18,8 @@ def main(argv=None) -> None:
         command.add_argument("--strategy", help="override the forecasting strategy in profiles.yaml")
         command.add_argument("--actions", type=Path, help="override the candidate action YAML")
         if name == "run":
+            command.add_argument("--devices", nargs="+", help="parallel evaluation devices, e.g. cuda:0 cuda:2")
+            command.add_argument("--workers-per-device", nargs="+", type=int, help="concurrent test policies per device")
             command.add_argument("--ema-beta", type=float, help="test EMA coefficient in [0, 1); default matches tau effective samples")
     train = commands.add_parser("train")
     train.add_argument("--data", type=Path, required=True, help="completed collection directory")
@@ -51,7 +53,8 @@ def main(argv=None) -> None:
             args.output.mkdir(parents=True, exist_ok=False)
             collect_experiment(config, args.config.resolve().parent, args.output / "data")
             train_experiment(args.output / "data", args.output / "models")
-            evaluate_experiment(args.output / "data", args.output / "models", args.output / "test")
+            evaluate_experiment(args.output / "data", args.output / "models", args.output / "test",
+                                devices=args.devices, workers_per_device=args.workers_per_device)
     elif args.command == "train":
         options = yaml.safe_load(args.config.read_text(encoding="utf-8"))["selectors"] if args.config else None
         train_experiment(args.data, args.output, options)
