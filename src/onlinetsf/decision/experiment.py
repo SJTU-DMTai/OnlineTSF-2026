@@ -475,7 +475,7 @@ def initialize_evaluation_worker(device: str, threads: int) -> None:
 
 
 def evaluate_policy_worker(data_directory: Path, manifest: dict, output: Path, name: str, policy) -> dict:
-    """Restore a fresh OneNet trajectory, including optimizer state, for one policy."""
+    """Restore a fresh trajectory, including optimizer state, for one policy."""
     saved = torch.load(data_directory / "evaluation_start.pt", weights_only=False, map_location="cpu")
     executor, dataset = saved["executor"], saved["dataset"]
     method = executor.method.method
@@ -485,7 +485,7 @@ def evaluate_policy_worker(data_directory: Path, manifest: dict, output: Path, n
     parameters = dict(zip(original_parameters, method.model.parameters()))
     method.device = _evaluation_device
     # Keep optimizer groups intact: the adapter holds references to these groups.
-    # OneNet's Adam/AdamW moment tensors follow parameters; step counters stay on CPU.
+    # Adam/AdamW moment tensors follow parameters; step counters stay on CPU.
     for optimizer in method.update_optimizers:
         for group in optimizer.param_groups:
             group["params"] = [parameters[parameter] for parameter in group["params"]]
@@ -539,8 +539,6 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
             raise ValueError("workers_per_device must provide one count per device")
         for count in workers_per_device:
             positive_integer(count, "workers_per_device")
-        if catalog.method != "onenet":
-            raise ValueError("parallel evaluation currently supports OneNet only")
     digest = hashlib.sha256((data_directory / "training.npz").read_bytes()).hexdigest()
     jobs = [("native", catalog.actions[catalog.native_indices[0]]),
             ("frozen", UpdateAction())]
