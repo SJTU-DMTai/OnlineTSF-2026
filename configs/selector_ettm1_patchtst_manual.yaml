@@ -24,14 +24,17 @@ collection:
 evaluation:
   ema_beta: null
 selectors:
-  formulations:
-  - independent_regression
-  - shared_regression
-  - classification
-  estimators:
-  - random_forest
-  - lightgbm
-  - mlp
+  # Only listed pairs are trained and evaluated; remove a line to exclude it.
+  models:
+    - {formulation: independent_regression, estimator: random_forest}
+    - {formulation: independent_regression, estimator: lightgbm}
+    - {formulation: independent_regression, estimator: mlp}
+    - {formulation: shared_regression, estimator: random_forest}
+    - {formulation: shared_regression, estimator: lightgbm}
+    - {formulation: shared_regression, estimator: mlp}
+    - {formulation: classification, estimator: random_forest}
+    - {formulation: classification, estimator: lightgbm}
+    - {formulation: classification, estimator: mlp}
   feature_selection: null
   features:
   - channel_shift_fraction

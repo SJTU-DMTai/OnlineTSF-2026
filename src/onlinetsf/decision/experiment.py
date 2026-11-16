@@ -32,6 +32,7 @@ from .feature_selection import select_state_features
 from .runtime import UpdateController
 from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, LOG1P_FEATURES, SelectorPolicy, resolve_ema_beta
 from .training import select_temperature
+from .ranking import RANKING_PAIRS, RankingSelector
 
 
 def save_json(path: Path, record) -> None:
@@ -283,13 +284,31 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
     if manifest["schema_version"] != 4:
         raise ValueError("recollect training data with the current feature schema")
     options = manifest["config"]["selectors"] if options is None else options
-    formulations, estimators = options["formulations"], options["estimators"]
+    if "formulations" in options or "estimators" in options:
+        raise ValueError("replace selectors.formulations/estimators with an explicit selectors.models list")
+    models = options.get("models")
+    if not isinstance(models, list) or not models:
+        raise ValueError("selectors.models must be a nonempty list of formulation/estimator pairs")
+    pairs = []
+    for model in models:
+        if (not isinstance(model, dict) or not {"formulation", "estimator"} <= set(model)
+                or set(model) - {"formulation", "estimator", "loss"}):
+            raise ValueError("each selectors.models entry requires formulation and estimator")
+        pair = model["formulation"], model["estimator"], model.get("loss", "default")
+        if pair[2] not in {"default", "margin_ranking"}:
+            raise ValueError(f"unknown selector loss: {pair[2]}")
+        if pair[2] == "margin_ranking" and pair[:2] not in RANKING_PAIRS:
+            raise ValueError(f"unsupported margin ranking selector: {pair[:2]}")
+        if pair[0] not in FORMULATIONS or pair[1] not in ESTIMATORS:
+            raise ValueError(f"unknown selector formulation/estimator: {pair}")
+        if pair in pairs:
+            raise ValueError(f"duplicate selector formulation/estimator: {pair}")
+        pairs.append(pair)
+    ranking = options.get("ranking", {})
+    if set(ranking) - {"margin"}:
+        raise ValueError("unknown selector ranking option")
     if "feature_sets" in options:
         raise ValueError("feature_sets is obsolete; ElasticNet selects from selectors.features or all collected features")
-    for values, allowed, name in ((formulations, FORMULATIONS, "formulations"),
-                                   (estimators, ESTIMATORS, "estimators")):
-        if not values or len(set(values)) != len(values) or set(values) - set(allowed):
-            raise ValueError(f"invalid or duplicate selector {name}")
     parameters = options.get("parameters", {})
     if set(parameters) - set(ESTIMATORS):
         raise ValueError("unknown estimator parameter section")
@@ -333,60 +352,66 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
         names = selection["selected_features"]
         states = candidate_states[:, [candidate_names.index(name) for name in names]]
         print(f"Feature selection ({selection['method']}): {len(names)}/{len(candidate_names)} state features: {names}", flush=True)
-        for formulation in formulations:
-            for estimator in estimators:
-                began = perf_counter()
-                selector = ActionSelector(catalog, names, formulation, estimator,
-                                          parameters={**parameters.get(estimator, {}),
-                                                      **formulation_parameters.get(formulation, {}).get(estimator, {})},
-                                          seed=manifest["config"].get("seed", 0),
-                                          feature_window=manifest["config"]["collection"].get("feature_window", 32),
-                                          error_window=manifest["config"]["collection"].get("error_window", 128))
-                selector.tau = manifest["tau"]
-                temperature_report = None
-                if formulation == "classification":
-                    temperature = classification.get("temperature", "auto")
-                    if temperature == "auto":
-                        temperature_selector = copy.copy(selector)
-                        temperature_selector.features = candidate_names
-                        temperature_report = select_temperature(
-                            temperature_selector, candidate_states, maes, gains, origins, label_ends,
-                            temperatures=classification.get("temperature_candidates", [.01, .02, .05, .1, .2]),
-                            cv_splits=classification.get("cv_splits", 3), feature_selection=selection_options)
-                        temperature = temperature_report["temperature"]
-                    else:
-                        temperature_report = {"method": "fixed", "temperature": temperature}
-                    selector.temperature = temperature
-                    print(f"classification/{estimator}: temperature={temperature}", flush=True)
-                selector.fit(states, maes)
-                fit_seconds = perf_counter() - began
-                directory = output / formulation / estimator
-                directory.mkdir(parents=True)
-                selector.save(directory / "selector.pkl")
-                if temperature_report is not None:
-                    save_json(directory / "temperature_selection.json", temperature_report)
-                if estimator == "mlp":
-                    save_json(directory / "learning_rates.json", {
-                        "schedule": "cosine", "unit": "epoch",
-                        "models": [{"action_id": catalog.ids[i] if formulation == "independent_regression" else None,
-                                    "rates": model.learning_rates_}
-                                   for i, model in enumerate(selector.models) if model is not None]})
-                row = {"formulation": formulation, "estimator": estimator, "feature_count": len(names),
-                       "fit_seconds": fit_seconds, "model_bytes": (directory / "selector.pkl").stat().st_size}
-                if formulation == "classification":
-                    row.update(target="softmax_negative_mae", temperature=selector.temperature)
+        for formulation, estimator, loss in pairs:
+            began = perf_counter()
+            selector_type = RankingSelector if loss == "margin_ranking" else ActionSelector
+            selector = selector_type(catalog, names, formulation, estimator,
+                                      **({"margin": ranking.get("margin", 1.)} if loss == "margin_ranking" else {}),
+                                      parameters={**parameters.get(estimator, {}),
+                                                  **formulation_parameters.get(formulation, {}).get(estimator, {})},
+                                      seed=manifest["config"].get("seed", 0),
+                                      feature_window=manifest["config"]["collection"].get("feature_window", 32),
+                                      error_window=manifest["config"]["collection"].get("error_window", 128))
+            selector.tau = manifest["tau"]
+            temperature_report = None
+            if formulation == "classification" and loss == "default":
+                temperature = classification.get("temperature", "auto")
+                if temperature == "auto":
+                    temperature_selector = copy.copy(selector)
+                    temperature_selector.features = candidate_names
+                    temperature_report = select_temperature(
+                        temperature_selector, candidate_states, maes, gains, origins, label_ends,
+                        temperatures=classification.get("temperature_candidates", [.01, .02, .05, .1, .2]),
+                        cv_splits=classification.get("cv_splits", 3), feature_selection=selection_options)
+                    temperature = temperature_report["temperature"]
                 else:
-                    row.update(target="action_mae")
-                results.append(row)
-                save_json(directory / "metadata.json", {**row, "features": names, "catalog": catalog.to_dict(),
-                                                        "action_encoding": catalog.encoding_names,
-                                                        "parameters": selector.parameters,
-                                                        "feature_selection": selection["method"],
-                                                        "feature_selection_parameters": selection["parameters"],
-                                                        "feature_transforms": {name: "log1p" for name in names
-                                                                               if name in LOG1P_FEATURES},
-                                                        "collection_sha256": collection_digest})
-                print(f"trained {formulation}/{estimator}", flush=True)
+                    temperature_report = {"method": "fixed", "temperature": temperature}
+                selector.temperature = temperature
+                print(f"classification/{estimator}: temperature={temperature}", flush=True)
+            selector.fit(states, maes)
+            fit_seconds = perf_counter() - began
+            model_name = estimator + ("_margin_ranking" if loss == "margin_ranking" else "")
+            directory = output / formulation / model_name
+            directory.mkdir(parents=True)
+            selector.save(directory / "selector.pkl")
+            if temperature_report is not None:
+                save_json(directory / "temperature_selection.json", temperature_report)
+            if estimator == "mlp":
+                save_json(directory / "learning_rates.json", {
+                    "schedule": "cosine", "unit": "epoch",
+                    "models": [{"action_id": catalog.ids[i] if formulation == "independent_regression" and loss == "default" else None,
+                                "rates": model.learning_rates_}
+                               for i, model in enumerate(selector.models) if model is not None]})
+            row = {"formulation": formulation, "estimator": estimator, "feature_count": len(names),
+                   "fit_seconds": fit_seconds, "model_bytes": (directory / "selector.pkl").stat().st_size}
+            if loss == "margin_ranking":
+                row.update(target="margin_ranking", loss=loss, margin=selector.margin,
+                           pair_reduction="mean_per_state_then_mean_states", ties="skip_exact",
+                           score_kind=selector.score_kind)
+            elif formulation == "classification":
+                row.update(target="softmax_negative_mae", temperature=selector.temperature)
+            else:
+                row.update(target="action_mae")
+            results.append(row)
+            save_json(directory / "metadata.json", {**row, "features": names, "catalog": catalog.to_dict(),
+                                                    "action_encoding": catalog.encoding_names,
+                                                    "parameters": selector.parameters,
+                                                    "feature_selection": selection["method"],
+                                                    "feature_selection_parameters": selection["parameters"],
+                                                    "feature_transforms": {name: "log1p" for name in names
+                                                                           if name in LOG1P_FEATURES},
+                                                    "collection_sha256": collection_digest})
+            print(f"trained {formulation}/{model_name}", flush=True)
     except BaseException as error:
         save_json(output / "manifest.json", {"status": "failed", "error": f"{type(error).__name__}: {error}", "results": results})
         raise
@@ -543,12 +568,13 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
     jobs = [("native", catalog.actions[catalog.native_indices[0]]),
             ("frozen", UpdateAction())]
     for row in trained["results"]:
-        directory = model_directory / row["formulation"] / row["estimator"]
+        model_name = row["estimator"] + ("_margin_ranking" if row.get("loss") == "margin_ranking" else "")
+        directory = model_directory / row["formulation"] / model_name
         metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
         if metadata["collection_sha256"] != digest or metadata["catalog"] != catalog.to_dict():
             raise ValueError("selector was trained on a different collection or candidate catalog")
         selector = ActionSelector.load(directory / "selector.pkl")
-        jobs.append((f"policy/{row['formulation']}/{row['estimator']}", SelectorPolicy(selector, ema_beta=beta)))
+        jobs.append((f"policy/{row['formulation']}/{model_name}", SelectorPolicy(selector, ema_beta=beta)))
     output.mkdir(parents=True, exist_ok=False)
     summaries = []
     save_json(output / "manifest.json", {"status": "evaluating", "ema_beta": beta})

@@ -191,6 +191,20 @@ class ActionSelector:
 
     def fit(self, states: np.ndarray, targets: np.ndarray) -> ActionSelector:
         states, targets = np.asarray(states, dtype=float), np.asarray(targets, dtype=float)
+        x = self.prepare_training(states, targets)
+        classification = self.formulation == "classification"
+        self.models = []
+        fit_targets = ([targets[:, i] for i in range(len(self.catalog.ids))] if self.formulation == "independent_regression"
+                       else [soft_targets(targets, self.temperature) if classification else targets.reshape(-1)])
+        for index, target in enumerate(fit_targets):
+            self.models.append(fit_estimator(self.estimator, x, target, classification=classification,
+                                            class_count=len(self.catalog.ids), parameters=self.parameters,
+                                            seed=self.seed + index))
+        return self
+
+    def prepare_training(self, states: np.ndarray, targets: np.ndarray) -> np.ndarray:
+        """Fit the same input preprocessing for ordinary and ranking selectors."""
+        states, targets = np.asarray(states, dtype=float), np.asarray(targets, dtype=float)
         if states.ndim != 2 or states.shape[1] != len(self.features) or not len(states):
             raise ValueError("training requires a nonempty state matrix matching the feature schema")
         if targets.shape != (len(states), len(self.catalog.ids)) or not np.isfinite(targets).all():
@@ -207,16 +221,7 @@ class ActionSelector:
         action_values = self.catalog.encode()
         self.action_mean, self.action_scale = action_values.mean(0), action_values.std(0)
         self.action_scale[self.action_scale < 1e-6] = 1.
-        x = self.design(states)
-        classification = self.formulation == "classification"
-        self.models = []
-        fit_targets = ([targets[:, i] for i in range(len(self.catalog.ids))] if self.formulation == "independent_regression"
-                       else [soft_targets(targets, self.temperature) if classification else targets.reshape(-1)])
-        for index, target in enumerate(fit_targets):
-            self.models.append(fit_estimator(self.estimator, x, target, classification=classification,
-                                            class_count=len(self.catalog.ids), parameters=self.parameters,
-                                            seed=self.seed + index))
-        return self
+        return self.design(states)
 
     def scores(self, states: np.ndarray) -> np.ndarray:
         x = self.design(states)
@@ -231,8 +236,14 @@ class ActionSelector:
 
     def select(self, states: np.ndarray, legal: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
         scores = self.scores(states)
-        ranked = scores if self.formulation == "classification" else -scores
-        return self.catalog.best(ranked, legal), scores
+        return self.catalog.best(self.rank_scores(scores), legal), scores
+
+    def rank_scores(self, scores: np.ndarray) -> np.ndarray:
+        return scores if self.formulation == "classification" else -scores
+
+    @property
+    def score_kind(self) -> str:
+        return "probability" if self.formulation == "classification" else "action_mae"
 
     def save(self, path: str | Path) -> None:
         Path(path).write_bytes(pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL))
@@ -271,13 +282,12 @@ class SelectorPolicy:
         scores = self.selector.scores(values)[0]
         self.smoothed_scores = (scores.copy() if self.smoothed_scores is None else
                                 self.beta * self.smoothed_scores + (1 - self.beta) * scores)
-        ranked = (self.smoothed_scores if self.selector.formulation == "classification" else
-                  -self.smoothed_scores)
+        ranked = self.selector.rank_scores(self.smoothed_scores)
         index = int(self.selector.catalog.best(ranked[None, :])[0])
         self.last_selection = {"action_id": self.selector.catalog.ids[index],
                                "scores": dict(zip(self.selector.catalog.ids, self.smoothed_scores.tolist())),
                                "raw_scores": dict(zip(self.selector.catalog.ids, scores.tolist())),
                                "ema_beta": self.beta,
-                               "score_kind": "probability" if self.selector.formulation == "classification" else "action_mae",
+                               "score_kind": self.selector.score_kind,
                                "features": {name: state.features[name] for name in self.selector.features}}
         return self.selector.catalog.actions[index]

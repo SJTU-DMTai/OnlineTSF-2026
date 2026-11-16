@@ -25,8 +25,17 @@ collection:
 evaluation:
   ema_beta: null  # null: (tau - 1) / (tau + 1); 0 disables smoothing.
 selectors:
-  formulations: [independent_regression, shared_regression, classification]
-  estimators: [random_forest, lightgbm, mlp]
+  # Only listed pairs are trained and evaluated; remove a line to exclude it.
+  models:
+    - {formulation: independent_regression, estimator: random_forest}
+    - {formulation: independent_regression, estimator: lightgbm}
+    - {formulation: independent_regression, estimator: mlp}
+    - {formulation: shared_regression, estimator: random_forest}
+    - {formulation: shared_regression, estimator: lightgbm}
+    - {formulation: shared_regression, estimator: mlp}
+    - {formulation: classification, estimator: random_forest}
+    - {formulation: classification, estimator: lightgbm}
+    - {formulation: classification, estimator: mlp}
   feature_selection: null
   # Candidate pool; ElasticNet selects the final inputs from these features.
   features:
