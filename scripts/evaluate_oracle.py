@@ -1,4 +1,4 @@
-"""Standalone entry for the current greedy Oracle; no selector training required."""
+"""Standalone lookahead beam Oracle; no collection or selector training required."""
 
 import sys
 from pathlib import Path

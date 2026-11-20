@@ -193,10 +193,17 @@ class ActionSelector:
         states, targets = np.asarray(states, dtype=float), np.asarray(targets, dtype=float)
         x = self.prepare_training(states, targets)
         classification = self.formulation == "classification"
+        # Use absolute lookahead costs for validation and classification, but
+        # remove state difficulty from regression targets. Native is exactly 0.
+        advantages = targets - targets[:, self.catalog.native_indices[:1]]
         self.models = []
-        fit_targets = ([targets[:, i] for i in range(len(self.catalog.ids))] if self.formulation == "independent_regression"
-                       else [soft_targets(targets, self.temperature) if classification else targets.reshape(-1)])
+        fit_targets = ([advantages[:, i] for i in range(len(self.catalog.ids))] if self.formulation == "independent_regression"
+                       else [soft_targets(targets - targets.min(1, keepdims=True), self.temperature)
+                             if classification else advantages.reshape(-1)])
         for index, target in enumerate(fit_targets):
+            if self.formulation == "independent_regression" and index in self.catalog.native_indices:
+                self.models.append(None)
+                continue
             self.models.append(fit_estimator(self.estimator, x, target, classification=classification,
                                             class_count=len(self.catalog.ids), parameters=self.parameters,
                                             seed=self.seed + index))
@@ -226,7 +233,7 @@ class ActionSelector:
     def scores(self, states: np.ndarray) -> np.ndarray:
         x = self.design(states)
         if self.formulation == "independent_regression":
-            scores = np.column_stack([model.predict(x) for model in self.models])
+            scores = np.column_stack([np.zeros(len(x)) if model is None else model.predict(x) for model in self.models])
         elif self.formulation == "shared_regression":
             scores = self.models[0].predict(x).reshape(-1, len(self.catalog.ids))
         else:
@@ -243,7 +250,7 @@ class ActionSelector:
 
     @property
     def score_kind(self) -> str:
-        return "probability" if self.formulation == "classification" else "action_mae"
+        return "probability" if self.formulation == "classification" else "relative_advantage"
 
     def save(self, path: str | Path) -> None:
         Path(path).write_bytes(pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL))

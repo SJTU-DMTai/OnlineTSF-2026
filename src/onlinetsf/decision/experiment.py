@@ -5,78 +5,38 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
-import io
 import json
 import multiprocessing
 import os
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from contextlib import nullcontext
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
 import numpy as np
 import torch
-import yaml
-from torch.utils.data import DataLoader, Subset
 
-from ..data import load_benchmark_dataset
-from ..factory import build_backbone, build_method
 from ..online import OnlineExecutor
 from .actions import UpdateAction, positive_integer
 from .catalog import ActionCatalog
 from .capabilities import UpdateCapabilities, UpdateUnit
-from .features import DATA_FEATURES, FEEDBACK_FEATURES, StateFeatures
 from .feature_selection import select_state_features
-from .runtime import UpdateController
+from .collection import collect_experiment
 from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, LOG1P_FEATURES, SelectorPolicy, resolve_ema_beta
 from .training import select_temperature
 from .ranking import RANKING_PAIRS, RankingSelector
-
-
-def save_json(path: Path, record) -> None:
-    path.write_text(json.dumps(record, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
-
-
-def rng_state() -> tuple:
-    return torch.get_rng_state(), torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
-
-
-def restore_rng(state: tuple) -> None:
-    torch.set_rng_state(state[0])
-    if state[1]:
-        torch.cuda.set_rng_state_all(state[1])
-
-
-def step_dataset(executor: OnlineExecutor, dataset, index: int, *, final: bool = False):
-    context, target = dataset[index]
-    values = dataset.decision_values
-    decision_context = values[index:index + dataset.context_length] if values is not None else context
-    return executor.step(index, context, target, decision_context=decision_context, final=final)
-
-
-class ProbePolicy:
-    """Capture the same pre-update state seen by deployed selectors."""
-
-    def __init__(self, action: UpdateAction) -> None:
-        self.action = action
-        self.features: dict | None = None
-
-    def __call__(self, state):
-        if self.features is None:
-            self.features = state.features
-        return self.action
+from .rollout import RecordingPolicy, rng_state, restore_rng, step_dataset
+from .preparation import save_json
 
 
 def score_action(source: OnlineExecutor, dataset, origin: int, action: UpdateAction, *,
-                 steps: int = 64, stop: int | None = None) -> tuple[dict, dict]:
-    """Apply one action for `steps` origins when collecting training labels."""
+                 steps: int = 1, stop: int | None = None) -> tuple[dict, dict]:
+    """Fixed-action diagnostics for the separate greedy hindsight baseline."""
     positive_integer(steps, "steps")
     saved_rng = rng_state()
     try:
         branch = copy.deepcopy(source)
-        policy = ProbePolicy(action)
+        policy = RecordingPolicy(action)
         branch.method.policy = policy
         absolute = squared = 0.
         count = 0
@@ -95,193 +55,11 @@ def score_action(source: OnlineExecutor, dataset, origin: int, action: UpdateAct
         restore_rng(saved_rng)
 
 
-def initialize_collection_worker(dataset, threads: int, device: torch.device) -> None:
-    global _collection_dataset
-    _collection_dataset = dataset
-    torch.set_num_threads(threads)
-    if device.type == "cuda":
-        torch.cuda.set_device(device.index if device.index is not None else 0)
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-
-
-def score_action_worker(snapshot: bytes, origin: int, action: UpdateAction, steps: int) -> tuple[dict, dict]:
-    # Bytes avoid sharing mutable model/optimizer CUDA storage between processes.
-    saved = torch.load(io.BytesIO(snapshot), weights_only=False)
-    restore_rng(saved["rng"])
-    return score_action(saved["executor"], _collection_dataset, origin, action, steps=steps)
-
-
-def sample_origins(first_target: int, end_row: int, context: int, horizon: int,
-                   steps: int, count: int) -> list[int]:
-    positive_integer(count, "state count")
-    first, last = first_target - context, end_row - context - steps - horizon + 1
-    if first < 0 or last - first + 1 < count:
-        raise ValueError("historical split is too short for the state count, tau and full forecast horizon")
-    return np.linspace(first, last, count, dtype=np.int64).tolist()
-
-
-def collect_experiment(config: dict, base: Path, output: Path) -> None:
-    """One data set and forecasting method per independently fitted experiment."""
-    print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] collection started", flush=True)
-    seed, threads = config.get("seed", 0), config.get("threads", 1)
-    positive_integer(threads, "threads")
-    torch.set_num_threads(threads)
-    torch.manual_seed(seed)
-    forecast, collection = config["forecast"], config["collection"]
-    resolve_ema_beta(config.get("evaluation", {}).get("ema_beta"), collection.get("tau", 64))
-    workers = collection.get("workers", 1)
-    positive_integer(workers, "collection.workers")
-    profiles = yaml.safe_load((base / forecast["profiles"]).read_text(encoding="utf-8"))["strategies"]
-    profile = profiles[forecast["strategy"]]
-    method_name = profile["method"]["name"]
-    if method_name not in {"onenet", "fsnet", "dsof", "ogd"}:
-        raise ValueError("selector experiments support onenet, fsnet, dsof and ogd")
-    device = torch.device(forecast.get("device", "cpu"))
-    if device.type not in {"cpu", "cuda"}:
-        raise ValueError("device must be cpu or cuda")
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-    data = dict(config["data"])
-    data["path"] = str((base / data["path"]).resolve())
-    if data.get("stride", 1) != 1:
-        raise ValueError("selector experiments require data.stride: 1")
-    dataset = load_benchmark_dataset(**data, keep_decision_inputs=True)
-    fractions = [collection["offline_fraction"], collection["train_end_fraction"]]
-    if not 0 < fractions[0] < fractions[1] < 1:
-        raise ValueError("require 0 < offline < train-end < 1")
-    offline_end, train_end = [int(len(dataset.values) * fraction) for fraction in fractions]
-    train_windows = offline_end - dataset.context_length - dataset.horizon + 1
-    if train_windows <= 0:
-        raise ValueError("offline split is shorter than context plus horizon")
-    for name in ("epochs", "batch_size"):
-        positive_integer(forecast[name], name)
-    # These statistics and the retained high-precision decision inputs fit only the offline prefix.
-    mean = dataset.values[:offline_end].mean(0).numpy()
-    std = dataset.values[:offline_end].std(0, unbiased=False).numpy()
-    std[std < 1e-6] = 1.
-    dataset.standardize(train_windows)
-    model_config = {"data": data, "forecasting": profile["forecasting"], "method": profile["method"],
-                    "online": {"device": str(device)}}
-    method = build_method(model_config, build_backbone(model_config, dataset.num_features,
-                                                      dataset.num_targets, dataset.target_indices))
-    features = StateFeatures(collection.get("feature_window", 32), collection.get("error_window", 128))
-    if hasattr(method, "configure_feature_history"):
-        method.configure_feature_history(features.feature_window, features.error_window)
-    controller = UpdateController(method, UpdateAction(), features=features)
-    catalog = ActionCatalog.load(base / config["actions"], method_name, controller.capabilities)
-    tau = collection.get("tau", 64)
-    positive_integer(tau, "collection.tau")
-    train_origins = sample_origins(offline_end + dataset.horizon, train_end, dataset.context_length,
-                                   dataset.horizon, tau, collection["train_states"])
-    test_start = train_end - dataset.context_length
-    if test_start >= len(dataset):
-        raise ValueError("test split has no complete forecast windows")
-    feature_names = list((*DATA_FEATURES, *FEEDBACK_FEATURES, *method.adaptation_feature_names))
-    output.mkdir(parents=True, exist_ok=False)
-    manifest = {"status": "collecting", "schema_version": 4, "config": config, "tau": tau,
-                "forecast_config": model_config, "data_sha256": hashlib.sha256(Path(data["path"]).read_bytes()).hexdigest(),
-                "catalog": catalog.to_dict(), "feature_names": feature_names,
-                "capabilities": [asdict(unit) for unit in catalog.capabilities.units],
-                "offline_end": offline_end, "train_end": train_end,
-                "train_origins": train_origins, "test_start": test_start,
-                "test_stop": len(dataset), "metric_scale": "offline-standardized numeric channels",
-                "target_mean": mean[list(dataset.target_indices)].tolist(),
-                "target_std": std[list(dataset.target_indices)].tolist(), "target_names": list(dataset.target_names),
-                "gain": "(same-origin same-tau Native MAE - action MAE) / max(Native MAE, 1e-12)",
-                "regression_target": "same-origin same-tau action MAE",
-                "branch_boundary": "nonterminal; no artificial tail-batch completion at tau",
-                "versions": {"torch": torch.__version__, "numpy": np.__version__}}
-    save_json(output / "manifest.json", manifest)
-    began = perf_counter()
-    try:
-        loader = DataLoader(Subset(dataset, range(train_windows)), batch_size=forecast["batch_size"], shuffle=True)
-        for epoch in range(forecast["epochs"]):
-            for context, target in loader:
-                if not np.isfinite(method.train_batch(context, target)):
-                    raise FloatingPointError("nonfinite offline training loss")
-            if hasattr(method, "end_offline_epoch"):
-                method.end_offline_epoch(epoch + 1)
-            print(f"offline epoch {epoch + 1}/{forecast['epochs']}", flush=True)
-        print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] offline training finished", flush=True)
-        if hasattr(method, "reset_online_state"):
-            method.reset_online_state()
-        controller.policy = controller.capabilities.native_action()
-        delay = tuple(range(1, dataset.horizon + 1)) if method.incremental_feedback else dataset.horizon
-        native = OnlineExecutor(controller, feedback_delay=delay)
-        requested = set(train_origins)
-        state_values, gains, maes, origins = [], [], [], []
-        with (ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
-                                  initializer=initialize_collection_worker, initargs=(dataset, threads, device))
-              if workers > 1 else nullcontext()) as pool, \
-                (output / "states.csv").open("w", encoding="utf-8", newline="") as state_file, \
-                (output / "outcomes.csv").open("w", encoding="utf-8", newline="") as outcome_file:
-            state_writer = csv.DictWriter(state_file, fieldnames=["state_id", "origin", *feature_names])
-            outcome_writer = csv.DictWriter(outcome_file, fieldnames=["state_id", "origin", "action_id",
-                                                                     "tau", "target_end_exclusive", "mae", "mse",
-                                                                     "native_mae", "relative_mae_gain"])
-            state_writer.writeheader()
-            outcome_writer.writeheader()
-            for index in range(offline_end - dataset.context_length, test_start):
-                if index in requested:
-                    action_indices = [number for number in range(len(catalog.actions))
-                                      if number not in catalog.native_indices]
-                    jobs = [catalog.capabilities.native_action()]
-                    jobs.extend(catalog.actions[number] for number in action_indices)
-                    if pool is None:
-                        results = [score_action(native, dataset, index, action, steps=tau) for action in jobs]
-                    else:
-                        snapshot = io.BytesIO()
-                        torch.save({"executor": native, "rng": rng_state()}, snapshot)
-                        payload = snapshot.getvalue()
-                        futures = [pool.submit(score_action_worker, payload, index, action, tau) for action in jobs]
-                        results = [future.result() for future in futures]
-                    baseline = results[0][1]
-                    scores = {number: result[1] for number, result in zip(action_indices, results[1:])}
-                    state = results[0][0]
-                    state_id = len(origins)
-                    state_writer.writerow({"state_id": state_id, "origin": index,
-                                           **{name: state[name] for name in feature_names}})
-                    row, mae_row = [], []
-                    for number, (name, action) in enumerate(zip(catalog.ids, catalog.actions)):
-                        score = baseline if number in catalog.native_indices else scores[number]
-                        reference = baseline["mae"]
-                        gain = 0. if number in catalog.native_indices else (reference - score["mae"]) / max(reference, 1e-12)
-                        row.append(gain)
-                        mae_row.append(score["mae"])
-                        outcome_writer.writerow({"state_id": state_id, "origin": index,
-                                                 "action_id": name, "tau": tau,
-                                                 "target_end_exclusive": index + dataset.context_length + tau + dataset.horizon - 1,
-                                                 **score, "native_mae": reference, "relative_mae_gain": gain})
-                    state_values.append([state[name] for name in feature_names])
-                    gains.append(row)
-                    maes.append(mae_row)
-                    origins.append(index)
-                    state_file.flush()
-                    outcome_file.flush()
-                    print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] collected train origin={index}, actions={len(catalog.ids)}", flush=True)
-                step_dataset(native, dataset, index)
-                native._events.clear()
-        np.savez(output / "training.npz", states=np.asarray(state_values, dtype=float),
-                 gains=np.asarray(gains), maes=np.asarray(maes),
-                 origins=np.asarray(origins), label_ends=np.asarray(origins) + tau + dataset.horizon - 1)
-        torch.save({"executor": native, "dataset": dataset, "rng": rng_state()}, output / "evaluation_start.pt")
-        manifest["status"] = "complete"
-    except BaseException as error:
-        manifest.update(status="failed", error=f"{type(error).__name__}: {error}")
-        raise
-    finally:
-        manifest["seconds"] = perf_counter() - began
-        save_json(output / "manifest.json", manifest)
-
-
 def train_experiment(data_directory: Path, output: Path, options: dict | None = None) -> None:
     manifest = json.loads((data_directory / "manifest.json").read_text(encoding="utf-8"))
     if manifest["status"] != "complete":
         raise ValueError("collection must complete before selector training")
-    if manifest["schema_version"] != 4:
+    if manifest["schema_version"] != 5:
         raise ValueError("recollect training data with the current feature schema")
     options = manifest["config"]["selectors"] if options is None else options
     if "formulations" in options or "estimators" in options:
@@ -324,9 +102,9 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
     capabilities = UpdateCapabilities(tuple(UpdateUnit(**row) for row in manifest["capabilities"]))
     catalog = ActionCatalog.from_dict(manifest["catalog"], capabilities)
     with np.load(data_directory / "training.npz") as values:
-        states, gains, maes = values["states"], values["gains"], values["maes"]
+        states, gains, maes = values["states"], values["advantages"], values["maes"]
         origins, label_ends = values["origins"], values["label_ends"]
-    expected_ends = origins + manifest["tau"] + manifest["config"]["data"]["horizon"] - 1
+    expected_ends = origins + manifest["h_act"] + manifest["h_tail"] + manifest["config"]["data"]["horizon"] - 1
     if not np.array_equal(label_ends, expected_ends) or np.any(label_ends + manifest["config"]["data"]["context_length"] > manifest["train_end"]):
         raise ValueError("historical action labels must end before the test split")
     collection_digest = hashlib.sha256((data_directory / "training.npz").read_bytes()).hexdigest()
@@ -399,9 +177,9 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
                            pair_reduction="mean_per_state_then_mean_states", ties="skip_exact",
                            score_kind=selector.score_kind)
             elif formulation == "classification":
-                row.update(target="softmax_negative_mae", temperature=selector.temperature)
+                row.update(target="softmax_negative_regret", temperature=selector.temperature)
             else:
-                row.update(target="action_mae")
+                row.update(target="relative_advantage")
             results.append(row)
             save_json(directory / "metadata.json", {**row, "features": names, "catalog": catalog.to_dict(),
                                                     "action_encoding": catalog.encoding_names,
@@ -420,7 +198,7 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
 
 
 def evaluate_policy(executor: OnlineExecutor, dataset, start: int, stop: int, output: Path,
-                    *, name: str, target_mean: np.ndarray, target_std: np.ndarray) -> dict:
+                    *, name: str, target_mean: np.ndarray, target_std: np.ndarray, terminal: bool = True) -> dict:
     """Persist issued forecasts separately from the later label-arrival clock."""
     if not 0 <= start < stop <= len(dataset):
         raise ValueError("invalid test forecast interval")
@@ -442,7 +220,7 @@ def evaluate_policy(executor: OnlineExecutor, dataset, start: int, stop: int, ou
         writer.writerow(["forecast_index", "raw_context_end_index", "raw_target_start_index", "decision_index",
                          "action_id", "mae", "mse", "original_mae", "original_mse"])
         for offset, index in enumerate(range(start, stop)):
-            prediction = step_dataset(executor, dataset, index, final=index == stop - 1).emission.prediction.double().numpy()
+            prediction = step_dataset(executor, dataset, index, final=terminal and index == stop - 1).emission.prediction.double().numpy()
             if not np.isfinite(prediction).all():
                 raise FloatingPointError(f"nonfinite test prediction at {index}")
             target = dataset[index][1].double().numpy()
@@ -501,7 +279,7 @@ def initialize_evaluation_worker(device: str, threads: int) -> None:
 
 def evaluate_policy_worker(data_directory: Path, manifest: dict, output: Path, name: str, policy) -> dict:
     """Restore a fresh trajectory, including optimizer state, for one policy."""
-    saved = torch.load(data_directory / "evaluation_start.pt", weights_only=False, map_location="cpu")
+    saved = torch.load(data_directory / manifest["prepared_data"] / "evaluation_start.pt", weights_only=False, map_location="cpu")
     executor, dataset = saved["executor"], saved["dataset"]
     method = executor.method.method
     original_device = method.device
@@ -580,7 +358,7 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
     save_json(output / "manifest.json", {"status": "evaluating", "ema_beta": beta})
     try:
         if devices is None:
-            saved = torch.load(data_directory / "evaluation_start.pt", weights_only=False)
+            saved = torch.load(data_directory / manifest["prepared_data"] / "evaluation_start.pt", weights_only=False)
             source, dataset = saved["executor"], saved["dataset"]
             for name, policy in jobs:
                 executor = copy.deepcopy(source)

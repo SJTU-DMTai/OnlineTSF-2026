@@ -13,16 +13,24 @@ forecast:
   epochs: 6
   batch_size: 32
 actions: actions/dsof_manual.yaml
-collection:
-  tau: 64
+split:
   offline_fraction: 0.2
   train_end_fraction: 0.6
-  train_states: 96
+  test_end_fraction: 1.0
+search:
+  stride: 64
+  beam_width: 3
+  sweeps: 3
+  h_tail: 128
+  tail_policy: native
   workers: 4
+collection:
+  h_act: 16
+  train_states: 96
   feature_window: 32
   error_window: 128
 evaluation:
-  ema_beta: null  # null: (tau - 1) / (tau + 1); 0 disables smoothing.
+  ema_beta: null  # null: (h_act - 1) / (h_act + 1); 0 disables smoothing.
 selectors:
   # Only listed pairs are trained and evaluated; remove a line to exclude it.
   models:
