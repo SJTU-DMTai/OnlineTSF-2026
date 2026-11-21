@@ -127,6 +127,10 @@ class OnlineExecutor:
     timing, prequential scoring, metrics, and checkpointable pending state.
     """
 
+    # Isolated rollouts can share read-only feedback tensors and omit events.
+    # Ordinary execution retains defensive copies and complete event records.
+    record_events = True
+
     def __init__(
         self,
         method: OnlineMethod,
@@ -225,7 +229,7 @@ class OnlineExecutor:
         emission = ForecastEmission(
             index=index,
             available_at=emission_available_at,
-            prediction=prediction.clone(),
+            prediction=prediction.clone() if self.record_events else prediction,
         )
         feedback.extend(self._deliver_through(index, context))
         return OnlineStep(emission=emission, feedback=tuple(feedback))
@@ -370,8 +374,8 @@ class OnlineExecutor:
                 order=self._next_pending_order,
                 context=stored_context,
                 target=stored_target,
-                prediction=prediction.clone(),
-                observed_mask=observed_mask.detach().to(device="cpu").clone(),
+                prediction=prediction.clone() if self.record_events else prediction,
+                observed_mask=observed_mask.detach().to(device="cpu"),
             )
             heapq.heappush(self._pending, (pending.available_at, pending.order, pending))
             self._next_pending_order += 1
@@ -380,21 +384,30 @@ class OnlineExecutor:
     def _deliver_through(self, index: int, current_context: Tensor | None = None) -> tuple[FeedbackEvent, ...]:
         pending_batch = []
         method_feedback = []
+        shared_context = None
+        if not self.record_events and self._pending and self._pending[0][0] <= index and current_context is not None:
+            shared_context = current_context.detach().clone()
         while self._pending and self._pending[0][0] <= index:
             _, _, pending = heapq.heappop(self._pending)
             pending_batch.append(pending)
             method_feedback.append(MethodFeedback(
                 index=pending.index, available_at=pending.available_at,
-                context=pending.context.clone(),
+                context=pending.context.clone() if self.record_events else pending.context,
                 target=pending.target.masked_fill(~pending.observed_mask, float("nan")),
-                observed_mask=pending.observed_mask.clone(), prediction=pending.prediction.clone(),
-                current_context=current_context.detach().clone() if current_context is not None else None))
+                observed_mask=pending.observed_mask.clone() if self.record_events else pending.observed_mask,
+                prediction=pending.prediction.clone() if self.record_events else pending.prediction,
+                current_context=(current_context.detach().clone() if current_context is not None else None)
+                if self.record_events else shared_context))
         if method_feedback and hasattr(self.method, "prepare_feedback"):
             self.method.prepare_feedback(tuple(method_feedback))
+        if not self.record_events:
+            for pending, feedback in zip(pending_batch, method_feedback, strict=True):
+                self._consume_feedback(pending, feedback)
+            return ()
         return tuple(self._consume_feedback(pending, feedback)
                      for pending, feedback in zip(pending_batch, method_feedback, strict=True))
 
-    def _consume_feedback(self, pending: _PendingFeedback, feedback: MethodFeedback) -> FeedbackEvent:
+    def _consume_feedback(self, pending: _PendingFeedback, feedback: MethodFeedback) -> FeedbackEvent | None:
         observed_target = feedback.target
         error = pending.prediction[pending.observed_mask] - pending.target[pending.observed_mask]
         absolute_error = error.abs()
@@ -409,6 +422,8 @@ class OnlineExecutor:
         if adaptation_loss is not None:
             self._adaptation_steps += 1
             self._adaptation_loss_sum += adaptation_loss
+        if not self.record_events:
+            return None
         metrics = self.metrics
         event = FeedbackEvent(
             index=pending.index,

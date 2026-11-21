@@ -40,28 +40,40 @@ def evaluate_oracle(data_directory: Path, output: Path, *, split: str = "test",
     save_json(output / "manifest.json", plan)
     torch.save({"executor": source, "rng": state}, output / "start.pt")
     try:
+        native_executor = copy.deepcopy(source)
+        native_executor.method.policy = SequencePolicy(catalog, start, (catalog.native_indices[0],) * (stop - start))
+        restore_rng(state)
+        native_summary = evaluate_policy(
+            native_executor, dataset, start, stop, output / "native", name="native",
+            target_mean=np.asarray(manifest["target_mean"]),
+            target_std=np.asarray(manifest["target_std"]), terminal=plan["terminal"],
+        )
+        del native_executor
+        with (output / "native/forecasts.csv").open(encoding="utf-8", newline="") as handle:
+            native_errors = np.asarray([float(row["mae"]) for row in csv.DictReader(handle)], dtype=np.float64)
         began = perf_counter()
         result = engine.search(source, dataset, start, stop, state,
-                               terminal=stop if plan["terminal"] else None)
+                               terminal=stop if plan["terminal"] else None,
+                               native_errors=native_errors)
         search_seconds = perf_counter() - began
         with (output / "sequence.csv").open("w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["origin", "action_id"])
             writer.writerows((start + offset, catalog.ids[index]) for offset, index in enumerate(result.actions))
-        summaries = []
-        for name, indices, expected in (("native", (catalog.native_indices[0],) * (stop - start), result.native_errors),
-                                         ("oracle", result.actions, result.errors)):
-            executor = copy.deepcopy(source)
-            executor.method.policy = SequencePolicy(catalog, start, indices)
-            restore_rng(state)
-            summary = evaluate_policy(executor, dataset, start, stop, output / name, name=name,
-                                      target_mean=np.asarray(manifest["target_mean"]),
-                                      target_std=np.asarray(manifest["target_std"]), terminal=plan["terminal"])
-            with (output / name / "forecasts.csv").open(encoding="utf-8", newline="") as handle:
-                actual = np.asarray([float(row["mae"]) for row in csv.DictReader(handle)])
-            if not np.allclose(actual, expected, rtol=1e-10, atol=1e-12):
-                raise RuntimeError("persisted sequence differs from searched trajectory")
-            summaries.append(summary)
+        oracle_executor = copy.deepcopy(source)
+        oracle_executor.method.policy = SequencePolicy(catalog, start, result.actions)
+        restore_rng(state)
+        oracle_summary = evaluate_policy(
+            oracle_executor, dataset, start, stop, output / "oracle", name="oracle",
+            target_mean=np.asarray(manifest["target_mean"]),
+            target_std=np.asarray(manifest["target_std"]), terminal=plan["terminal"],
+        )
+        del oracle_executor
+        with (output / "oracle/forecasts.csv").open(encoding="utf-8", newline="") as handle:
+            actual = np.asarray([float(row["mae"]) for row in csv.DictReader(handle)], dtype=np.float64)
+        if not np.allclose(actual, result.errors, rtol=1e-10, atol=1e-12):
+            raise RuntimeError("persisted sequence differs from searched trajectory")
+        summaries = [native_summary, oracle_summary]
         with (output / "comparison.csv").open("w", encoding="utf-8", newline="") as handle:
             fields = [key for key, value in summaries[0].items() if not isinstance(value, list)]
             writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")

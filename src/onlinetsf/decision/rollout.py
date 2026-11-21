@@ -31,6 +31,8 @@ def step_dataset(executor, dataset, index: int, *, final: bool = False):
 
 @dataclass
 class SequencePolicy:
+    needs_features = False
+
     catalog: ActionCatalog
     start: int
     indices: tuple[int, ...]
@@ -46,6 +48,10 @@ class RecordingPolicy:
     action: object
     features: dict | None = None
 
+    @property
+    def needs_features(self) -> bool:
+        return self.features is None
+
     def __call__(self, state):
         if self.features is None:
             self.features = state.features
@@ -53,16 +59,20 @@ class RecordingPolicy:
 
 
 def advance(executor, dataset, start: int, stop: int, policy, random_state: tuple, *,
-            terminal: int | None = None) -> tuple[np.ndarray, tuple]:
+            terminal: int | None = None, error_limit: float | None = None,
+            error_offset: float = 0.) -> tuple[np.ndarray, tuple]:
     """Advance an owned snapshot; restore the caller RNG even on failure.
 
     Only the real end of the experiment completes tail batches. Search and
     training-label boundaries are nonterminal unless they coincide with it.
+    A finite error limit may stop a nonnegative-MAE rollout early. The returned
+    vector then contains only executed origins; its state must be discarded.
     """
     saved = rng_state()
     restore_rng(random_state)
     executor.method.policy = policy
-    errors = []
+    errors = np.zeros(stop - start, dtype=np.float64)
+    completed = 0
     try:
         for index in range(start, stop):
             final = terminal is not None and index == terminal - 1
@@ -70,9 +80,15 @@ def advance(executor, dataset, start: int, stop: int, policy, random_state: tupl
             error = (prediction - dataset[index][1].double()).abs().mean().item()
             if not np.isfinite(error):
                 raise FloatingPointError(f"nonfinite forecast at origin {index}")
-            errors.append(error)
+            errors[completed] = error
+            completed += 1
             executor._events.clear()
-        return np.asarray(errors, dtype=np.float64), rng_state()
+            # Sum the full zero-padded vector, using exactly the final reduction
+            # shape. Its result is monotone as nonnegative entries arrive, unlike
+            # a running sum whose rounding could incorrectly prune a near tie.
+            if error_limit is not None and error_offset + float(errors.sum()) > error_limit:
+                break
+        return errors[:completed], rng_state()
     finally:
         restore_rng(saved)
 

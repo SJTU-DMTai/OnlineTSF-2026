@@ -140,11 +140,17 @@ def load_interval(directory: Path, *, split: str = "test", start_row: int | None
         raise ValueError("search target rows must lie after offline training and within test_end")
     if split == "history" and last > manifest["train_end"]:
         raise ValueError("history search cannot access labels past train_end")
-    saved = torch.load(directory / "online_start.pt", weights_only=False)
+    checkpoint = ("evaluation_start.pt"
+                  if first >= manifest["train_end"] and (directory / "evaluation_start.pt").exists()
+                  else "online_start.pt")
+    saved = torch.load(directory / checkpoint, weights_only=False)
     dataset, executor = saved["dataset"], saved["executor"]
     start, stop = first - dataset.context_length, last - dataset.context_length - dataset.horizon + 1
     if stop <= start:
         raise ValueError("interval needs at least one complete forecast window")
-    _, state = advance(executor, dataset, manifest["online_start"], start,
-                       executor.method.capabilities.native_action(), saved["rng"])
+    prefix_start = manifest["test_start"] if checkpoint == "evaluation_start.pt" else manifest["online_start"]
+    state = saved["rng"]
+    if start > prefix_start:
+        _, state = advance(executor, dataset, prefix_start, start,
+                           executor.method.capabilities.native_action(), state)
     return manifest, executor, dataset, start, stop, state

@@ -19,7 +19,7 @@ split:
   test_end_fraction: 1.0
 search:
   stride: 64
-  beam_width: 3
+  beam_width: 4
   sweeps: 3
   h_tail: 128
   tail_policy: native

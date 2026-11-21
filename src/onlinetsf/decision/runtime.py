@@ -34,6 +34,8 @@ class UpdateController:
     ``policy(state)`` is called once on every data clock.
     """
 
+    measure_updates = True
+
     def __init__(self, method, policy: UpdateAction | Callable[[DecisionState], UpdateAction], *, features=None) -> None:
         self.method = method
         self.adapter = build_adapter(method)
@@ -87,10 +89,14 @@ class UpdateController:
         if self.last_decided_index == self.index:
             return
         began = perf_counter()
-        state = DecisionState(self.index, self.context.clone(), feedback,
-                              self.capabilities, self.action, dict(self.schedule.counts),
-                              self.features.snapshot(self.method) if self.features is not None else {})
-        action = self.policy if isinstance(self.policy, UpdateAction) else self.policy(state)
+        if isinstance(self.policy, UpdateAction):
+            action = self.policy
+        else:
+            features = (self.features.snapshot(self.method)
+                        if self.features is not None and getattr(self.policy, "needs_features", True) else {})
+            state = DecisionState(self.index, self.context.clone(), feedback,
+                                  self.capabilities, self.action, dict(self.schedule.counts), features)
+            action = self.policy(state)
         if not isinstance(action, UpdateAction):
             raise TypeError("policy must return an UpdateAction")
         self.capabilities.validate(action)
@@ -123,15 +129,21 @@ class UpdateController:
         if feedback.current_context is None:
             return None
         due = frozenset(name for name in prepared.opportunities if self.schedule.due(name))
-        self._synchronize()
-        began = perf_counter()
+        if not due:
+            self.method.last_gradient_steps = self.method.last_egd_steps = 0
+            return None
+        began = None
+        if self.measure_updates:
+            self._synchronize()
+            began = perf_counter()
         loss = self.adapter.apply(prepared, due, self.schedule)
         self._record_update(began)
         return loss
 
-    def _record_update(self, began: float) -> None:
-        self._synchronize()
-        self.update_seconds += perf_counter() - began
+    def _record_update(self, began: float | None) -> None:
+        if began is not None:
+            self._synchronize()
+            self.update_seconds += perf_counter() - began
         self.gradient_steps += self.method.last_gradient_steps
         self.egd_steps += self.method.last_egd_steps
         if self.method.last_gradient_steps and self._gradient_clock != self.index:
@@ -143,8 +155,10 @@ class UpdateController:
         names = [unit.name for unit in self.capabilities.units if unit.name in units and pending.get(unit.name)]
         if not names:
             return
-        self._synchronize()
-        began = perf_counter()
+        began = None
+        if self.measure_updates:
+            self._synchronize()
+            began = perf_counter()
         self.adapter.apply_batches(self.adapter.batches.take(names), self.schedule)
         for name in names:
             self.schedule.counts[name] = 0
