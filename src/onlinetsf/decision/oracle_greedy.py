@@ -1,4 +1,4 @@
-"""Per-origin hindsight Oracles over the current update-action catalog."""
+"""Fixed-stride hindsight Oracles over the current update-action catalog."""
 
 from __future__ import annotations
 
@@ -14,10 +14,11 @@ from ..online import OnlineExecutor
 from .catalog import ActionCatalog
 from .experiment import evaluate_policy, restore_rng, save_json, score_action
 from .selector import resolve_ema_beta
+from .actions import positive_integer
 
 
 class GreedyOracleExecutor:
-    """Select before each data clock, then let the ordinary executor train causally.
+    """Select once per segment, then let the ordinary executor train causally.
 
     Every candidate starts from the same pre-observation state and RNG. Search
     rolls back its branches; the winner is executed again on the real trajectory.
@@ -25,8 +26,12 @@ class GreedyOracleExecutor:
     """
 
     def __init__(self, executor: OnlineExecutor, dataset, catalog: ActionCatalog, stop: int,
-                 *, ema_beta: float | None = None, terminal: bool = True) -> None:
+                 *, ema_beta: float | None = None, terminal: bool = True, stride: int = 1) -> None:
+        positive_integer(stride, "stride")
         self.executor, self.dataset, self.catalog, self.stop = executor, dataset, catalog, stop
+        self.stride = stride
+        self.segment_start = self.segment_stop = -1
+        self.segment_action_id = None
         self.terminal = terminal
         self.method = executor.method
         self._events = executor._events
@@ -36,11 +41,17 @@ class GreedyOracleExecutor:
         self.candidate_evaluations = 0
 
     def step(self, index, context, target, *, decision_context=None, final=False):
+        if index < self.segment_stop:
+            result = self.executor.step(index, context, target, decision_context=decision_context, final=final)
+            self.method.last_decision.update(action_id=self.segment_action_id,
+                                             segment_start=self.segment_start, segment_stop=self.segment_stop)
+            return result
         began = perf_counter()
         outcomes = []
+        steps = min(self.stride, self.stop - index)
         for name, action in zip(self.catalog.ids, self.catalog.actions):
-            features, score = score_action(self.executor, self.dataset, index, action, steps=1, stop=self.stop if self.terminal else None)
-            outcomes.append({"action_id": name, "scored_steps": 1, **score})
+            features, score = score_action(self.executor, self.dataset, index, action, steps=steps, stop=self.stop if self.terminal else None)
+            outcomes.append({"action_id": name, "scored_steps": steps, **score})
         losses = np.asarray([row["mae"] for row in outcomes])
         if self.beta is not None:
             self.smoothed_maes = (losses.copy() if self.smoothed_maes is None else
@@ -54,8 +65,11 @@ class GreedyOracleExecutor:
         self.candidate_evaluations += len(outcomes)
         action = self.catalog.actions[chosen]
         self.method.policy = action
+        self.segment_start, self.segment_stop = index, index + steps
+        self.segment_action_id = self.catalog.ids[chosen]
         selection = {"action_id": self.catalog.ids[chosen],
-                     "score_kind": "current_mae" if self.beta is None else "ema_current_mae",
+                     "score_kind": ("current_mae" if self.stride == 1 else "segment_mae") if self.beta is None else "ema_current_mae",
+                     "segment_start": self.segment_start, "segment_stop": self.segment_stop,
                      "features": features, "ema_beta": self.beta,
                      "selected_current_mae": outcomes[chosen]["mae"],
                      "selected_ema_mae": outcomes[chosen]["ema_mae"],
@@ -64,6 +78,9 @@ class GreedyOracleExecutor:
                      "candidate_search_seconds": seconds, "candidate_outcomes": outcomes}
         result = self.executor.step(index, context, target, decision_context=decision_context, final=final)
         self.method.last_decision.update(selection)
+        if self.stride > 1:
+            print(f"greedy segment [{index}, {self.segment_stop}): action={self.segment_action_id} "
+                  f"mae={outcomes[chosen]['mae']:.8f}", flush=True)
         return result
 
     def flush(self):

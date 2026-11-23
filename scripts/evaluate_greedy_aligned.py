@@ -1,4 +1,4 @@
-"""Evaluate the one-origin greedy Oracle from a saved beam experiment's snapshot."""
+"""Evaluate a fixed-stride greedy Oracle from a saved beam experiment's snapshot."""
 
 import argparse
 import copy
@@ -24,11 +24,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--stride", type=int, default=1, help="origins per greedy segment; score each candidate over the whole segment")
     parser.add_argument("--check-only", action="store_true", help="check alignment without loading snapshots or running forecasts")
     parser.add_argument("--device", choices=("cuda:0", "cpu"), default="cuda:0",
                         help="use CUDA_VISIBLE_DEVICES=2 with cuda:0 to select physical GPU 2")
     parser.add_argument("--max-origins", type=int, help="short smoke run only; omit for the aligned full interval")
     args = parser.parse_args()
+    if args.stride <= 0:
+        raise ValueError("stride must be positive")
     matches = list(args.run_root.resolve().glob("**/dsof/oracle_online_beam4/manifest.json"))
     if len(matches) != 1:
         raise ValueError("run-root must contain exactly one dsof/oracle_online_beam4/manifest.json")
@@ -65,7 +68,7 @@ def main() -> None:
             raise ValueError("max-origins must be positive")
         stop = min(stop, start + args.max_origins)
     full_interval = stop == reference["stop"]
-    plan = {"status": "checked", "kind": "aligned_greedy_oracle",
+    plan = {"status": "checked", "kind": "aligned_greedy_oracle", "stride": args.stride,
             "reference": str(reference_dir), "prepared_data": str(prepared_dir),
             "prepared_sha256": reference["prepared_sha256"], "catalog": reference["catalog"],
             "split": reference["split"], "start": start, "stop": stop,
@@ -74,7 +77,7 @@ def main() -> None:
                               + prepared["config"]["data"]["horizon"] - 1,
             "full_reference_interval": full_interval,
             "terminal": reference["terminal"] and full_interval,
-            "selection": "minimum current-window MAE at every forecast origin; no EMA",
+            "selection": "minimum segment mean MAE; hold configuration for the whole segment; no EMA or tail lookahead",
             "uses_future_labels_for_selection": True, "device": args.device}
     print(json.dumps({**plan, "catalog": {"action_count": len(plan["catalog"]["actions"])}},
                      ensure_ascii=False, indent=2), flush=True)
@@ -137,12 +140,12 @@ def main() -> None:
         print(f"Native aligned: {differences}. Starting greedy Oracle ({stop - start} origins)...", flush=True)
         restore_rng(state)
         oracle = GreedyOracleExecutor(copy.deepcopy(source), dataset, catalog, stop,
-                                      ema_beta=None, terminal=plan["terminal"])
+                                      ema_beta=None, terminal=plan["terminal"], stride=args.stride)
         summary = evaluate_policy(oracle, dataset, start, stop, args.output / "oracle_greedy",
-                                  name="oracle_greedy", target_mean=np.asarray(prepared["target_mean"]),
+                                  name=f"oracle_greedy_stride{args.stride}", target_mean=np.asarray(prepared["target_mean"]),
                                   target_std=np.asarray(prepared["target_std"]), terminal=plan["terminal"])
         summary.update(candidate_search_seconds=oracle.candidate_search_seconds,
-                       candidate_evaluations=oracle.candidate_evaluations)
+                       candidate_evaluations=oracle.candidate_evaluations, stride=args.stride)
         save_json(args.output / "oracle_greedy/summary.json", summary)
         summaries.append(summary)
         if full_interval:
