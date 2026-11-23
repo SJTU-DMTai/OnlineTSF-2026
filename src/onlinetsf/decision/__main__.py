@@ -35,6 +35,8 @@ def main(argv=None) -> None:
             command.add_argument("--h-tail", type=int)
             command.add_argument("--sweeps", type=int)
             command.add_argument("--workers", type=int)
+            command.add_argument("--profile", action="store_true",
+                                 help="write buffered wall-clock diagnostics to output/profile.jsonl (no added CUDA sync)")
         else:
             command.add_argument("--ema-beta", type=float)
     collect = commands.add_parser("collect")
@@ -72,7 +74,7 @@ def main(argv=None) -> None:
         search = {name: getattr(args, name) for name in ("stride", "beam_width", "h_tail", "sweeps", "workers")
                   if getattr(args, name) is not None}
         evaluate_oracle(args.data, args.output, split=args.split, start_row=args.start_row,
-                        end_row=args.end_row, search=search)
+                        end_row=args.end_row, search=search, profile=args.profile)
     elif args.command == "oracle_greedy":
         evaluate_greedy_oracle(args.data, args.output, split=args.split, start_row=args.start_row,
                                end_row=args.end_row, ema_beta=args.ema_beta)
