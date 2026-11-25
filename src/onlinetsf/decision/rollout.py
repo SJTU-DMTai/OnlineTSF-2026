@@ -31,14 +31,22 @@ def step_dataset(executor, dataset, index: int, *, final: bool = False):
 
 @dataclass
 class SequencePolicy:
-    needs_features = False
-
     catalog: ActionCatalog
     start: int
     indices: tuple[int, ...]
+    record_origins: frozenset[int] = frozenset()
+
+    def __post_init__(self) -> None:
+        self.record_origins = frozenset(self.record_origins)
+        self.recorded_features: dict[int, dict[str, float | None]] = {}
+
+    def needs_features(self, index: int) -> bool:
+        return index in self.record_origins
 
     def __call__(self, state):
         index = self.indices[state.index - self.start]
+        if state.index in self.record_origins:
+            self.recorded_features[state.index] = dict(state.features)
         self.last_selection = {"action_id": self.catalog.ids[index]}
         return self.catalog.actions[index]
 

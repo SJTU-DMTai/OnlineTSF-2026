@@ -19,15 +19,15 @@ split:
   train_end_fraction: 0.6
   test_end_fraction: 1.0
 search:
-  stride: 64
+  k: [64, 32, 16]
   beam_width: 4
-  sweeps: 1
   h_tail: 128
   tail_policy: native
   workers: 4
 collection:
-  h_act: 16
-  train_states: 96  # Number of sampled decision origins; evaluate every candidate at each origin.
+  mode: reuse
+  train_states: null  # null: keep all complete winning-round segments; integer N subsamples N segments.
+  anchor_epsilon: 0.0  # Nonnegative margin for teacher-anchored cost; null disables anchoring.
   feature_window: 32
   error_window: 128
 evaluation:

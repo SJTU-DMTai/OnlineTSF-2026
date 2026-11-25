@@ -3,17 +3,21 @@
 import argparse
 import csv
 import hashlib
+import io
 import json
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+import torch
+
 from onlinetsf.decision.actions import UpdateAction
 from onlinetsf.decision.experiment import (
     evaluate_policy_worker, initialize_evaluation_worker, save_json,
 )
 from onlinetsf.decision.selector import ActionSelector, SelectorPolicy, resolve_ema_beta
+from onlinetsf.decision.preparation import load_interval
 
 
 if __name__ == "__main__":
@@ -72,10 +76,16 @@ if __name__ == "__main__":
     save_json(output / "manifest.json", {"status": "evaluating", "ema_beta": beta,
                                          "results": list(summaries.values())})
     if pending_jobs:
+        torch.set_num_threads(manifest["config"].get("threads", 1))
+        _, source, dataset, _, _, state = load_interval(data / manifest["prepared_data"], split="test")
+        buffer = io.BytesIO()
+        torch.save({"executor": source, "dataset": dataset, "rng": state}, buffer)
+        snapshot = buffer.getvalue()
+        del buffer, source, dataset
         with ProcessPoolExecutor(max_workers=args.workers, mp_context=multiprocessing.get_context("spawn"),
                                  initializer=initialize_evaluation_worker,
-                                 initargs=(args.device, manifest["config"].get("threads", 1))) as pool:
-            futures = [pool.submit(evaluate_policy_worker, data, manifest, output, name, policy)
+                                 initargs=(args.device, manifest["config"].get("threads", 1), snapshot)) as pool:
+            futures = [pool.submit(evaluate_policy_worker, manifest, output, name, policy)
                        for name, policy in pending_jobs]
             for future in as_completed(futures):
                 summary = future.result()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import csv
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -26,7 +27,7 @@ from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, LOG1P_FEATURES, 
 from .training import select_temperature
 from .ranking import RANKING_PAIRS, RankingSelector
 from .rollout import RecordingPolicy, rng_state, restore_rng, step_dataset
-from .preparation import save_json
+from .preparation import load_interval, save_json
 
 
 def score_action(source: OnlineExecutor, dataset, origin: int, action: UpdateAction, *,
@@ -263,9 +264,10 @@ def evaluate_policy(executor: OnlineExecutor, dataset, start: int, stop: int, ou
     return summary
 
 
-def initialize_evaluation_worker(device: str, threads: int) -> None:
+def initialize_evaluation_worker(device: str, threads: int, snapshot: bytes) -> None:
     """Give each evaluation process one physical GPU and a private CUDA context."""
-    global _evaluation_device, _evaluation_device_name
+    global _evaluation_device, _evaluation_device_name, _evaluation_snapshot
+    _evaluation_snapshot = snapshot
     requested = torch.device(device)
     _evaluation_device_name = device
     os.environ["CUDA_VISIBLE_DEVICES"] = str(requested.index) if requested.type == "cuda" else ""
@@ -277,9 +279,9 @@ def initialize_evaluation_worker(device: str, threads: int) -> None:
         torch.backends.cudnn.deterministic = True
 
 
-def evaluate_policy_worker(data_directory: Path, manifest: dict, output: Path, name: str, policy) -> dict:
+def evaluate_policy_worker(manifest: dict, output: Path, name: str, policy) -> dict:
     """Restore a fresh trajectory, including optimizer state, for one policy."""
-    saved = torch.load(data_directory / manifest["prepared_data"] / "evaluation_start.pt", weights_only=False, map_location="cpu")
+    saved = torch.load(io.BytesIO(_evaluation_snapshot), weights_only=False, map_location="cpu")
     executor, dataset = saved["executor"], saved["dataset"]
     method = executor.method.method
     original_device = method.device
@@ -357,13 +359,14 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
     summaries = []
     save_json(output / "manifest.json", {"status": "evaluating", "ema_beta": beta})
     try:
+        # Warm the Native prefix once, only when evaluation is requested. All
+        # policies branch from this in-memory state; no extra checkpoint is written.
+        _, source, dataset, _, _, state = load_interval(data_directory / manifest["prepared_data"], split="test")
         if devices is None:
-            saved = torch.load(data_directory / manifest["prepared_data"] / "evaluation_start.pt", weights_only=False)
-            source, dataset = saved["executor"], saved["dataset"]
             for name, policy in jobs:
                 executor = copy.deepcopy(source)
                 executor.method.policy = policy
-                restore_rng(saved["rng"])
+                restore_rng(state)
                 summaries.append(evaluate_policy(executor, dataset, manifest["test_start"], manifest["test_stop"],
                                                  output / name, name=name,
                                                  target_mean=np.asarray(manifest["target_mean"]),
@@ -371,19 +374,23 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
                 print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] tested {name}: MAE={summaries[-1]['mae']:.6f}", flush=True)
                 del executor
         else:
+            buffer = io.BytesIO()
+            torch.save({"executor": source, "dataset": dataset, "rng": state}, buffer)
+            snapshot = buffer.getvalue()
+            del buffer, source, dataset
             pools, pending = [], {}
             remaining = iter(jobs)
             try:
                 for device, count in zip(devices, workers_per_device):
                     pool = ProcessPoolExecutor(max_workers=count, mp_context=multiprocessing.get_context("spawn"),
                                                initializer=initialize_evaluation_worker,
-                                               initargs=(device, manifest["config"].get("threads", 1)))
+                                               initargs=(device, manifest["config"].get("threads", 1), snapshot))
                     pools.append(pool)
                     for _ in range(count):
                         job = next(remaining, None)
                         if job is not None:
                             name, policy = job
-                            pending[pool.submit(evaluate_policy_worker, data_directory, manifest, output, name, policy)] = pool
+                            pending[pool.submit(evaluate_policy_worker, manifest, output, name, policy)] = pool
                 while pending:
                     completed, _ = wait(pending, return_when=FIRST_COMPLETED)
                     for future in completed:
@@ -394,7 +401,7 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
                         job = next(remaining, None)
                         if job is not None:
                             name, policy = job
-                            pending[pool.submit(evaluate_policy_worker, data_directory, manifest, output, name, policy)] = pool
+                            pending[pool.submit(evaluate_policy_worker, manifest, output, name, policy)] = pool
             finally:
                 for future in pending:
                     future.cancel()

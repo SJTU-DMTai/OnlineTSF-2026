@@ -18,15 +18,15 @@ split:
   train_end_fraction: 0.6
   test_end_fraction: 1.0
 search:
-  stride: 64
+  k: [64, 32, 16]
   beam_width: 4
-  sweeps: 3
   h_tail: 128
   tail_policy: native
   workers: 4
 collection:
-  h_act: 16
-  train_states: 96
+  mode: reuse
+  train_states: null
+  anchor_epsilon: 0.0
   feature_window: 32
   error_window: 128
 evaluation:

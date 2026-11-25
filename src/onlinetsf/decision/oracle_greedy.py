@@ -15,6 +15,7 @@ from .catalog import ActionCatalog
 from .experiment import evaluate_policy, restore_rng, save_json, score_action
 from .selector import resolve_ema_beta
 from .actions import positive_integer
+from .search_schedule import resolve_search_schedule
 
 
 class GreedyOracleExecutor:
@@ -95,10 +96,13 @@ def evaluate_greedy_oracle(data_directory: Path, output: Path, *, split: str = "
 
     manifest, source, dataset, start, stop, state = load_interval(
         data_directory, split=split, start_row=start_row, end_row=end_row)
+    search = manifest["config"].get("search", {})
+    collection = manifest["config"].get("collection", {})
+    finest_k, finest_tail = resolve_search_schedule(
+        **{name: search[name] for name in ("k", "k_max", "k_min", "h_tail") if name in search})[-1]
     beta = resolve_ema_beta(ema_beta if ema_beta is not None else
                             manifest["config"].get("evaluation", {}).get("ema_beta"),
-                            manifest["config"].get("collection", {}).get("h_act", 1)
-                            + manifest["config"].get("search", {}).get("h_tail", 128))
+                            collection.get("h_act", finest_k) + collection.get("h_tail", finest_tail))
     catalog = ActionCatalog.from_dict(manifest["catalog"], source.method.capabilities)
     torch.set_num_threads(manifest["config"].get("threads", 1))
     output.mkdir(parents=True, exist_ok=False)

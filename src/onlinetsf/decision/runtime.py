@@ -92,8 +92,10 @@ class UpdateController:
         if isinstance(self.policy, UpdateAction):
             action = self.policy
         else:
-            features = (self.features.snapshot(self.method)
-                        if self.features is not None and getattr(self.policy, "needs_features", True) else {})
+            needs_features = getattr(self.policy, "needs_features", True)
+            if callable(needs_features):
+                needs_features = needs_features(self.index)
+            features = self.features.snapshot(self.method) if self.features is not None and needs_features else {}
             state = DecisionState(self.index, self.context.clone(), feedback,
                                   self.capabilities, self.action, dict(self.schedule.counts), features)
             action = self.policy(state)
@@ -118,10 +120,6 @@ class UpdateController:
             self.last_decision.update(selection)
         self.decision_seconds += perf_counter() - began
 
-    def _synchronize(self) -> None:
-        if self.method.device.type == "cuda":
-            torch.cuda.synchronize(self.method.device)
-
     def on_feedback(self, feedback: MethodFeedback) -> float | None:
         if not self.prepared or self.prepared[0].feedback is not feedback:
             raise RuntimeError("feedback must be prepared as a batch before execution")
@@ -134,7 +132,6 @@ class UpdateController:
             return None
         began = None
         if self.measure_updates:
-            self._synchronize()
             began = perf_counter()
         loss = self.adapter.apply(prepared, due, self.schedule)
         self._record_update(began)
@@ -142,7 +139,6 @@ class UpdateController:
 
     def _record_update(self, began: float | None) -> None:
         if began is not None:
-            self._synchronize()
             self.update_seconds += perf_counter() - began
         self.gradient_steps += self.method.last_gradient_steps
         self.egd_steps += self.method.last_egd_steps
@@ -157,7 +153,6 @@ class UpdateController:
             return
         began = None
         if self.measure_updates:
-            self._synchronize()
             began = perf_counter()
         self.adapter.apply_batches(self.adapter.batches.take(names), self.schedule)
         for name in names:
