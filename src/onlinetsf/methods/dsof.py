@@ -31,6 +31,7 @@ class DSOFModel(nn.Module):
         self.teacher = teacher
         self.horizon = horizon
         self.target_indices = target_indices
+        self.student_dropout = student_dropout
         layers: list[nn.Module] = [nn.Linear(context_length + horizon, student_hidden)]
         for _ in range(student_depth - 2):
             layers.extend((nn.Identity(), nn.Dropout(student_dropout), nn.Linear(student_hidden, student_hidden)))
@@ -47,6 +48,78 @@ class DSOFModel(nn.Module):
         return teacher_prediction + self.residual(context, teacher_prediction)
 
 
+class DSOFReplayBuffer:
+    """Fixed-capacity contiguous ring buffer for DSOF replay windows."""
+
+    def __init__(self, maxlen: int, device: torch.device | None = None) -> None:
+        self.maxlen = maxlen
+        self._device = device
+        self._contexts: Tensor | None = None
+        self._targets: Tensor | None = None
+        self._size = 0
+        self._head = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+        if index < 0:
+            index += self._size
+        if not 0 <= index < self._size:
+            raise IndexError("replay buffer index out of range")
+        pos = (self._head + index) % self.maxlen
+        return self._contexts[pos].cpu(), self._targets[pos].cpu()
+
+    def append(self, item: tuple[Tensor, Tensor]) -> None:
+        context, target = item
+        if self._contexts is None:
+            device = self._device if self._device is not None else context.device
+            self._contexts = torch.empty((self.maxlen, *context.shape), dtype=context.dtype, device=device)
+            self._targets = torch.empty((self.maxlen, *target.shape), dtype=target.dtype, device=device)
+        if self._size < self.maxlen:
+            pos = self._size
+            self._size += 1
+        else:
+            pos = self._head
+            self._head = (self._head + 1) % self.maxlen
+        self._contexts[pos].copy_(context)
+        self._targets[pos].copy_(target)
+
+    def sample_batch(self, indices: Tensor, device: torch.device) -> tuple[Tensor, Tensor]:
+        if self._contexts.device != device:
+            self._contexts = self._contexts.to(device)
+            self._targets = self._targets.to(device)
+            self._device = device
+        pos = (self._head + indices) % self.maxlen if self._head else indices
+        if device.type != "cpu":
+            pos = pos.to(device)
+        return self._contexts.index_select(0, pos), self._targets.index_select(0, pos)
+
+    def clear(self) -> None:
+        self._size = 0
+        self._head = 0
+        self._contexts = None
+        self._targets = None
+
+    def __deepcopy__(self, memo: dict) -> DSOFReplayBuffer:
+        cloned = object.__new__(DSOFReplayBuffer)
+        cloned.maxlen = self.maxlen
+        cloned._device = self._device
+        cloned._size = self._size
+        cloned._head = self._head
+        cloned._contexts = None if self._contexts is None else self._contexts.clone()
+        cloned._targets = None if self._targets is None else self._targets.clone()
+        memo[id(self)] = cloned
+        return cloned
+
+    @classmethod
+    def from_iterable(cls, items, maxlen: int, device: torch.device | None = None) -> DSOFReplayBuffer:
+        buf = cls(maxlen, device=device)
+        for item in items:
+            buf.append(item)
+        return buf
+
+
 class DSOFMethod:
     """Replay complete windows, then adapt the student from one-step TD labels."""
 
@@ -55,6 +128,8 @@ class DSOFMethod:
     incremental_feedback = True
     adaptation_feature_names = ("teacher_fast_error_ratio", "student_correction_gain")
     last_egd_steps = 0
+    record_diagnostics = True
+    _discount_weights: Tensor | None = None
 
     def __init__(
         self,
@@ -94,11 +169,12 @@ class DSOFMethod:
         self.teacher_optimizer = torch.optim.AdamW(model.teacher.parameters(), lr=learning_rate, amsgrad=True)
         self.student_optimizer = torch.optim.AdamW(model.student.parameters(), lr=student_learning_rate, amsgrad=True)
         self.online_optimizer = torch.optim.AdamW(model.student.parameters(), lr=online_learning_rate, amsgrad=True)
-        self.replay: deque[tuple[Tensor, Tensor]] = deque(maxlen=replay_buffer_size)
+        self.replay: DSOFReplayBuffer = DSOFReplayBuffer(replay_buffer_size, device=self.device)
         self.replay_batch_size = replay_batch_size
         self.replay_epochs = replay_epochs
         self.replay_frequency = replay_frequency
         self.discount = discount
+        self._discount_weights: Tensor | None = None
         self._complete_count = 0
         self._partial: dict[int, tuple[Tensor, Tensor]] = {}
         self.last_gradient_steps = 0
@@ -120,10 +196,11 @@ class DSOFMethod:
             values = context.unsqueeze(0).to(self.device)
             teacher = self.model.teacher(values)
             prediction = teacher + self.model.residual(values, teacher)
-        cached = teacher.squeeze(0).detach().cpu().clone()
-        self._pending_teacher_predictions.append(cached)
-        self._latest_teacher_prediction = cached
-        self._latest_first_step_observed = False
+        if self.record_diagnostics:
+            cached = teacher.squeeze(0).detach().cpu().clone()
+            self._pending_teacher_predictions.append(cached)
+            self._latest_teacher_prediction = cached
+            self._latest_first_step_observed = False
         return prediction.squeeze(0)
 
     def discard_feedback(self, feedback: MethodFeedback) -> None:
@@ -157,6 +234,8 @@ class DSOFMethod:
 
     def _record_forecast_feedback(self, feedback: MethodFeedback) -> None:
         """Score immutable issued forecasts, including frozen and terminal labels."""
+        if not self.record_diagnostics:
+            return
         record = self._diagnostic_partial.pop(feedback.index, None)
         if record is None:
             record = self._pending_teacher_predictions.popleft(), 0.0, 0.0, 0
@@ -195,28 +274,37 @@ class DSOFMethod:
 
     def _supervised_update(self, context: Tensor, target: Tensor,
                            groups: frozenset[str] = frozenset({"teacher", "student"}),
-                           *, offline: bool = False) -> float:
+                           *, offline: bool = False, return_loss: bool = True) -> float | None:
         teacher_optimizer = self.offline_teacher_optimizer if offline else self.teacher_optimizer
         student_optimizer = self.offline_student_optimizer if offline else self.student_optimizer
         self.model.train()
         with torch.set_grad_enabled("teacher" in groups):
             teacher_prediction = self.model.teacher(context)
-        final_prediction = teacher_prediction.detach() + self.model.residual(context, teacher_prediction)
-        teacher_loss = (teacher_prediction - target).square().mean()
-        student_loss = (final_prediction - target).square().mean()
-        teacher_optimizer.zero_grad(set_to_none=True)
-        student_optimizer.zero_grad(set_to_none=True)
         if "teacher" in groups:
+            teacher_optimizer.zero_grad(set_to_none=True)
+            teacher_loss = (teacher_prediction - target).square().mean()
             teacher_loss.backward()
             teacher_optimizer.step()
             self.last_gradient_steps += 1
+        student_loss = None
+        if "student" in groups or return_loss or getattr(self.model, "student_dropout", 0.0) > 0:
+            with torch.set_grad_enabled("student" in groups):
+                final_prediction = teacher_prediction.detach() + self.model.residual(context, teacher_prediction)
+                student_loss = (final_prediction - target).square().mean()
         if "student" in groups:
+            student_optimizer.zero_grad(set_to_none=True)
             student_loss.backward()
             student_optimizer.step()
             self.last_gradient_steps += 1
-        return student_loss.detach().item()
+        return student_loss.detach().item() if return_loss else None
 
-    def _replay_update(self, groups: frozenset[str] = frozenset({"teacher", "student"})) -> float | None:
+    def _sample_replay(self, indices: Tensor) -> tuple[Tensor, Tensor]:
+        if not isinstance(self.replay, DSOFReplayBuffer):
+            self.replay = DSOFReplayBuffer.from_iterable(self.replay, self.replay.maxlen, device=self.device)
+        return self.replay.sample_batch(indices, self.device)
+
+    def _replay_update(self, groups: frozenset[str] = frozenset({"teacher", "student"}),
+                       *, return_loss: bool = True) -> float | None:
         if len(self.replay) < self.replay_batch_size:
             return None
         self._complete_count += 1
@@ -226,17 +314,19 @@ class DSOFMethod:
             return None
         losses: list[float] = []
         for _ in range(self.replay_epochs):
-            indices = torch.randperm(len(self.replay))[:self.replay_batch_size].tolist()
-            context = torch.stack([self.replay[index][0] for index in indices]).to(self.device)
-            target = torch.stack([self.replay[index][1] for index in indices]).to(self.device)
-            losses.append(self._supervised_update(context, target, groups))
-        return sum(losses) / len(losses)
+            indices = torch.randperm(len(self.replay))[:self.replay_batch_size]
+            context, target = self._sample_replay(indices)
+            loss = self._supervised_update(context, target, groups, return_loss=return_loss)
+            if loss is not None:
+                losses.append(loss)
+        return sum(losses) / len(losses) if losses else None
 
-    def _fast_update(self, feedback: MethodFeedback) -> float:
+    def _fast_update(self, feedback: MethodFeedback, *, return_loss: bool = True) -> float | None:
         return self._fast_update_batch(feedback.context.unsqueeze(0), feedback.current_context.unsqueeze(0),
-                                       feedback.target[:1].unsqueeze(0))
+                                       feedback.target[:1].unsqueeze(0), return_loss=return_loss)
 
-    def _fast_update_batch(self, context: Tensor, current_context: Tensor, first_target: Tensor) -> float:
+    def _fast_update_batch(self, context: Tensor, current_context: Tensor, first_target: Tensor,
+                           *, return_loss: bool = True) -> float | None:
         self.model.teacher.eval()
         self.model.student.train()
         previous_context = context.to(self.device)
@@ -246,13 +336,17 @@ class DSOFMethod:
             current_teacher = self.model.teacher(current_context)
             pseudo_target = torch.cat((first_target.to(self.device), current_teacher[:, :-1]), dim=1)
         prediction = previous_teacher + self.model.residual(previous_context, previous_teacher)
-        weights = self.discount ** torch.arange(self.model.horizon, device=self.device, dtype=prediction.dtype)
-        loss = ((prediction - pseudo_target).square() * weights.view(1, -1, 1)).mean()
+        weights = self._discount_weights
+        if weights is None or weights.device != prediction.device or weights.dtype != prediction.dtype:
+            weights = (self.discount ** torch.arange(self.model.horizon, device=prediction.device,
+                                                     dtype=prediction.dtype)).view(1, -1, 1)
+            self._discount_weights = weights
+        loss = ((prediction - pseudo_target).square() * weights).mean()
         self.online_optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.online_optimizer.step()
         self.last_gradient_steps += 1
-        return loss.detach().item()
+        return loss.detach().item() if return_loss else None
 
     def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None) -> float | None:
         groups = frozenset({"teacher", "student", "online"}) if update_groups is None else update_groups

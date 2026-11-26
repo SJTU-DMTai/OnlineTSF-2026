@@ -35,6 +35,7 @@ class UpdateController:
     """
 
     measure_updates = True
+    return_loss = True
 
     def __init__(self, method, policy: UpdateAction | Callable[[DecisionState], UpdateAction], *, features=None) -> None:
         self.method = method
@@ -54,6 +55,14 @@ class UpdateController:
         self.decision_seconds = self.update_seconds = 0.0
         self._gradient_clock: int | None = None
 
+    def enable_search_mode(self, executor) -> None:
+        """Strip diagnostics, timing and unused loss syncs for isolated rollouts."""
+        self.features = None
+        self.measure_updates = False
+        self.return_loss = False
+        if hasattr(self.adapter, "enable_search_mode"):
+            self.adapter.enable_search_mode(executor)
+
     def validate_feedback_delay(self, delay: int | tuple[int, ...]) -> None:
         horizon = self.method.model.horizon
         if self.method.incremental_feedback:
@@ -66,9 +75,12 @@ class UpdateController:
         if self.index is not None and index != self.index + 1:
             raise ValueError("update actions require consecutive data clocks")
         self.index = index
-        self.context = torch.as_tensor(context).detach().clone()
         if self.features is not None:
             self.features.on_observation(context)
+        if self.measure_updates or not isinstance(self.policy, UpdateAction):
+            self.context = torch.as_tensor(context).detach().clone()
+        else:
+            self.context = context
         self.last_decision = None
 
     def prepare_feedback(self, feedback: tuple[MethodFeedback, ...]) -> None:
@@ -88,7 +100,11 @@ class UpdateController:
             raise RuntimeError("call on_observation before executing an action")
         if self.last_decided_index == self.index:
             return
-        began = perf_counter()
+        if not self.measure_updates and isinstance(self.policy, UpdateAction) and self.action == self.policy:
+            self.last_decided_index = self.index
+            self.decision_count += 1
+            return
+        began = perf_counter() if self.measure_updates else 0.0
         if isinstance(self.policy, UpdateAction):
             action = self.policy
         else:
@@ -96,29 +112,36 @@ class UpdateController:
             if callable(needs_features):
                 needs_features = needs_features(self.index)
             features = self.features.snapshot(self.method) if self.features is not None and needs_features else {}
-            state = DecisionState(self.index, self.context.clone(), feedback,
+            state = DecisionState(self.index, self.context.clone() if self.measure_updates else self.context, feedback,
                                   self.capabilities, self.action, dict(self.schedule.counts), features)
             action = self.policy(state)
         if not isinstance(action, UpdateAction):
             raise TypeError("policy must return an UpdateAction")
-        self.capabilities.validate(action)
-        self.decision_seconds += perf_counter() - began
-        if self.action is not None:
-            changed = frozenset(name for name in self.action.units
-                                if name not in action.units
-                                or self.action.learning_rate_scales.get(name, 1.0) != action.learning_rate_scales.get(name, 1.0))
-            self._finish_batches(changed)
-        began = perf_counter()
-        self.adapter.configure(action.learning_rate_scales)
-        self.schedule.activate(action)
-        self.action = action
+        same_action = self.action == action
+        if not same_action:
+            self.capabilities.validate(action)
+        if self.measure_updates:
+            self.decision_seconds += perf_counter() - began
+        if not same_action:
+            if self.action is not None:
+                changed = frozenset(name for name in self.action.units
+                                    if name not in action.units
+                                    or self.action.learning_rate_scales.get(name, 1.0) != action.learning_rate_scales.get(name, 1.0))
+                self._finish_batches(changed)
+            began = perf_counter() if self.measure_updates else 0.0
+            self.adapter.configure(action.learning_rate_scales)
+            self.schedule.activate(action)
+            self.action = action
+        elif self.measure_updates:
+            began = perf_counter()
         self.last_decided_index = self.index
         self.decision_count += 1
-        self.last_decision = {"index": self.index, "action": action.to_dict()}
-        selection = getattr(self.policy, "last_selection", None)
-        if isinstance(selection, dict):
-            self.last_decision.update(selection)
-        self.decision_seconds += perf_counter() - began
+        if self.measure_updates:
+            self.last_decision = {"index": self.index, "action": action.to_dict()}
+            selection = getattr(self.policy, "last_selection", None)
+            if isinstance(selection, dict):
+                self.last_decision.update(selection)
+            self.decision_seconds += perf_counter() - began
 
     def on_feedback(self, feedback: MethodFeedback) -> float | None:
         if not self.prepared or self.prepared[0].feedback is not feedback:
@@ -133,7 +156,7 @@ class UpdateController:
         began = None
         if self.measure_updates:
             began = perf_counter()
-        loss = self.adapter.apply(prepared, due, self.schedule)
+        loss = self.adapter.apply(prepared, due, self.schedule, return_loss=self.return_loss)
         self._record_update(began)
         return loss
 
@@ -154,7 +177,7 @@ class UpdateController:
         began = None
         if self.measure_updates:
             began = perf_counter()
-        self.adapter.apply_batches(self.adapter.batches.take(names), self.schedule)
+        self.adapter.apply_batches(self.adapter.batches.take(names), self.schedule, return_loss=self.return_loss)
         for name in names:
             self.schedule.counts[name] = 0
         self._record_update(began)

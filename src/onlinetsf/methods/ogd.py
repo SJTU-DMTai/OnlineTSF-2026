@@ -84,7 +84,8 @@ class OGDMethod:
         self.offline_optimizer.step()
         return loss.detach().item()
 
-    def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None) -> float | None:
+    def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None,
+                    complete_mask: bool = False, return_loss: bool = True) -> float | None:
         self.last_gradient_steps = 0
         if update_groups is not None:
             if update_groups - {"model"}:
@@ -97,16 +98,20 @@ class OGDMethod:
         self.model.train()
         context = feedback.context.unsqueeze(0).to(self.device)
         target = feedback.target.unsqueeze(0).to(self.device)
-        observed_mask = feedback.observed_mask.unsqueeze(0).to(self.device)
+        observed_mask = None if complete_mask else feedback.observed_mask.unsqueeze(0).to(self.device)
         losses: list[float] = []
         for _ in range(self.update_steps):
             self.optimizer.zero_grad(set_to_none=True)
             prediction = self.model(context)
-            loss = self.loss_fn(prediction[observed_mask], target[observed_mask])
+            if complete_mask:
+                loss = self.loss_fn(prediction.reshape(-1), target.reshape(-1))
+            else:
+                loss = self.loss_fn(prediction[observed_mask], target[observed_mask])
             if loss.ndim != 0:
                 raise ValueError("loss_fn must return a scalar tensor")
             loss.backward()
             self.optimizer.step()
             self.last_gradient_steps += 1
-            losses.append(loss.detach().item())
-        return sum(losses) / len(losses)
+            if return_loss:
+                losses.append(loss.detach().item())
+        return sum(losses) / len(losses) if losses else None

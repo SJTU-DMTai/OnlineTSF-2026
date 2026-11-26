@@ -115,6 +115,10 @@ class _PendingFeedback:
     prediction: Tensor
     observed_mask: Tensor
 
+    def __deepcopy__(self, memo: dict[int, Any]) -> _PendingFeedback:
+        # All fields are immutable once scheduled (detached, cloned CPU tensors).
+        return self
+
 
 class OnlineExecutor:
     """Schedule method-neutral prequential forecasting with delayed labels.
@@ -130,6 +134,9 @@ class OnlineExecutor:
     # Isolated rollouts can share read-only feedback tensors and omit events.
     # Ordinary execution retains defensive copies and complete event records.
     record_events = True
+    track_metrics = True
+    _compact_incremental = False
+    _delay_mask_cache: dict[tuple[int, ...], tuple[tuple[int, ...], tuple[Tensor, ...]]] | None = None
 
     def __init__(
         self,
@@ -163,6 +170,47 @@ class OnlineExecutor:
         self._squared_error_sum = 0.0
         self._adaptation_steps = 0
         self._adaptation_loss_sum = 0.0
+        self._delay_mask_cache: dict[tuple[int, ...], tuple[tuple[int, ...], tuple[Tensor, ...]]] = {}
+
+    def enable_compact_incremental(self, horizon: int) -> None:
+        """Keep only first-step and final-step deliveries for 1..horizon delays.
+
+        Intended for isolated search rollouts with ``record_events=False`` and
+        ``track_metrics=False`` where intermediate steps produce no updates.
+        """
+        if self.feedback_delay != tuple(range(1, horizon + 1)) or horizon <= 1:
+            return
+        compacted = [
+            entry for entry in self._pending
+            if entry[0] == entry[2].index + 1 or entry[0] == entry[2].index + horizon
+        ]
+        heapq.heapify(compacted)
+        self._pending = compacted
+        self._compact_incremental = True
+
+    def _delay_masks(self, target: Tensor) -> tuple[tuple[int, ...], tuple[Tensor, ...]]:
+        cache = self._delay_mask_cache
+        if cache is None:
+            cache = self._delay_mask_cache = {}
+        shape = tuple(target.shape)
+        cached = cache.get(shape)
+        if cached is not None:
+            return cached
+        if isinstance(self.feedback_delay, int):
+            delays: tuple[int, ...] = (self.feedback_delay,)
+            masks: tuple[Tensor, ...] = (torch.ones(shape, dtype=torch.bool),)
+        else:
+            if len(self.feedback_delay) != shape[0]:
+                raise ValueError("feedback_delay sequence length must equal the forecast horizon")
+            by_delay: dict[int, Tensor] = {}
+            for horizon_index, delay in enumerate(self.feedback_delay):
+                if delay not in by_delay:
+                    by_delay[delay] = torch.zeros(shape, dtype=torch.bool)
+                by_delay[delay][horizon_index] = True
+            delays = tuple(sorted(by_delay))
+            masks = tuple(by_delay[delay] for delay in delays)
+        cache[shape] = (delays, masks)
+        return delays, masks
 
     @property
     def events(self) -> tuple[FeedbackEvent, ...]:
@@ -349,21 +397,14 @@ class OnlineExecutor:
         target: Tensor,
         prediction: Tensor,
     ) -> int | tuple[int, ...]:
+        delays, masks = self._delay_masks(target)
         if isinstance(self.feedback_delay, int):
-            delays = (self.feedback_delay,)
-            masks = (torch.ones_like(target, dtype=torch.bool),)
             emission_available_at: int | tuple[int, ...] = index + self.feedback_delay
         else:
-            if len(self.feedback_delay) != target.shape[0]:
-                raise ValueError("feedback_delay sequence length must equal the forecast horizon")
-            by_delay: dict[int, Tensor] = {}
-            for horizon_index, delay in enumerate(self.feedback_delay):
-                if delay not in by_delay:
-                    by_delay[delay] = torch.zeros_like(target, dtype=torch.bool)
-                by_delay[delay][horizon_index] = True
-            delays = tuple(sorted(by_delay))
-            masks = tuple(by_delay[delay] for delay in delays)
             emission_available_at = tuple(index + delay for delay in self.feedback_delay)
+            if self._compact_incremental:
+                delays = (delays[0], delays[-1])
+                masks = (masks[0], masks[-1])
 
         stored_context = context.detach().to(device="cpu").clone()
         stored_target = target.detach().to(device="cpu").clone()
@@ -375,7 +416,7 @@ class OnlineExecutor:
                 context=stored_context,
                 target=stored_target,
                 prediction=prediction.clone() if self.record_events else prediction,
-                observed_mask=observed_mask.detach().to(device="cpu"),
+                observed_mask=observed_mask,
             )
             heapq.heappush(self._pending, (pending.available_at, pending.order, pending))
             self._next_pending_order += 1
@@ -387,13 +428,22 @@ class OnlineExecutor:
         shared_context = None
         if not self.record_events and self._pending and self._pending[0][0] <= index and current_context is not None:
             shared_context = current_context.detach().clone()
+        scalar_complete = isinstance(self.feedback_delay, int)
+        compact_horizon = len(self.feedback_delay) if self._compact_incremental else 0
         while self._pending and self._pending[0][0] <= index:
             _, _, pending = heapq.heappop(self._pending)
             pending_batch.append(pending)
+            if not self.record_events and (
+                scalar_complete
+                or (compact_horizon and pending.available_at == pending.index + compact_horizon)
+            ):
+                delivered_target = pending.target
+            else:
+                delivered_target = pending.target.masked_fill(~pending.observed_mask, float("nan"))
             method_feedback.append(MethodFeedback(
                 index=pending.index, available_at=pending.available_at,
                 context=pending.context.clone() if self.record_events else pending.context,
-                target=pending.target.masked_fill(~pending.observed_mask, float("nan")),
+                target=delivered_target,
                 observed_mask=pending.observed_mask.clone() if self.record_events else pending.observed_mask,
                 prediction=pending.prediction.clone() if self.record_events else pending.prediction,
                 current_context=(current_context.detach().clone() if current_context is not None else None)
@@ -408,6 +458,9 @@ class OnlineExecutor:
                      for pending, feedback in zip(pending_batch, method_feedback, strict=True))
 
     def _consume_feedback(self, pending: _PendingFeedback, feedback: MethodFeedback) -> FeedbackEvent | None:
+        if not self.record_events and not self.track_metrics:
+            self.method.on_feedback(feedback)
+            return None
         observed_target = feedback.target
         error = pending.prediction[pending.observed_mask] - pending.target[pending.observed_mask]
         absolute_error = error.abs()

@@ -8,6 +8,7 @@ import yaml
 from .experiment import collect_experiment, evaluate_experiment, train_experiment
 from .oracle import evaluate_oracle
 from .oracle_greedy import evaluate_greedy_oracle
+from .fixed_collection import collect_fixed_oracle
 from .preparation import prepare_experiment
 
 
@@ -54,6 +55,12 @@ def main(argv=None) -> None:
     collect.add_argument("--profile", action="store_true",
                          help="write buffered wall-clock diagnostics to output/profile.jsonl (no added CUDA sync)")
     collect.add_argument("--output", type=Path, required=True)
+    fixed = commands.add_parser("collect_fixed")
+    fixed.add_argument("--data", type=Path, required=True, help="prepared snapshots directory")
+    fixed.add_argument("--output", type=Path, required=True)
+    fixed.add_argument("--window", type=int, default=32, help="evaluate and execute each action for this many origins")
+    fixed.add_argument("--workers", type=int)
+    fixed.add_argument("--profile", action="store_true")
     train = commands.add_parser("train")
     train.add_argument("--data", type=Path, required=True, help="teacher collection directory")
     train.add_argument("--config", type=Path)
@@ -106,6 +113,9 @@ def main(argv=None) -> None:
         if args.profile:
             kwargs["profile"] = True
         collect_experiment(args.data, args.oracle, args.output, config=config, **kwargs)
+    elif args.command == "collect_fixed":
+        collect_fixed_oracle(args.data, args.output, window=args.window,
+                             workers=args.workers, profile=args.profile)
     elif args.command == "train":
         options = yaml.safe_load(args.config.read_text(encoding="utf-8"))["selectors"] if args.config else None
         train_experiment(args.data, args.output, options)

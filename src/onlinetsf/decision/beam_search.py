@@ -2,6 +2,7 @@
 
 import copy
 import io
+import math
 import multiprocessing
 import os
 from collections import Counter
@@ -80,8 +81,13 @@ def _search_copy(source):
     """Keep search instrumentation off its owned snapshots, not the caller's."""
     branch = copy.deepcopy(source)
     branch.record_events = False
-    branch.method.features = None
-    branch.method.measure_updates = False
+    branch.track_metrics = False
+    controller = getattr(branch, "method", None)
+    if hasattr(controller, "enable_search_mode"):
+        controller.enable_search_mode(branch)
+    elif controller is not None:
+        controller.features = None
+        controller.measure_updates = False
     return branch
 
 
@@ -89,14 +95,16 @@ def _expand_actions(node: BeamNode, dataset, catalog: ActionCatalog, origin: int
                     tail_end: int, actions: tuple[int, ...], tail_policy, beam_width: int, *,
                     terminal: int | None, score_limit: float | None = None,
                     shared_scores=None, metrics: dict | None = None,
-                    recorded_scores: dict[int, tuple[float, float, float]] | None = None) -> list[tuple[float, BeamNode]]:
+                    recorded_scores: dict[int, tuple[float, float, float]] | None = None,
+                    action_ranks: dict[int, int] | None = None) -> list[tuple[float, BeamNode]]:
     """Keep local top-B; a discarded local candidate cannot be global top-B.
 
     Bounds use completed candidates only and strict > comparisons. Workers read
     the global bound once per candidate; a stale, higher bound only prunes less.
-    Stable action order resolves exact ties just as in the serial search.
+    Canonical action ranks resolve exact ties regardless of execution order.
     """
-    candidates = []
+    candidates: list[tuple[float, int, BeamNode]] = []
+    ranks = {index: rank for rank, index in enumerate(actions)} if action_ranks is None else action_ranks
     act_len = end - origin
     tail_len = tail_end - end
     for action_index in actions:
@@ -179,14 +187,15 @@ def _expand_actions(node: BeamNode, dataset, catalog: ActionCatalog, origin: int
             stats["completed_candidates"] += 1
         child = BeamNode(branch, state, total, node.actions + (action_index,) * act_len,
                          (*node.errors, errors), node.expansions)
-        candidates.append((score, child))
-        candidates.sort(key=lambda item: item[0])
+        candidates.append((score, ranks[action_index], child))
+        candidates.sort(key=lambda item: (item[0], item[1]))
         del candidates[beam_width:]
-    return candidates
+    return [(score, child) for score, _, child in candidates]
 
 
 def _score_search_job(job: tuple) -> tuple:
-    snapshot, actions, origin, end, tail_end, tail_actions, total, beam_width, profiling = job
+    (snapshot, actions, origin, end, tail_end, tail_actions, total,
+     beam_width, profiling, action_ranks, need_executor) = job
     began = perf_counter() if profiling else 0.
     saved = torch.load(io.BytesIO(snapshot), weights_only=False)
     timings = {"load_seconds": perf_counter() - began} if profiling else {}
@@ -197,17 +206,27 @@ def _score_search_job(job: tuple) -> tuple:
     candidates = _expand_actions(node, _search_dataset, _search_catalog, origin, end, tail_end,
                                  actions, tail_policy, beam_width, terminal=_search_terminal,
                                  shared_scores=_search_scores, metrics=metrics,
-                                 recorded_scores=recorded_scores)
+                                 recorded_scores=recorded_scores, action_ranks=action_ranks)
+    global_limit = np.inf
+    if _search_scores is not None and candidates:
+        with _search_scores.get_lock():
+            global_limit = _search_scores[-1]
     results = []
     save_began = perf_counter() if profiling else 0.
     for score, child in candidates:
-        buffer = io.BytesIO()
-        torch.save({"executor": child.executor, "random_state": child.random_state}, buffer)
-        results.append((score, child.actions[0], child.errors[0], buffer.getvalue()))
+        if score > global_limit:
+            continue
+        if need_executor:
+            buffer = io.BytesIO()
+            torch.save({"executor": child.executor, "random_state": child.random_state}, buffer)
+            payload = buffer.getvalue()
+        else:
+            payload = None
+        results.append((score, child.actions[0], child.errors[0], payload))
     if profiling:
         timings.update(pid=os.getpid(), save_seconds=perf_counter() - save_began,
                        job_seconds=perf_counter() - began, input_bytes=len(snapshot),
-                       output_bytes=sum(len(row[3]) for row in results))
+                       output_bytes=sum(len(row[3]) for row in results if row[3] is not None))
     return results, recorded_scores, metrics, timings
 
 
@@ -244,8 +263,12 @@ class CoarseToFineBeamSearch:
         winning_expansions: tuple[SegmentExpansion, ...] = ()
         finest_native_expansions: list[SegmentExpansion] = []
         device = _executor_device(source)
-        order = [native] + [i for i in range(len(self.catalog.ids)) if i != native]
-        action_ranks = {index: rank for rank, index in enumerate(order)}
+        tie_order = [native] + [i for i in range(len(self.catalog.ids)) if i != native]
+        action_ranks = {index: rank for rank, index in enumerate(tie_order)}
+        # Evaluate cheaper actions (fewer updated units, e.g. frozen) first to
+        # tighten score bounds early while keeping canonical tie-breaking ranks.
+        exec_order = tuple(sorted(tie_order,
+                                  key=lambda index: (len(self.catalog.actions[index].units), action_ranks[index])))
         # The complete incumbent is protected outside the finite beam. This
         # preserves Native even for B=1 without occupying its only search slot.
         context = multiprocessing.get_context("spawn")
@@ -283,9 +306,9 @@ class CoarseToFineBeamSearch:
                             parent_scores_list.append(parent_scores)
                             limit = candidates[-1][0] if len(candidates) == self.beam_width else None
                             expanded = _expand_actions(node, dataset, self.catalog, origin, end, tail_end,
-                                                       tuple(order), tail_policy, self.beam_width,
+                                                       exec_order, tail_policy, self.beam_width,
                                                        terminal=terminal, score_limit=limit, metrics=metrics,
-                                                       recorded_scores=parent_scores)
+                                                       recorded_scores=parent_scores, action_ranks=action_ranks)
                             began = perf_counter() if profile is not None else 0.
                             for score, child in expanded:
                                 candidates.append((score, node_index, action_ranks[child.actions[-1]], child))
@@ -293,7 +316,7 @@ class CoarseToFineBeamSearch:
                             del candidates[self.beam_width:]
                             if profile is not None:
                                 parent_times["prune_seconds"] += perf_counter() - began
-                            evaluations += len(order)
+                            evaluations += len(exec_order)
                         if track_native_prefix:
                             native_prefix = (native,) * (origin - start)
                             matched = next((parent_scores_list[i] for i, node in enumerate(beam)
@@ -311,11 +334,11 @@ class CoarseToFineBeamSearch:
                         # belong only to this segment, including across rounds.
                         with shared_scores.get_lock():
                             shared_scores[:] = [np.inf] * self.beam_width
-                        # Group actions so a parent is loaded once per group,
-                        # rather than once per action. Limit groups to useful
-                        # worker parallelism; return only each group's top-B.
-                        groups = min(len(order), max(1, (self.workers + len(beam) - 1) // len(beam)))
-                        chunk_size = (len(order) + groups - 1) // groups
+                        # Choose groups per parent so len(beam) * groups is a
+                        # multiple of workers (eliminating partial-wave idle time),
+                        # and interleave exec_order across chunks for balanced load.
+                        groups = min(len(exec_order), self.workers // math.gcd(self.workers, len(beam)))
+                        need_executor = end < stop
                         jobs, parents = [], []
                         tail_slice = reference_actions[end - start:tail_end - start]
                         for node_index, node in enumerate(beam):
@@ -324,10 +347,13 @@ class CoarseToFineBeamSearch:
                             snapshot = buffer.getvalue()
                             if profile is not None:
                                 parent_times["snapshot_bytes"] += len(snapshot)
-                            for offset in range(0, len(order), chunk_size):
-                                jobs.append((snapshot, tuple(order[offset:offset + chunk_size]), origin, end,
-                                             tail_end, tail_slice, node.total, self.beam_width, profile is not None))
-                                parents.append(node_index)
+                            for group in range(groups):
+                                chunk = exec_order[group::groups]
+                                if chunk:
+                                    jobs.append((snapshot, chunk, origin, end, tail_end, tail_slice,
+                                                 node.total, self.beam_width, profile is not None,
+                                                 action_ranks, need_executor))
+                                    parents.append(node_index)
                         ranked = []
                         parent_scores_list = [{} for _ in range(len(beam))]
                         if profile is not None:
@@ -345,7 +371,7 @@ class CoarseToFineBeamSearch:
                         if profile is not None:
                             parent_times["dispatch_wait_seconds"] = perf_counter() - began
                             began = perf_counter()
-                        evaluations += len(beam) * len(order)
+                        evaluations += len(beam) * len(exec_order)
                         ranked.sort(key=lambda item: item[:3])
                         if track_native_prefix:
                             native_prefix = (native,) * (origin - start)
@@ -355,8 +381,12 @@ class CoarseToFineBeamSearch:
                         next_beam = []
                         for _, node_index, _, action_index, errors, snapshot in ranked[:self.beam_width]:
                             parent = beam[node_index]
-                            saved = torch.load(io.BytesIO(snapshot), weights_only=False)
-                            next_beam.append(BeamNode(saved["executor"], saved["random_state"],
+                            if snapshot is not None:
+                                saved = torch.load(io.BytesIO(snapshot), weights_only=False)
+                                child_exec, child_rng = saved["executor"], saved["random_state"]
+                            else:
+                                child_exec, child_rng = None, ()
+                            next_beam.append(BeamNode(child_exec, child_rng,
                                                       parent.total + float(errors.sum()),
                                                       parent.actions + (action_index,) * (end - origin),
                                                       (*parent.errors, errors),

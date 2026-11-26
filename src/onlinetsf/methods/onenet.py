@@ -145,12 +145,22 @@ class OneNetEnsemble(nn.Module):
         return self.combine(*self.expert_predictions(context))
 
 
+class _ImmutableDeque(deque):
+    """Deque of immutable tensor tuples; shallow-copies references on deepcopy."""
+
+    def __deepcopy__(self, memo: dict) -> _ImmutableDeque:
+        copied = _ImmutableDeque(self, maxlen=self.maxlen)
+        memo[id(self)] = copied
+        return copied
+
+
 class OneNetMethod:
     """Train both OneNet experts and its long- and short-term ensemble weights."""
 
     update_group_names = ("time", "variable", "decision")
     incremental_feedback = False
     adaptation_feature_names = ("expert_relative_gap", "combined_time_weight")
+    record_diagnostics = True
 
     def __init__(
         self,
@@ -199,7 +209,7 @@ class OneNetMethod:
         )
         self.loss_fn = loss_fn or nn.MSELoss()
         # Scalar feedback delays preserve emission order, so a FIFO retains exact expert forecasts.
-        self._pending_predictions: deque[tuple[Tensor, Tensor]] = deque()
+        self._pending_predictions: deque[tuple[Tensor, Tensor]] = _ImmutableDeque()
 
     @property
     def update_optimizers(self) -> tuple[Optimizer, ...]:
@@ -212,12 +222,20 @@ class OneNetMethod:
                 context.unsqueeze(0).to(self.device)
             )
             prediction = self.model.combine(cross_time, cross_variable)
-        self._pending_predictions.append(
-            (
-                cross_time.squeeze(0).detach().cpu(),
-                cross_variable.squeeze(0).detach().cpu(),
+        if self.record_diagnostics:
+            self._pending_predictions.append(
+                (
+                    cross_time.squeeze(0).detach().cpu(),
+                    cross_variable.squeeze(0).detach().cpu(),
+                )
             )
-        )
+        else:
+            self._pending_predictions.append(
+                (
+                    cross_time.squeeze(0).detach(),
+                    cross_variable.squeeze(0).detach(),
+                )
+            )
         return prediction.squeeze(0)
 
     def discard_feedback(self, feedback: MethodFeedback) -> None:
@@ -319,8 +337,8 @@ class OneNetMethod:
         # is trained with dropout. Offline train_batch enables branch dropout.
         self.model.eval()
         self.model.decision.train()
-        self.expert_optimizer.zero_grad(set_to_none=True)
         if groups & {"time", "variable"}:
+            self.expert_optimizer.zero_grad(set_to_none=True)
             losses = []
             if "time" in groups:
                 losses.append(self.loss_fn(self.model.cross_time(context), target))
@@ -346,8 +364,9 @@ class OneNetMethod:
         refresh_short: bool = True,
     ) -> None:
         # The decision network learns a recent correction conditioned on the labeled forecast.
-        self.decision_optimizer.zero_grad(set_to_none=True)
         if train_decision or refresh_short:
+            if train_decision:
+                self.decision_optimizer.zero_grad(set_to_none=True)
             with torch.set_grad_enabled(train_decision):
                 bias = self.model.decision_bias(cross_time, cross_variable, target)
                 if train_decision:

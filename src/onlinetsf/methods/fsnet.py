@@ -160,7 +160,7 @@ class AdaptiveConv1d(nn.Module):
         return output * feature_scale.view(1, -1, 1)
 
     @torch.no_grad()
-    def record_gradient(self) -> None:
+    def record_gradient(self, *, record_diagnostics: bool = True) -> None:
         """Update official fast/slow gradient EMAs after backpropagation."""
 
         gradient = F.normalize(self.conv.weight.grad.detach()).flatten()
@@ -174,11 +174,11 @@ class AdaptiveConv1d(nn.Module):
                 dim=0,
                 eps=1e-6,
             )
-            alignment = similarity.item()
-            valid = (self.fast_gradient_ema.square().sum() > 1e-12) & (self.gradient_ema.square().sum() > 1e-12)
-            self.last_gradient_alignment = alignment if valid.item() else None
-            if alignment < -self.memory_threshold:
-                self.memory_trigger.fill_(True)
+            self.memory_trigger |= similarity < -self.memory_threshold
+            if record_diagnostics:
+                alignment = similarity.item()
+                valid = (self.fast_gradient_ema.square().sum() > 1e-12) & (self.gradient_ema.square().sum() > 1e-12)
+                self.last_gradient_alignment = alignment if valid.item() else None
         self.gradient_ema.mul_(self.gradient_decay).add_(
             gradient, alpha=1.0 - self.gradient_decay
         )
@@ -281,6 +281,9 @@ class FSNetTCN(ForecastBackbone):
         )
         self.representation_dropout = nn.Dropout(representation_dropout)
         self.head = nn.Linear(representation_channels, horizon * self.num_targets)
+        self._adaptive_layers: tuple[AdaptiveConv1d, ...] = tuple(
+            module for module in self.modules() if isinstance(module, AdaptiveConv1d)
+        )
 
     def forward(self, context: Tensor, *, advance_state: bool = True) -> Tensor:
         if context.ndim != 3 or context.shape[1:] != (self.context_length, self.num_features):
@@ -297,12 +300,20 @@ class FSNetTCN(ForecastBackbone):
         forecast = self.head(encoded[..., -1])
         return forecast.reshape(context.shape[0], self.horizon, self.num_targets)
 
-    def record_gradients(self) -> None:
+    _adaptive_layers: tuple[AdaptiveConv1d, ...] | None = None
+
+    def adaptive_layers(self) -> tuple[AdaptiveConv1d, ...]:
+        if self._adaptive_layers is None:
+            self._adaptive_layers = tuple(
+                module for module in self.modules() if isinstance(module, AdaptiveConv1d)
+            )
+        return self._adaptive_layers
+
+    def record_gradients(self, *, record_diagnostics: bool = True) -> None:
         """Store gradients for every adapted convolution."""
 
-        for module in self.modules():
-            if isinstance(module, AdaptiveConv1d):
-                module.record_gradient()
+        for module in self.adaptive_layers():
+            module.record_gradient(record_diagnostics=record_diagnostics)
 
 
 class FSNetMethod:
@@ -311,6 +322,8 @@ class FSNetMethod:
     update_group_names = ("base", "adapter", "head")
     incremental_feedback = False
     adaptation_feature_names = ("gradient_alignment", "recent_memory_trigger_rate")
+    record_diagnostics = True
+    _parameter_groups: dict[str, list[nn.Parameter]] | None = None
 
     def __init__(
         self,
@@ -338,6 +351,7 @@ class FSNetMethod:
         self.last_gradient_steps = self.last_egd_steps = 0
         self._gradient_alignment: float | None = None
         self._memory_trigger_rates: deque[float] = deque(maxlen=32)
+        self._parameter_groups = self._build_parameter_groups()
 
     @property
     def update_optimizers(self) -> tuple[Optimizer, ...]:
@@ -365,8 +379,7 @@ class FSNetMethod:
         return {"gradient_alignment": self._gradient_alignment,
                 "recent_memory_trigger_rate": sum(rates) / len(rates) if rates else None}
 
-    def parameter_groups(self) -> dict[str, list[nn.Parameter]]:
-        """Disjoint base, gradient-adapter, and prediction-head parameters."""
+    def _build_parameter_groups(self) -> dict[str, list[nn.Parameter]]:
         groups: dict[str, list[nn.Parameter]] = {"base": [], "adapter": [], "head": []}
         for name, parameter in self.model.named_parameters():
             if name.startswith("head."):
@@ -377,6 +390,12 @@ class FSNetMethod:
                 group = "base"
             groups[group].append(parameter)
         return groups
+
+    def parameter_groups(self) -> dict[str, list[nn.Parameter]]:
+        """Disjoint base, gradient-adapter, and prediction-head parameters."""
+        if self._parameter_groups is None:
+            self._parameter_groups = self._build_parameter_groups()
+        return self._parameter_groups
 
     def on_feedback(self, feedback: MethodFeedback, *, update_groups: frozenset[str] | None = None) -> float | None:
         """Apply official-style inner updates after complete feedback arrives."""
@@ -429,7 +448,8 @@ class FSNetMethod:
                                  gradient_memory=gradient_memory, memory_schedule=memory_schedule)
 
     def update_batch(self, context: Tensor, target: Tensor, selected: frozenset[str], *,
-                     gradient_memory: bool, memory_schedule: Callable[[], bool] | None = None) -> float | None:
+                     gradient_memory: bool, memory_schedule: Callable[[], bool] | None = None,
+                     return_loss: bool = True) -> float | None:
         """Compute real gradients for memory even when no parameters are stepped.
 
         Memory scheduling is called only on native inner forwards that advance
@@ -443,7 +463,7 @@ class FSNetMethod:
         context = context.to(self.device)
         target = target.to(self.device)
         losses: list[float] = []
-        layers = [module for module in self.model.modules() if isinstance(module, AdaptiveConv1d)]
+        layers = self.model.adaptive_layers()
         for inner_step in range(self.n_inner):
             self.optimizer.zero_grad(set_to_none=True)
             advance_memory = inner_step > 0 and (memory_schedule is None or memory_schedule())
@@ -454,12 +474,13 @@ class FSNetMethod:
             loss.backward()
             # Memory observes real gradients even when base parameters stay fixed.
             if gradient_memory:
-                self.model.record_gradients()
-                valid = [layer for layer in layers if layer.last_gradient_alignment is not None]
-                if valid:
-                    self._gradient_alignment = sum(layer.last_gradient_alignment for layer in valid) / len(valid)
-                    self._memory_trigger_rates.append(sum(layer.last_gradient_alignment < -layer.memory_threshold
-                                                          for layer in valid) / len(valid))
+                self.model.record_gradients(record_diagnostics=self.record_diagnostics)
+                if self.record_diagnostics:
+                    valid = [layer for layer in layers if layer.last_gradient_alignment is not None]
+                    if valid:
+                        self._gradient_alignment = sum(layer.last_gradient_alignment for layer in valid) / len(valid)
+                        self._memory_trigger_rates.append(sum(layer.last_gradient_alignment < -layer.memory_threshold
+                                                              for layer in valid) / len(valid))
             for name, parameters in groups.items():
                 if name not in selected:
                     for parameter in parameters:
@@ -467,5 +488,6 @@ class FSNetMethod:
             if selected:
                 self.optimizer.step()
                 self.last_gradient_steps += 1
-            losses.append(loss.detach().item())
-        return sum(losses) / len(losses)
+            if return_loss:
+                losses.append(loss.detach().item())
+        return sum(losses) / len(losses) if losses else None
