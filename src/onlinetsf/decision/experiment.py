@@ -9,8 +9,11 @@ import io
 import json
 import multiprocessing
 import os
+import random
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime
+from contextlib import ExitStack
 from pathlib import Path
 from time import perf_counter
 
@@ -23,9 +26,10 @@ from .catalog import ActionCatalog
 from .capabilities import UpdateCapabilities, UpdateUnit
 from .feature_selection import select_state_features
 from .collection import collect_experiment
-from .selector import ActionSelector, ESTIMATORS, FORMULATIONS, LOG1P_FEATURES, SelectorPolicy, resolve_ema_beta
+from .selector import ActionSelector, LOG1P_FEATURES, SelectorPolicy, resolve_ema_beta
 from .training import select_temperature
-from .ranking import RANKING_PAIRS, RankingSelector
+from .ranking import RankingSelector
+from .model_specs import expand_model_specs
 from .rollout import RecordingPolicy, rng_state, restore_rng, step_dataset
 from .preparation import load_interval, save_json
 
@@ -56,62 +60,37 @@ def score_action(source: OnlineExecutor, dataset, origin: int, action: UpdateAct
         restore_rng(saved_rng)
 
 
-def train_experiment(data_directory: Path, output: Path, options: dict | None = None) -> None:
+def train_experiment(data_directory: Path, output: Path, options: dict | None = None, *,
+                     compact_output: bool = False) -> None:
     manifest = json.loads((data_directory / "manifest.json").read_text(encoding="utf-8"))
     if manifest["status"] != "complete":
         raise ValueError("collection must complete before selector training")
     if manifest["schema_version"] != 5:
         raise ValueError("recollect training data with the current feature schema")
     options = manifest["config"]["selectors"] if options is None else options
-    if "formulations" in options or "estimators" in options:
-        raise ValueError("replace selectors.formulations/estimators with an explicit selectors.models list")
-    models = options.get("models")
-    if not isinstance(models, list) or not models:
-        raise ValueError("selectors.models must be a nonempty list of formulation/estimator pairs")
-    pairs = []
-    for model in models:
-        if (not isinstance(model, dict) or not {"formulation", "estimator"} <= set(model)
-                or set(model) - {"formulation", "estimator", "loss"}):
-            raise ValueError("each selectors.models entry requires formulation and estimator")
-        pair = model["formulation"], model["estimator"], model.get("loss", "default")
-        if pair[2] not in {"default", "margin_ranking"}:
-            raise ValueError(f"unknown selector loss: {pair[2]}")
-        if pair[2] == "margin_ranking" and pair[:2] not in RANKING_PAIRS:
-            raise ValueError(f"unsupported margin ranking selector: {pair[:2]}")
-        if pair[0] not in FORMULATIONS or pair[1] not in ESTIMATORS:
-            raise ValueError(f"unknown selector formulation/estimator: {pair}")
-        if pair in pairs:
-            raise ValueError(f"duplicate selector formulation/estimator: {pair}")
-        pairs.append(pair)
+    jobs = expand_model_specs(options)
+    seed = options.get("seed", manifest["config"].get("seed", 0))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     ranking = options.get("ranking", {})
-    if set(ranking) - {"margin"}:
-        raise ValueError("unknown selector ranking option")
+    classification = options.get("classification", {})
     if "feature_sets" in options:
         raise ValueError("feature_sets is obsolete; ElasticNet selects from selectors.features or all collected features")
-    parameters = options.get("parameters", {})
-    if set(parameters) - set(ESTIMATORS):
-        raise ValueError("unknown estimator parameter section")
-    formulation_parameters = options.get("formulation_parameters", {})
-    if set(formulation_parameters) - set(FORMULATIONS):
-        raise ValueError("unknown formulation parameter section")
-    if any(set(values) - set(ESTIMATORS) for values in formulation_parameters.values()):
-        raise ValueError("unknown estimator in formulation parameters")
-    classification = options.get("classification", {})
-    if set(classification) - {"temperature", "temperature_candidates", "cv_splits"}:
-        raise ValueError("unknown classification temperature option")
     torch.set_num_threads(manifest["config"].get("threads", 1))
     capabilities = UpdateCapabilities(tuple(UpdateUnit(**row) for row in manifest["capabilities"]))
     catalog = ActionCatalog.from_dict(manifest["catalog"], capabilities)
     with np.load(data_directory / "training.npz") as values:
         states, gains, maes = values["states"], values["advantages"], values["maes"]
         origins, label_ends = values["origins"], values["label_ends"]
+        teacher_actions = values["teacher_actions"] if "teacher_actions" in values else None
     expected_ends = origins + manifest["h_act"] + manifest["h_tail"] + manifest["config"]["data"]["horizon"] - 1
     if not np.array_equal(label_ends, expected_ends) or np.any(label_ends + manifest["config"]["data"]["context_length"] > manifest["train_end"]):
         raise ValueError("historical action labels must end before the test split")
     collection_digest = hashlib.sha256((data_directory / "training.npz").read_bytes()).hexdigest()
     output.mkdir(parents=True, exist_ok=False)
     results = []
-    save_json(output / "manifest.json", {"status": "training", "data": str(data_directory.resolve()), "options": options})
+    save_json(output / "manifest.json", {"status": "training", "data": str(data_directory.resolve()), "options": options, "seed": seed, "compact_output": compact_output})
     try:
         names = options.get("features", manifest["feature_names"])
         if not names or len(set(names)) != len(names) or set(names) - set(manifest["feature_names"]):
@@ -131,19 +110,19 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
         names = selection["selected_features"]
         states = candidate_states[:, [candidate_names.index(name) for name in names]]
         print(f"Feature selection ({selection['method']}): {len(names)}/{len(candidate_names)} state features: {names}", flush=True)
-        for formulation, estimator, loss in pairs:
+        for job in jobs:
+            formulation, estimator, loss = job["formulation"], job["estimator"], job["loss"]
             began = perf_counter()
-            selector_type = RankingSelector if loss == "margin_ranking" else ActionSelector
+            selector_type = RankingSelector if loss == "top1_bpr" else ActionSelector
             selector = selector_type(catalog, names, formulation, estimator,
-                                      **({"margin": ranking.get("margin", 1.)} if loss == "margin_ranking" else {}),
-                                      parameters={**parameters.get(estimator, {}),
-                                                  **formulation_parameters.get(formulation, {}).get(estimator, {})},
-                                      seed=manifest["config"].get("seed", 0),
+                                      **({"r_max": ranking.get("r_max", 1.)} if loss == "top1_bpr" else {}),
+                                      label_mode=job["label_mode"], parameters=job["parameters"],
+                                      seed=seed,
                                       feature_window=manifest["config"]["collection"].get("feature_window", 32),
                                       error_window=manifest["config"]["collection"].get("error_window", 128))
             selector.tau = manifest["tau"]
             temperature_report = None
-            if formulation == "classification" and loss == "default":
+            if formulation == "classification" and loss == "default" and job["label_mode"] == "soft":
                 temperature = classification.get("temperature", "auto")
                 if temperature == "auto":
                     temperature_selector = copy.copy(selector)
@@ -157,26 +136,27 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
                     temperature_report = {"method": "fixed", "temperature": temperature}
                 selector.temperature = temperature
                 print(f"classification/{estimator}: temperature={temperature}", flush=True)
-            selector.fit(states, maes)
+            selector.fit(states, maes, teacher_actions=teacher_actions)
             fit_seconds = perf_counter() - began
-            model_name = estimator + ("_margin_ranking" if loss == "margin_ranking" else "")
-            directory = output / formulation / model_name
+            directory = output / job["directory"]
             directory.mkdir(parents=True)
             selector.save(directory / "selector.pkl")
-            if temperature_report is not None:
+            if temperature_report is not None and not compact_output:
                 save_json(directory / "temperature_selection.json", temperature_report)
-            if estimator == "mlp":
+            if estimator == "mlp" and not compact_output:
                 save_json(directory / "learning_rates.json", {
                     "schedule": "cosine", "unit": "epoch",
                     "models": [{"action_id": catalog.ids[i] if formulation == "independent_regression" and loss == "default" else None,
                                 "rates": model.learning_rates_}
                                for i, model in enumerate(selector.models) if model is not None]})
-            row = {"formulation": formulation, "estimator": estimator, "feature_count": len(names),
+            row = {**{key: value for key, value in job.items() if key != "parameters"}, "feature_count": len(names), "seed": selector.seed,
                    "fit_seconds": fit_seconds, "model_bytes": (directory / "selector.pkl").stat().st_size}
-            if loss == "margin_ranking":
-                row.update(target="margin_ranking", loss=loss, margin=selector.margin,
-                           pair_reduction="mean_per_state_then_mean_states", ties="skip_exact",
+            if loss == "top1_bpr":
+                row.update(target="top1_bpr", r_max=selector.r_max,
+                           pair_reduction="sum_teacher_pairs_then_mean_states", ties="zero_regret_weight",
                            score_kind=selector.score_kind)
+            elif formulation == "classification" and job["label_mode"] == "hard":
+                row.update(target="teacher_action")
             elif formulation == "classification":
                 row.update(target="softmax_negative_regret", temperature=selector.temperature)
             else:
@@ -190,17 +170,18 @@ def train_experiment(data_directory: Path, output: Path, options: dict | None = 
                                                     "feature_transforms": {name: "log1p" for name in names
                                                                            if name in LOG1P_FEATURES},
                                                     "collection_sha256": collection_digest})
-            print(f"trained {formulation}/{model_name}", flush=True)
+            print(f"trained {job['directory']}", flush=True)
     except BaseException as error:
-        save_json(output / "manifest.json", {"status": "failed", "error": f"{type(error).__name__}: {error}", "results": results})
+        save_json(output / "manifest.json", {"status": "failed", "seed": seed, "compact_output": compact_output, "error": f"{type(error).__name__}: {error}", "results": results})
         raise
     save_json(output / "manifest.json", {"status": "complete", "data": str(data_directory.resolve()),
-                                         "options": options, "results": results})
+                                         "options": options, "seed": seed, "compact_output": compact_output, "results": results})
 
 
 def evaluate_policy(executor: OnlineExecutor, dataset, start: int, stop: int, output: Path,
-                    *, name: str, target_mean: np.ndarray, target_std: np.ndarray, terminal: bool = True) -> dict:
-    """Persist issued forecasts separately from the later label-arrival clock."""
+                    *, name: str, target_mean: np.ndarray, target_std: np.ndarray, terminal: bool = True,
+                    compact_output: bool = False) -> dict:
+    """Score the same causal stream with optional per-origin artifacts."""
     if not 0 <= start < stop <= len(dataset):
         raise ValueError("invalid test forecast interval")
     output.mkdir(parents=True, exist_ok=False)
@@ -209,30 +190,35 @@ def evaluate_policy(executor: OnlineExecutor, dataset, start: int, stop: int, ou
     controller.gradient_steps = controller.egd_steps = controller.gradient_update_clocks = controller.decision_count = 0
     controller.decision_seconds = controller.update_seconds = 0.
     controller._gradient_clock = None
-    shape = (stop - start, dataset.horizon, dataset.num_targets)
-    predictions = np.lib.format.open_memmap(output / "predictions.npy", mode="w+", dtype="float64", shape=shape)
-    targets = np.lib.format.open_memmap(output / "targets.npy", mode="w+", dtype="float64", shape=shape)
     absolute = squared = raw_absolute = raw_squared = 0.
     decision_index, action_id = -1, name
+    action_counts = Counter()
     began = perf_counter()
-    with (output / "forecasts.csv").open("w", encoding="utf-8", newline="") as forecast_file, \
-            (output / "decisions.jsonl").open("w", encoding="utf-8") as decision_file:
-        writer = csv.writer(forecast_file)
-        writer.writerow(["forecast_index", "raw_context_end_index", "raw_target_start_index", "decision_index",
-                         "action_id", "mae", "mse", "original_mae", "original_mse"])
+    with ExitStack() as stack:
+        if not compact_output:
+            shape = (stop - start, dataset.horizon, dataset.num_targets)
+            predictions = np.lib.format.open_memmap(output / "predictions.npy", mode="w+", dtype="float64", shape=shape)
+            targets = np.lib.format.open_memmap(output / "targets.npy", mode="w+", dtype="float64", shape=shape)
+            forecast_file = stack.enter_context((output / "forecasts.csv").open("w", encoding="utf-8", newline=""))
+            decision_file = stack.enter_context((output / "decisions.jsonl").open("w", encoding="utf-8"))
+            writer = csv.writer(forecast_file)
+            writer.writerow(["forecast_index", "raw_context_end_index", "raw_target_start_index", "decision_index",
+                             "action_id", "mae", "mse", "original_mae", "original_mse"])
         for offset, index in enumerate(range(start, stop)):
             prediction = step_dataset(executor, dataset, index, final=terminal and index == stop - 1).emission.prediction.double().numpy()
             if not np.isfinite(prediction).all():
                 raise FloatingPointError(f"nonfinite test prediction at {index}")
             target = dataset[index][1].double().numpy()
             if controller.last_decision is not None:
-                decision_index += 1
-                record = {"decision_index": decision_index, **controller.last_decision}
-                action_id = record.get("action_id", name)
-                record["action_id"] = action_id
-                decision_file.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
-            predictions[offset] = prediction * target_std + target_mean
-            targets[offset] = target * target_std + target_mean
+                action_id = controller.last_decision.get("action_id", name)
+                if not compact_output:
+                    decision_index += 1
+                    record = {"decision_index": decision_index, **controller.last_decision, "action_id": action_id}
+                    decision_file.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+            action_counts[action_id] += 1
+            if not compact_output:
+                predictions[offset] = prediction * target_std + target_mean
+                targets[offset] = target * target_std + target_mean
             error = prediction - target
             raw_error = error * target_std
             mae, mse = float(np.abs(error).mean()), float(np.square(error).mean())
@@ -241,21 +227,24 @@ def evaluate_policy(executor: OnlineExecutor, dataset, start: int, stop: int, ou
             squared += mse
             raw_absolute += raw_mae
             raw_squared += raw_mse
-            writer.writerow([index, index + dataset.context_length - 1, index + dataset.context_length,
-                             decision_index, action_id, mae, mse, raw_mae, raw_mse])
+            if not compact_output:
+                writer.writerow([index, index + dataset.context_length - 1, index + dataset.context_length,
+                                 decision_index, action_id, mae, mse, raw_mae, raw_mse])
             executor._events.clear()
         executor.flush()  # Scores outstanding labels only; no decisions or training.
         executor._events.clear()
-    predictions.flush()
-    targets.flush()
+    if not compact_output:
+        predictions.flush()
+        targets.flush()
     if controller.method.device.type == "cuda":
         torch.cuda.synchronize(controller.method.device)
-    summary = {"name": name, "forecasts": stop - start, "mae": absolute / (stop - start),
+    summary = {"name": name, "compact_output": compact_output, "forecasts": stop - start, "mae": absolute / (stop - start),
                "mse": squared / (stop - start), "original_mae": raw_absolute / (stop - start),
                "original_mse": raw_squared / (stop - start), "online_seconds": perf_counter() - began,
                "decision_seconds": controller.decision_seconds, "update_seconds": controller.update_seconds,
                "gradient_steps": controller.gradient_steps, "formula_steps": controller.egd_steps,
                "gradient_update_clocks": controller.gradient_update_clocks, "decisions": controller.decision_count,
+               "action_counts": dict(action_counts),
                "test_start": start, "test_stop": stop, "target_names": list(dataset.target_names),
                "prediction_scale": "original numeric channel units", "metric_scale": "offline-standardized numeric channels",
                "array_axes": ["forecast (forecasts.csv order)", "horizon step (zero based)", "target (target_names order)"],
@@ -270,7 +259,12 @@ def initialize_evaluation_worker(device: str, threads: int, snapshot: bytes) -> 
     _evaluation_snapshot = snapshot
     requested = torch.device(device)
     _evaluation_device_name = device
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(requested.index) if requested.type == "cuda" else ""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if requested.type == "cuda":
+        physical = str(requested.index) if visible is None else visible.split(",")[requested.index].strip()
+        os.environ["CUDA_VISIBLE_DEVICES"] = physical
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
     _evaluation_device = torch.device("cuda:0" if requested.type == "cuda" else "cpu")
     torch.set_num_threads(threads)
     if requested.type == "cuda":
@@ -279,7 +273,8 @@ def initialize_evaluation_worker(device: str, threads: int, snapshot: bytes) -> 
         torch.backends.cudnn.deterministic = True
 
 
-def evaluate_policy_worker(manifest: dict, output: Path, name: str, policy) -> dict:
+def evaluate_policy_worker(manifest: dict, output: Path, name: str, policy,
+                           compact_output: bool = False) -> dict:
     """Restore a fresh trajectory, including optimizer state, for one policy."""
     saved = torch.load(io.BytesIO(_evaluation_snapshot), weights_only=False, map_location="cpu")
     executor, dataset = saved["executor"], saved["dataset"]
@@ -302,6 +297,8 @@ def evaluate_policy_worker(manifest: dict, output: Path, name: str, policy) -> d
             for key, value in state.items():
                 if isinstance(value, torch.Tensor) and key != "step":
                     state[key] = value.to(_evaluation_device)
+    random.seed(manifest["config"].get("seed", 0))
+    np.random.seed(manifest["config"].get("seed", 0))
     torch.set_rng_state(saved["rng"][0])
     if _evaluation_device.type == "cuda":
         if saved["rng"][1]:
@@ -312,7 +309,7 @@ def evaluate_policy_worker(manifest: dict, output: Path, name: str, policy) -> d
     summary = evaluate_policy(executor, dataset, manifest["test_start"], manifest["test_stop"],
                               output / name, name=name,
                               target_mean=np.asarray(manifest["target_mean"]),
-                              target_std=np.asarray(manifest["target_std"]))
+                              target_std=np.asarray(manifest["target_std"]), compact_output=compact_output)
     summary["device"] = _evaluation_device_name
     save_json(output / name / "summary.json", summary)
     return summary
@@ -320,13 +317,23 @@ def evaluate_policy_worker(manifest: dict, output: Path, name: str, policy) -> d
 
 def evaluate_experiment(data_directory: Path, model_directory: Path, output: Path, *,
                         devices: list[str] | None = None, workers_per_device: list[int] | None = None,
-                        ema_beta: float | None = None) -> None:
+                        ema_beta: float | None = None,
+                        ema_betas: list[float | None] | None = None,
+                        compact_output: bool = False) -> None:
     manifest = json.loads((data_directory / "manifest.json").read_text(encoding="utf-8"))
     trained = json.loads((model_directory / "manifest.json").read_text(encoding="utf-8"))
     if manifest["status"] != "complete" or trained["status"] != "complete":
         raise ValueError("collection and model training must both complete")
-    beta = resolve_ema_beta(ema_beta if ema_beta is not None else
-                            manifest["config"].get("evaluation", {}).get("ema_beta"), manifest["tau"])
+    if ema_beta is not None and ema_betas is not None:
+        raise ValueError("specify ema_beta or ema_betas, not both")
+    evaluation = manifest["config"].get("evaluation", {})
+    requested_betas = (ema_betas if ema_betas is not None else [ema_beta] if ema_beta is not None
+                       else evaluation.get("ema_betas", [evaluation.get("ema_beta")]))
+    if not isinstance(requested_betas, list) or not requested_betas:
+        raise ValueError("ema_betas must be a nonempty list of numbers or null for the default")
+    betas = list(dict.fromkeys(resolve_ema_beta(value, manifest["tau"]) for value in requested_betas))
+    seed = trained["seed"]
+    evaluation_info = {"seed": seed, "forecast_seed": manifest["config"].get("seed", 0), "ema_beta": betas[0] if len(betas) == 1 else None, "ema_betas": betas, "compact_output": compact_output}
     torch.set_num_threads(manifest["config"].get("threads", 1))
     capabilities = UpdateCapabilities(tuple(UpdateUnit(**row) for row in manifest["capabilities"]))
     catalog = ActionCatalog.from_dict(manifest["catalog"], capabilities)
@@ -347,30 +354,38 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
     digest = hashlib.sha256((data_directory / "training.npz").read_bytes()).hexdigest()
     jobs = [("native", catalog.actions[catalog.native_indices[0]]),
             ("frozen", UpdateAction())]
+    job_metadata = {"native": {"ema_beta": None}, "frozen": {"ema_beta": None}}
     for row in trained["results"]:
-        model_name = row["estimator"] + ("_margin_ranking" if row.get("loss") == "margin_ranking" else "")
-        directory = model_directory / row["formulation"] / model_name
+        directory = model_directory / row["directory"]
         metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
         if metadata["collection_sha256"] != digest or metadata["catalog"] != catalog.to_dict():
             raise ValueError("selector was trained on a different collection or candidate catalog")
         selector = ActionSelector.load(directory / "selector.pkl")
-        jobs.append((f"policy/{row['formulation']}/{model_name}", SelectorPolicy(selector, ema_beta=beta)))
+        for beta in betas:
+            name = f"policy/{row['directory']}" + (f"/beta_{beta:.17g}" if len(betas) > 1 else "")
+            jobs.append((name, SelectorPolicy(selector, ema_beta=beta)))
+            job_metadata[name] = {key: row[key] for key in ("formulation", "estimator", "loss", "label_mode", "variant")}
+            job_metadata[name]["ema_beta"] = beta
     output.mkdir(parents=True, exist_ok=False)
     summaries = []
-    save_json(output / "manifest.json", {"status": "evaluating", "ema_beta": beta})
+    save_json(output / "manifest.json", {"status": "evaluating", **evaluation_info})
     try:
         # Warm the Native prefix once, only when evaluation is requested. All
         # policies branch from this in-memory state; no extra checkpoint is written.
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
         _, source, dataset, _, _, state = load_interval(data_directory / manifest["prepared_data"], split="test")
         if devices is None:
             for name, policy in jobs:
                 executor = copy.deepcopy(source)
                 executor.method.policy = policy
+                random.seed(manifest["config"].get("seed", 0))
+                np.random.seed(manifest["config"].get("seed", 0))
                 restore_rng(state)
                 summaries.append(evaluate_policy(executor, dataset, manifest["test_start"], manifest["test_stop"],
                                                  output / name, name=name,
                                                  target_mean=np.asarray(manifest["target_mean"]),
-                                                 target_std=np.asarray(manifest["target_std"])))
+                                                 target_std=np.asarray(manifest["target_std"]), compact_output=compact_output))
                 print(f"[{datetime.now().astimezone():%Y-%m-%d %H:%M:%S %z}] tested {name}: MAE={summaries[-1]['mae']:.6f}", flush=True)
                 del executor
         else:
@@ -390,7 +405,7 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
                         job = next(remaining, None)
                         if job is not None:
                             name, policy = job
-                            pending[pool.submit(evaluate_policy_worker, manifest, output, name, policy)] = pool
+                            pending[pool.submit(evaluate_policy_worker, manifest, output, name, policy, compact_output)] = pool
                 while pending:
                     completed, _ = wait(pending, return_when=FIRST_COMPLETED)
                     for future in completed:
@@ -401,7 +416,7 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
                         job = next(remaining, None)
                         if job is not None:
                             name, policy = job
-                            pending[pool.submit(evaluate_policy_worker, manifest, output, name, policy)] = pool
+                            pending[pool.submit(evaluate_policy_worker, manifest, output, name, policy, compact_output)] = pool
             finally:
                 for future in pending:
                     future.cancel()
@@ -410,11 +425,34 @@ def evaluate_experiment(data_directory: Path, model_directory: Path, output: Pat
             order = {name: index for index, (name, _) in enumerate(jobs)}
             summaries.sort(key=lambda row: order[row["name"]])
     except BaseException as error:
-        save_json(output / "manifest.json", {"status": "failed", "ema_beta": beta, "error": f"{type(error).__name__}: {error}", "results": summaries})
+        save_json(output / "manifest.json", {"status": "failed", **evaluation_info, "error": f"{type(error).__name__}: {error}", "results": summaries})
         raise
-    save_json(output / "manifest.json", {"status": "complete", "ema_beta": beta, "results": summaries})
+    for summary in summaries:
+        if summary["name"] == "native":
+            summary["action_counts"] = {catalog.ids[catalog.native_indices[0]]: summary["forecasts"]}
+        elif summary["name"] == "frozen":
+            frozen_id = next((action_id for action_id, action in zip(catalog.ids, catalog.actions) if not action.units), "frozen")
+            summary["action_counts"] = {frozen_id: summary["forecasts"]}
+        summary["action_counts"] = {**dict.fromkeys(catalog.ids, 0), **summary["action_counts"]}
+        summary.update(seed=seed, forecast_seed=manifest["config"].get("seed", 0), **job_metadata[summary["name"]])
+        save_json(output / summary["name"] / "summary.json", summary)
+    save_json(output / "manifest.json", {"status": "complete", **evaluation_info, "results": summaries})
     with (output / "comparison.csv").open("w", encoding="utf-8", newline="") as handle:
-        fields = [key for key, value in summaries[0].items() if not isinstance(value, list)]
+        fields = list(dict.fromkeys(key for row in summaries for key, value in row.items() if not isinstance(value, (list, dict))))
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(summaries)
+
+    write_action_usage(output / "action_usage.csv", summaries)
+
+
+def write_action_usage(path: Path, summaries: list[dict]) -> None:
+    """One row per trajectory and action, including candidates selected zero times."""
+    keys = ["collection", "name", "formulation", "estimator", "loss", "label_mode", "variant", "ema_beta", "seed", "forecast_seed"]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[*keys, "action_id", "count", "fraction"])
+        writer.writeheader()
+        for summary in summaries:
+            for action_id, count in summary["action_counts"].items():
+                writer.writerow({**{key: summary.get(key) for key in keys}, "action_id": action_id,
+                                 "count": count, "fraction": count / summary["forecasts"]})

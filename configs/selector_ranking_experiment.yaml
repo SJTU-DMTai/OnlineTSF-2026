@@ -33,13 +33,13 @@ collection:
 evaluation:
   ema_beta: null  # null: (h_act - 1) / (h_act + 1); 0 disables smoothing.
 selectors:
-  # Pure margin ranking; omit loss to use the existing MAE/CE implementation.
+  # Pure teacher top-1 weighted BPR; omit loss to use the existing MAE/CE implementation.
   models:
-    - {formulation: independent_regression, estimator: mlp, loss: margin_ranking}
-    - {formulation: shared_regression, estimator: mlp, loss: margin_ranking}
-    - {formulation: classification, estimator: mlp, loss: margin_ranking}
+    - {formulation: independent_regression, estimator: mlp, loss: top1_bpr}
+    - {formulation: shared_regression, estimator: mlp, loss: top1_bpr}
+    - {formulation: classification, estimator: mlp, loss: top1_bpr}
   ranking:
-    margin: 1.0
+    r_max: 1.0
   feature_selection: null
   # feature_selection: null keeps every listed feature.
   features:

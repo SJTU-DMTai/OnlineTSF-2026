@@ -1,0 +1,65 @@
+# Reuse historical 20%-40% teachers; test causal online policies on 40%-100%.
+# Paths are relative to this YAML. Only the MLP entries use pure BPR.
+collections:
+  - id: dsof_greedy
+    data: ../runs/ettm1_dsof_onenet_oracles_20261126_121339/dsof/fixed32_data
+  - id: dsof_beam
+    data: ../runs/ettm1_dsof_onenet_oracles_20261126_121339/dsof/beam_data
+  - id: onenet_greedy
+    data: ../runs/ettm1_dsof_onenet_oracles_20261126_121339/onenet/fixed32_data
+  - id: onenet_beam
+    data: ../runs/ettm1_dsof_onenet_oracles_20261126_121339/onenet/beam_data
+  - id: fsnet_greedy
+    data: ../runs/ettm1_fsnet_oracles_20261126_131042/fsnet/fixed32_data
+  - id: fsnet_beam
+    data: ../runs/ettm1_fsnet_oracles_20261126_131042/fsnet/beam_data
+evaluation:
+  ema_betas: [0, null, 0.5]  # null uses (h_act - 1) / (h_act + 1) for each collection.
+selectors:
+  seed: 0  # Fixed across methods, label modes, variants and repeated runs.
+  models:
+    - {formulation: shared_regression, estimator: mlp, variants: &variants [baseline, compact, wide]}
+    - {formulation: shared_regression, estimator: lightgbm, variants: *variants}
+    - {formulation: shared_regression, estimator: random_forest, variants: *variants}
+    - {formulation: classification, estimator: mlp, variants: *variants}
+    - {formulation: classification, estimator: lightgbm, variants: *variants}
+    - {formulation: classification, estimator: random_forest, variants: *variants}
+    - {formulation: classification, estimator: mlp, label_mode: hard, variants: *variants}
+    - {formulation: classification, estimator: lightgbm, label_mode: hard, variants: *variants}
+    - {formulation: classification, estimator: random_forest, label_mode: hard, variants: *variants}
+    - {formulation: shared_regression, estimator: mlp, loss: top1_bpr, variants: *variants}
+    - {formulation: classification, estimator: mlp, loss: top1_bpr, variants: *variants}
+  ranking:
+    r_max: 1.0  # Cap in offline-standardized MAE units; sum pairs, then mean states.
+  feature_selection: null  # Keep all method-specific collected causal features.
+  classification:
+    temperature: auto
+    temperature_candidates: [0.01, 0.02, 0.05, 0.1, 0.2]
+    cv_splits: 3
+  parameters:
+    random_forest: {n_estimators: 200, max_depth: 6, min_samples_leaf: 4, n_jobs: 1}
+    lightgbm: {n_estimators: 200, learning_rate: 0.05, num_leaves: 7, min_child_samples: 4, n_jobs: 1}
+    mlp:
+      hidden_sizes: [64, 32]
+      learning_rate: 0.001
+      min_learning_rate: 0.0001
+      epochs: 100
+      batch_size: 64
+      weight_decay: 0.0001
+  formulation_parameters:
+    shared_regression:
+      random_forest: {max_depth: 12, min_samples_leaf: 2}
+      lightgbm: {n_estimators: 600, num_leaves: 31, min_child_samples: 2}
+  variants:
+    mlp:
+      baseline: {}
+      compact: {hidden_sizes: [32, 16], batch_size: 32}
+      wide: {hidden_sizes: [128, 64], epochs: 200, weight_decay: 0.001}
+    lightgbm:
+      baseline: {}
+      compact: {n_estimators: 150, num_leaves: 7, min_child_samples: 8, learning_rate: 0.03, reg_lambda: 1.0}
+      wide: {n_estimators: 600, num_leaves: 31, min_child_samples: 4, learning_rate: 0.03, reg_lambda: 1.0}
+    random_forest:
+      baseline: {}
+      compact: {n_estimators: 100, max_depth: 4, min_samples_leaf: 8}
+      wide: {n_estimators: 400, max_depth: 16, min_samples_leaf: 1}

@@ -37,6 +37,18 @@ def soft_targets(maes: np.ndarray, temperature: float) -> np.ndarray:
     return probabilities / probabilities.sum(axis=1, keepdims=True)
 
 
+def resolve_teacher_actions(catalog: ActionCatalog, costs: np.ndarray,
+                            teacher_actions: np.ndarray | None) -> np.ndarray:
+    """Use recorded trajectory teachers, preserving their choice among tied costs."""
+    if teacher_actions is None:
+        return catalog.best(-costs)
+    teacher = np.asarray(teacher_actions)
+    if (teacher.shape != (len(costs),) or not np.issubdtype(teacher.dtype, np.integer)
+            or np.any(teacher < 0) or np.any(teacher >= len(catalog.ids))):
+        raise ValueError("teacher_actions must contain one legal action index per state")
+    return teacher.astype(np.int64, copy=False)
+
+
 class MLPEstimator:
     """CPU MLP trained on all supplied samples for the configured epoch count."""
 
@@ -61,7 +73,7 @@ class MLPEstimator:
         self.target_mean = 0. if self.classification else float(np.mean(y))
         self.target_scale = 1. if self.classification else max(float(np.std(y)), 1e-6)
         values = torch.as_tensor(x, dtype=torch.float32)
-        targets = torch.as_tensor(y, dtype=torch.float32) if self.classification else torch.as_tensor(
+        targets = torch.as_tensor(y, dtype=torch.long if y.ndim == 1 else torch.float32) if self.classification else torch.as_tensor(
             (y - self.target_mean) / self.target_scale, dtype=torch.float32).reshape(-1, 1)
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(self.seed)
@@ -113,7 +125,8 @@ def fit_estimator(kind: str, x: np.ndarray, y: np.ndarray, *, classification: bo
                              seed=seed, **parameters)
         return model.fit(x, y)
     weights = None
-    if classification:
+    soft_labels = classification and y.ndim == 2
+    if soft_labels:
         if y.shape != (len(x), class_count):
             raise ValueError("classification requires one soft target probability per state and action")
         # Weighted copies have exactly the same cross-entropy as soft targets:
@@ -129,7 +142,7 @@ def fit_estimator(kind: str, x: np.ndarray, y: np.ndarray, *, classification: bo
         if classification:
             options["criterion"] = "log_loss"
             # Convert integer leaf thresholds to the expanded sample scale.
-            if isinstance(options["min_samples_leaf"], int):
+            if soft_labels and isinstance(options["min_samples_leaf"], int):
                 options["min_samples_leaf"] *= class_count
     elif kind == "lightgbm":
         from lightgbm import LGBMClassifier, LGBMRegressor
@@ -137,11 +150,11 @@ def fit_estimator(kind: str, x: np.ndarray, y: np.ndarray, *, classification: bo
         model_type = LGBMClassifier if classification else LGBMRegressor
         options = {"n_estimators": 200, "learning_rate": .05, "num_leaves": 7, "min_child_samples": 4,
                    "verbosity": -1, "n_jobs": 1, **parameters}
-        if classification:
+        if soft_labels:
             options["min_child_samples"] *= class_count
     else:
         raise ValueError(f"unknown estimator: {kind}")
-    if classification and class_count == 1:
+    if classification and len(np.unique(y)) == 1:
         from sklearn.dummy import DummyClassifier
 
         return DummyClassifier(strategy="constant", constant=y[0]).fit(x, y)
@@ -151,7 +164,8 @@ def fit_estimator(kind: str, x: np.ndarray, y: np.ndarray, *, classification: bo
 class ActionSelector:
     def __init__(self, catalog: ActionCatalog, features: list[str], formulation: str,
                  estimator: str, *, parameters: dict | None = None, seed: int = 0,
-                 feature_window: int = 32, error_window: int = 128, temperature: float = .05) -> None:
+                 feature_window: int = 32, error_window: int = 128, temperature: float = .05,
+                 label_mode: str = "soft") -> None:
         if formulation not in FORMULATIONS or estimator not in ESTIMATORS:
             raise ValueError("unknown selector formulation or estimator")
         if len(features) != len(set(features)):
@@ -159,6 +173,9 @@ class ActionSelector:
         self.catalog, self.features = catalog, list(features)
         self.formulation, self.estimator = formulation, estimator
         self.parameters = {**FORMULATION_PARAMETERS.get(formulation, {}).get(estimator, {}), **(parameters or {})}
+        if label_mode not in {"soft", "hard"} or (formulation != "classification" and label_mode != "soft"):
+            raise ValueError("label_mode must be soft, or hard for classification")
+        self.label_mode = label_mode
         self.seed = seed
         soft_targets(np.zeros((1, 1)), temperature)
         self.temperature = temperature
@@ -189,7 +206,8 @@ class ActionSelector:
             actions = (actions - self.action_mean) / self.action_scale
         return np.column_stack((np.repeat(states, len(actions), axis=0), np.tile(actions, (len(states), 1))))
 
-    def fit(self, states: np.ndarray, targets: np.ndarray) -> ActionSelector:
+    def fit(self, states: np.ndarray, targets: np.ndarray, *,
+            teacher_actions: np.ndarray | None = None) -> ActionSelector:
         states, targets = np.asarray(states, dtype=float), np.asarray(targets, dtype=float)
         x = self.prepare_training(states, targets)
         classification = self.formulation == "classification"
@@ -197,9 +215,12 @@ class ActionSelector:
         # remove state difficulty from regression targets. Native is exactly 0.
         advantages = targets - targets[:, self.catalog.native_indices[:1]]
         self.models = []
+        classification_targets = None
+        if classification:
+            classification_targets = (resolve_teacher_actions(self.catalog, targets, teacher_actions)
+                                      if self.label_mode == "hard" else soft_targets(targets, self.temperature))
         fit_targets = ([advantages[:, i] for i in range(len(self.catalog.ids))] if self.formulation == "independent_regression"
-                       else [soft_targets(targets - targets.min(1, keepdims=True), self.temperature)
-                             if classification else advantages.reshape(-1)])
+                       else [classification_targets if classification else advantages.reshape(-1)])
         for index, target in enumerate(fit_targets):
             if self.formulation == "independent_regression" and index in self.catalog.native_indices:
                 self.models.append(None)

@@ -20,6 +20,7 @@ def main(argv=None) -> None:
         command.add_argument("--config", type=Path, default=Path("configs/selector_experiment.yaml"))
         command.add_argument("--output", type=Path, required=True)
         if name == "run":
+            command.add_argument("--compact-output", action="store_true", help="keep models, metadata and aggregate comparisons only")
             command.add_argument("--ema-beta", type=float)
             command.add_argument("--devices", nargs="+")
             command.add_argument("--workers-per-device", nargs="+", type=int)
@@ -71,7 +72,18 @@ def main(argv=None) -> None:
     evaluate.add_argument("--output", type=Path, required=True)
     evaluate.add_argument("--devices", nargs="+")
     evaluate.add_argument("--workers-per-device", nargs="+", type=int)
-    evaluate.add_argument("--ema-beta", type=float)
+    group = evaluate.add_mutually_exclusive_group()
+    group.add_argument("--ema-beta", type=float)
+    group.add_argument("--ema-betas", nargs="+", help="EMA grid, e.g. 0 default 0.5; Native/Frozen run once")
+    suite = commands.add_parser("suite", help="train and evaluate configured existing collections")
+    suite.add_argument("--config", type=Path, required=True)
+    suite.add_argument("--output", type=Path, required=True)
+    suite.add_argument("--devices", nargs="+")
+    suite.add_argument("--workers-per-device", nargs="+", type=int)
+    suite.add_argument("--dry-run", action="store_true", help="validate inputs and write the experiment plan without fitting or forecasting")
+    for command in (train, evaluate, suite):
+        command.add_argument("--compact-output", action="store_true", help="keep models, metadata and aggregate comparisons only")
+    suite.add_argument("--collections", nargs="+", help="configured collection ids to run, in the given order")
     args = parser.parse_args(argv)
     if args.command in {"prepare", "run"}:
         config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
@@ -79,14 +91,15 @@ def main(argv=None) -> None:
             prepare_experiment(config, args.config.resolve().parent, args.output)
         else:
             if args.ema_beta is not None:
-                config.setdefault("evaluation", {})["ema_beta"] = args.ema_beta
+                config.setdefault("evaluation", {}).pop("ema_betas", None)
+                config["evaluation"]["ema_beta"] = args.ema_beta
             args.output.mkdir(parents=True, exist_ok=False)
             prepare_experiment(config, args.config.resolve().parent, args.output / "prepared")
             evaluate_oracle(args.output / "prepared", args.output / "teacher", split="history")
             collect_experiment(args.output / "prepared", args.output / "teacher", args.output / "data")
-            train_experiment(args.output / "data", args.output / "models")
+            train_experiment(args.output / "data", args.output / "models", compact_output=args.compact_output)
             evaluate_experiment(args.output / "data", args.output / "models", args.output / "test",
-                                devices=args.devices, workers_per_device=args.workers_per_device)
+                                devices=args.devices, workers_per_device=args.workers_per_device, compact_output=args.compact_output)
     elif args.command == "oracle":
         search = {name: getattr(args, name) for name in ("k", "k_max", "k_min", "beam_width", "h_tail", "workers")
                   if getattr(args, name) is not None}
@@ -118,10 +131,18 @@ def main(argv=None) -> None:
                              workers=args.workers, profile=args.profile)
     elif args.command == "train":
         options = yaml.safe_load(args.config.read_text(encoding="utf-8"))["selectors"] if args.config else None
-        train_experiment(args.data, args.output, options)
+        train_experiment(args.data, args.output, options, compact_output=args.compact_output)
+    elif args.command == "suite":
+        from .suite import run_suite
+
+        run_suite(args.config, args.output, devices=args.devices,
+                  workers_per_device=args.workers_per_device, dry_run=args.dry_run,
+                  compact_output=args.compact_output, collection_ids=args.collections)
     else:
+        betas = None if args.ema_betas is None else [None if value == "default" else float(value) for value in args.ema_betas]
         evaluate_experiment(args.data, args.models, args.output, devices=args.devices,
-                            workers_per_device=args.workers_per_device, ema_beta=args.ema_beta)
+                            workers_per_device=args.workers_per_device, ema_beta=args.ema_beta, ema_betas=betas,
+                            compact_output=args.compact_output)
 
 
 if __name__ == "__main__":
